@@ -5,6 +5,8 @@ import re
 from pathlib import Path
 from . import extraction_pipeline as engine
 
+_PLACEHOLDER = re.compile(r'\{([A-Z][A-Z0-9_]*)\}')
+
 
 def digest(value):
     return hashlib.sha256(engine._canonical_json_bytes(value)).hexdigest()
@@ -22,7 +24,14 @@ def render(template, inputs):
         if match[1] not in inputs:
             raise ValueError(f'missing template variable: {match[1]}')
         return inputs[match[1]]
-    return re.sub(r'\{([A-Z][A-Z0-9_]*)\}', substitute, template)
+    return _PLACEHOLDER.sub(substitute, template)
+
+
+def template_prefix(template):
+    first = _PLACEHOLDER.search(template)
+    if first is None:
+        raise ValueError('--prompt-cache requires a template input placeholder such as {INPUT_JSON}')
+    return template[:first.start()], first.group()
 
 
 def prepare_file(dataset, path, template, load_report=None):

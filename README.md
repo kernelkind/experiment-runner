@@ -25,7 +25,7 @@ Use this launcher for experiment execution. Do not substitute an immutable Nix
 package or require a system installation for this workflow.
 
 `experiment-runner --help` lists commands and points to the cache workflow.
-`experiment-runner prepare --help` includes the prefix option, an automatic
+`experiment-runner prepare --help` includes the caching option, an automatic
 warming example, and worker migration. `experiment-runner run --help`
 explains shared attempt bounds and cache-cost accounting.
 
@@ -100,13 +100,22 @@ with `--from` and `--runner-binary` to migrate, as described above.
 
 ## SSE prefix caching
 
-Version 1.2.0 provides one caching option: `--prompt-cache-prefix FILE`.
+Version 1.3.0 provides one caching option: `--prompt-cache`.
 Use it for **large experiments sharing fixed instructions** to reduce
 API-equivalent cost.
-It is supported for `openai-codex`, `gpt-6.1-sol` and SSE. Supply a nonempty
-UTF-8 file containing the **exact beginning of every rendered prompt**, including
-whitespace. Fixed instructions go there; changing case data follows them. The
-runner refuses mismatches, derives a stable namespaced key from the prefix's
+It is supported for `openai-codex`, `gpt-6.1-sol` and SSE. No separate prefix
+file or manual key is needed. The runner selects **every byte before the first
+input placeholder** in the prompt template, using the renderer's existing
+`UPPER_CASE` placeholder rules (for example, `{INPUT_JSON}` or `{POST}`).
+Fixed instructions, examples and whitespace before that boundary are included;
+literal JSON braces are not placeholders. When the template has several input
+placeholders, the earliest sets the boundary. Every byte after it remains in the
+user message, including later fixed text. Matching input values across cases do
+not become part of the prefix. The runner does not pad or rearrange the template.
+
+Preparation refuses templates without placeholders or whose prefix does not
+begin every rendered prompt exactly. It prints the selected boundary, estimated
+token count and warming setup. The runner derives a stable key from the prefix's
 SHA-256 hash, and freezes both the prefix and key. The same prefix gets the same
 key across cases and batches; changing whitespace changes it. The backend still
 receives and checks the actual input text; a key does not substitute for it.
@@ -118,12 +127,12 @@ cd ~/src/notedeck_worktrees/algos/oracle-mvp
   --runner-binary ../experiment-runner/experiment_runner/run-model.sh \
   --provider openai-codex --model gpt-6.1-sol --reasoning-effort medium \
   --transport sse --concurrency 8 \
-  --prompt-cache-prefix prompts/compare-prefix.txt
+  --prompt-cache
 ../experiment-runner/bin/experiment-runner run target/compare-cached-v1 \
   --max-new-attempts 129
 ```
 
-Replace the example's experiment and prefix paths with your own. Preparation
+Replace the example's experiment paths with your own. Preparation
 makes no model calls. The single `run` command first checks exact-answer reuse.
 Immediately before the first comparison requiring a new attempt, it sends one
 instructions-only warmup and waits for completion, then runs the comparisons.
@@ -134,8 +143,8 @@ included.
 Preparation requires a prefix with at least **1,024 locally estimated
 `o200k_base` tokens** when prefix caching is requested. A shorter prefix is
 rejected with its estimated count and minimum before creating the experiment or
-spending calls. Omit the caching option (or remove `runner.prompt_cache_prefix`
-from the spec) to prepare without caching. Automatic warming also requires
+spending calls. For a new uncached spec, omit the caching option and
+`runner.prompt_cache`. Automatic warming also requires
 allowance for warmup plus a comparison. The count covers
 only the supplied text, excludes message/schema overhead and is not an exact
 subscription tokenizer contract. The documented public API threshold is 1,024
@@ -170,16 +179,24 @@ usage leaves complete cost unknown. Raw provider usage stays in immutable
 receipts. `--generation-costs` also includes the original warmup once when
 tracing multiple answers reused from the same batch.
 
-For specs, set literal `runner.prompt_cache_prefix` text without a manual key.
-The CLI option reads and hashes a file. Later `prepare --from` batches inherit
-the automatic policy. Omission preserves the previous one-user-message format.
-Old manual-key/warmup experiments retain their frozen behavior; the legacy
-options remain accepted for compatibility but are hidden from normal help.
-Supply the prefix option again to opt an older experiment into the automatic
-workflow. Existing worker identity checks still require selecting the shared
-worker for a newly prepared experiment. `prepare --repeat` requests independent
-fresh trials; otherwise identical comparisons reuse saved answers. WebSocket
-cache options are refused before dispatch.
+For specs, set `runner.prompt_cache` to `true` (a JSON boolean). Later
+`prepare --from` batches inherit template caching. Changing the template with
+`--prompt` recomputes the prefix, count and key after the new prompt is rendered.
+The prefix and boundary are frozen into the new plan; old receipts stay unchanged.
+New specs without caching preserve the previous one-user-message format.
+
+Old manual-prefix/key/warmup experiments retain their frozen behavior. The legacy
+`--prompt-cache-prefix FILE`, `--prompt-cache-key KEY` and `--cache-warmup`
+options remain accepted but hidden from normal help. Supply `--prompt-cache`
+to opt an older experiment into template selection. It cannot be combined with
+manual cache overrides or historical import. Existing worker identity checks
+still require selecting the shared worker for a newly prepared experiment.
+
+Adding caching changes the request's message format and identity, so uncached
+answers are not reused as cached answers, even if their combined text is the
+same. Identical cached requests reuse saved answers normally. `prepare --repeat`
+requests independent fresh trials. WebSocket cache options are refused before
+dispatch.
 
 The completed 1,032-attempt, eight-block comparison measured **13.0659% lower
 total API-equivalent cost**, including eight warmups, with no failures or

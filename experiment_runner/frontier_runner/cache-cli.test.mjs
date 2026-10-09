@@ -86,7 +86,6 @@ test('shared CLI warms the exact SSE prefix and accounts for real worker receipt
   const launcher = path.join(root, 'worker.sh');
   fs.writeFileSync(launcher, '#!/usr/bin/env bash\nset -euo pipefail\nexec "$EXPERIMENT_RUNNER_TEST_WORKER" "$@" --pi-config\n', { mode: 0o755 });
   fs.writeFileSync(path.join(root, 'prompt.txt'), prefix + '{DATA}');
-  fs.writeFileSync(path.join(root, 'prefix.txt'), prefix);
   write('cases.json', { cases: ['Tea', 'Coffee'].map((value, index) => ({ id: String(index), inputs: { DATA: value } })) });
   write('spec.json', { schema_version: 1, prompt: { id: 'cache-cli-v1', path: 'prompt.txt' }, dataset: { adapter: 'generic', path: 'cases.json' },
     runner: { provider: 'openai-codex', auth_file: null, model: 'gpt-6.1-sol', reasoning_effort: 'medium',
@@ -107,7 +106,7 @@ test('shared CLI warms the exact SSE prefix and accounts for real worker receipt
   }
   try {
     await command('prepare', 'ordinary', '--spec', 'spec.json');
-    await command('prepare', 'cached', '--from', 'ordinary', '--prompt-cache-prefix', path.join(root, 'prefix.txt'));
+    await command('prepare', 'cached', '--from', 'ordinary', '--prompt-cache');
     assert.equal(observations.length, 0);
     for (const name of ['ordinary', 'cached']) await command('run', name, '--attempt-budget', path.join(root, 'budget.json'));
     assert.equal(observations.length, 5); assert.equal(load('budget.json').used, 5);
