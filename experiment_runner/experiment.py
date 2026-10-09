@@ -200,6 +200,7 @@ def prepare(args, *, preparation_context=None, include_request_preview=True):
             "max_output_tokens",
             "transport",
             "runner_binary",
+            "prompt_cache_key",
         )
         if getattr(args, k) is not None
     }
@@ -207,6 +208,25 @@ def prepare(args, *, preparation_context=None, include_request_preview=True):
     if args.runner_binary is not None:
         setup["runner"]["runner_binary"] = str(engine._resolve_executable(
             str(args.runner_binary), "runner_binary", Path.cwd()))
+    prefix_path = getattr(args, "prompt_cache_prefix", None)
+    if prefix_path is not None:
+        prefix_path = prefix_path.expanduser().resolve()
+        setup["runner"]["prompt_cache_prefix"] = prefix_path.read_bytes().decode()
+        setup["sources"] = {**setup["sources"], str(prefix_path): engine._sha256_file(prefix_path)}
+    warmup = getattr(args, "cache_warmup", False)
+    if warmup:
+        prefix = setup["runner"].get("prompt_cache_prefix")
+        if (not args.from_experiment or not prefix or args.only or args.prompt
+                or args.prompt_id or args.baseline or args.import_config
+                or overrides or prefix_path is not None):
+            raise ValueError("--cache-warmup requires --from a native-prefix experiment without case, prompt or runner-setting overrides")
+        setup["prompt"] = {**setup["prompt"], "id": setup["prompt"]["id"] + "-cache-warmup", "text": prefix}
+        setup["dataset"] = {"adapter": "generic"}
+        setup["cases"] = [{"id": "cache-warmup", "inputs": {}, "input_sha256": inputs.digest({}),
+                           "prompt": prefix, "evidence": {"kind": "instructions-only-cache-warmup"}}]
+        setup["preparation"] = {"version": "prompt-cache-warmup-v1", "cases": 1, "application_allowed": False}
+        setup["runner"] = {**setup["runner"], "concurrency": 1}
+        baseline = None
     if args.prompt:
         if not args.prompt_id:
             raise ValueError("--prompt requires --prompt-id")
@@ -284,7 +304,7 @@ def prepare(args, *, preparation_context=None, include_request_preview=True):
             engine._request_history_options(
                 config,
                 manifest,
-                repeat=args.repeat,
+                repeat=args.repeat or warmup,
                 history_root=args.history_root
                 or (
                     Path(inherited_history) if inherited_history else destination.parent
@@ -337,6 +357,8 @@ def import_setup(path, setup):
         "max_output_tokens",
         "timeout_seconds",
         "transport",
+        "prompt_cache_key",
+        "prompt_cache_prefix",
     ):
         default = {"timeout_seconds": 600, "transport": "sse"}.get(name)
         expected = setup["runner"].get(name, default)
@@ -968,6 +990,12 @@ def parser():
     p.add_argument("--max-output-tokens", type=int)
     p.add_argument("--transport", choices=("sse", "websocket"),
                    help="explicit transport; websocket is subscription-only, without fallback")
+    p.add_argument("--prompt-cache-key",
+                   help="opt-in stable subscription SSE cache affinity; sends matching session-id and prompt_cache_key")
+    p.add_argument("--prompt-cache-prefix", type=Path,
+                   help="exact UTF-8 prefix file; opt in to GPT-6.1 Sol subscription SSE instruction/data format")
+    p.add_argument("--cache-warmup", action="store_true",
+                   help="prepare an intentional instructions-only request from a native-prefix experiment; answer never supplied to comparisons")
     p.add_argument(
         "--import-config",
         type=Path,

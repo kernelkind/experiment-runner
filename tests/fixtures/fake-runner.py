@@ -164,6 +164,28 @@ result = {
     "usage": {"input_tokens": 100, "cached_input_tokens": 0, "output_tokens": 20, "reasoning_output_tokens": 5},
     "request": {"body": {"model": request["model"], ("input" if request["provider"] == "openai-codex" else "messages"): [{"role": "user", "content": prompt}], **(({"text": {"format": {"schema": request["schema"]}}} if request["provider"] == "openai-codex" else {"response_format": {"json_schema": {"schema": request["schema"]}}}) if "schema" in request else {})}}, "response_metadata": {},
 }
+if "prompt_cache_key" in request:
+    result["request"]["body"]["prompt_cache_key"] = request["prompt_cache_key"]
+    result["request"]["headers"] = {"session-id": request["prompt_cache_key"],
+                                     "x-client-request-id": request["prompt_cache_key"]}
+if "prompt_cache_prefix" in request:
+    import uuid
+    def content_id(kind, value):
+        return kind + "_" + str(uuid.uuid5(uuid.NAMESPACE_DNS, kind + "\0" + json.dumps(value, ensure_ascii=False, separators=(",", ":"))))
+    def message(role, text):
+        content = [{"type": "input_text", "text": text}]
+        return {"type": "message", "id": content_id("msg", {"role": role, "content": content}),
+                "role": role, "content": content, "internal_chat_message_metadata_passthrough": {
+                    "content_item_kinds": ["model.base_instructions" if role == "developer" else "user.text"]}}
+    prefix = request["prompt_cache_prefix"]
+    body = result["request"]["body"]
+    body["input"] = [{"type": "additional_tools", "id": content_id("at", []), "role": "developer", "tools": []}, message("developer", prefix)]
+    if prompt[len(prefix):]: body["input"].append(message("user", prompt[len(prefix):]))
+    body.update(tool_choice="auto", parallel_tool_calls=False, include=["reasoning.encrypted_content"],
+                reasoning={"effort": request["reasoning"], "context": "all_turns"},
+                client_metadata={"session_id": request["prompt_cache_key"], "thread_id": request["prompt_cache_key"]})
+    result["request"]["headers"].update({"x-openai-internal-codex-responses-lite": "true",
+        "x-codex-routing-hint": "model=gpt-6.1-sol", "thread-id": request["prompt_cache_key"]})
 result.update(json.loads(os.environ.get("FAKE_RUNNER_RESULT_OVERRIDE", "{}")))
 failures = json.loads(os.environ.get("FAKE_RUNNER_FAILURES", "{}"))
 for text, failure in failures.items():

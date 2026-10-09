@@ -177,7 +177,7 @@ function compileSchema(schema) {
 /** Prepare the exact prompt and explicitly selected route, without reading any task inputs. */
 export async function prepare(config) {
   if (!config || typeof config !== 'object' || Array.isArray(config)) throw new Error('Config must be an object');
-  const allowed = new Set(['provider', 'model', 'reasoning', 'prompt', 'schema', 'max_output_tokens', 'timeout_seconds', 'debug', 'transport']);
+  const allowed = new Set(['provider', 'model', 'reasoning', 'prompt', 'schema', 'max_output_tokens', 'timeout_seconds', 'debug', 'transport', 'prompt_cache_key', 'prompt_cache_prefix']);
   for (const key of Object.keys(config)) if (!allowed.has(key)) throw new Error(`Unknown config field: ${key}`);
   const transport = config.transport ?? 'sse';
   if (!['sse', 'websocket'].includes(transport)) throw new Error('transport must be sse or websocket');
@@ -193,6 +193,22 @@ export async function prepare(config) {
   if (!nonempty(config.model)) throw new Error('model must be a nonempty string');
   // pi-ai removes unpaired surrogates. Refuse them instead of silently changing the prompt.
   if (!config.prompt.isWellFormed()) throw new Error('prompt must contain well-formed Unicode; unpaired surrogates are unsupported');
+  if (Object.hasOwn(config, 'prompt_cache_key')) {
+    if (config.provider !== 'openai-codex' || transport !== 'sse') throw new Error('prompt_cache_key requires subscription Responses over SSE');
+    if (typeof config.prompt_cache_key !== 'string' || !/^[\x21-\x7e]{1,64}$/.test(config.prompt_cache_key)) {
+      throw new Error('prompt_cache_key must contain 1–64 visible ASCII characters without spaces');
+    }
+  }
+  if (Object.hasOwn(config, 'prompt_cache_prefix')) {
+    if (!nonempty(config.prompt_cache_prefix) || !config.prompt_cache_prefix.isWellFormed() ||
+        !config.prompt.startsWith(config.prompt_cache_prefix)) {
+      throw new Error('prompt_cache_prefix must be a nonempty well-formed exact prefix of prompt');
+    }
+    if (config.provider !== 'openai-codex' || config.model !== 'gpt-6.1-sol' ||
+        !nonempty(config.prompt_cache_key)) {
+      throw new Error('prompt_cache_prefix requires gpt-6.1-sol subscription and prompt_cache_key');
+    }
+  }
   let model;
   if (config.provider === 'openai-codex') {
     model = config.model === sol61.id ? sol61
@@ -229,11 +245,32 @@ export async function prepare(config) {
   const schema = hasSchema ? structuredClone(config.schema) : null;
   const validate = hasSchema ? compileSchema(schema) : null;
   return {
-    model, decisions, transport, reasoning: config.reasoning, prompt: config.prompt, debug: structuredClone(config.debug),
+    model, decisions, transport, promptCacheKey: config.prompt_cache_key ?? null,
+    promptCachePrefix: config.prompt_cache_prefix ?? null,
+    reasoning: config.reasoning, prompt: config.prompt, debug: structuredClone(config.debug),
     max_output_tokens: config.max_output_tokens ?? null, timeout_seconds: timeout,
     prompt_sha256: sha256(config.prompt), schema, schema_name: 'output',
     schema_sha256: hasSchema ? sha256(JSON.stringify(schema)) : null, validate,
   };
+}
+
+// Responses Lite requires stable item identities. UUIDv5 names are derived only
+// from the item's content, so seeds, cases and directories share fixed instructions.
+function contentId(type, content) {
+  const namespace = Buffer.from('6ba7b8109dad11d180b400c04fd430c8', 'hex');
+  const bytes = createHash('sha1').update(namespace).update(`${type}\0${JSON.stringify(content)}`).digest().subarray(0, 16);
+  bytes[6] = (bytes[6] & 0x0f) | 0x50;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = bytes.toString('hex');
+  return `${type}_${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
+function nativeMessage(role, text) {
+  const content = [{ type: 'input_text', text }];
+  return { type: 'message', id: contentId('msg', { role, content }), role, content,
+    internal_chat_message_metadata_passthrough: {
+      content_item_kinds: [role === 'developer' ? 'model.base_instructions' : 'user.text'],
+    } };
 }
 
 function formatPayload(payload, request) {
@@ -248,6 +285,23 @@ function formatPayload(payload, request) {
       format: { type: 'json_schema', name: request.schema_name, strict: true, schema: request.schema },
     };
     else delete payload.text;
+    if (request.promptCachePrefix !== null) {
+      const tools = [];
+      payload.input = [
+        { type: 'additional_tools', id: contentId('at', tools), role: 'developer', tools },
+        nativeMessage('developer', request.promptCachePrefix),
+      ];
+      const suffix = request.prompt.slice(request.promptCachePrefix.length);
+      if (suffix.length) payload.input.push(nativeMessage('user', suffix));
+      delete payload.instructions;
+      delete payload.tools;
+      payload.tool_choice = 'auto';
+      // The tested native format disables tool parallelism and supplies no tools.
+      payload.parallel_tool_calls = false;
+      payload.reasoning = { ...payload.reasoning, context: 'all_turns' };
+      payload.include = ['reasoning.encrypted_content'];
+      payload.client_metadata = { session_id: request.promptCacheKey, thread_id: request.promptCacheKey };
+    }
   } else {
     if (request.max_output_tokens === null) {
       // The SDK otherwise supplies a catalog default even when the caller omitted the cap.
@@ -322,7 +376,7 @@ function upstreamRequestSummary(body, redact) {
 }
 
 // Observe metadata and timing without retaining another copy of the token stream.
-function observeResponse(response, metadata, timing, elapsed, redact, captureDebug) {
+function observeResponse(response, metadata, timing, elapsed, redact, captureDebug, provider) {
   timing.headers_ms = elapsed();
   metadata.http_status = response.status;
   for (const [header, key] of [['x-request-id', 'request_id'], ['retry-after', 'retry_after'],
@@ -330,10 +384,12 @@ function observeResponse(response, metadata, timing, elapsed, redact, captureDeb
     const value = response.headers.get(header);
     if (value) metadata[key] = redact(value).slice(0, 1024);
   }
-  // Both callers request SSE. A missing Content-Type does not change that
-  // request contract; an explicitly different response type still takes priority.
+  // The Codex SDK parses successful bodies as SSE regardless of Content-Type.
+  // Observe that same body; otherwise SDK usage survives while raw metadata is
+  // silently lost. OpenRouter still respects an explicitly different type.
   const contentType = response.headers.get('content-type');
-  if (!response.ok || !response.body || (contentType && !contentType.includes('text/event-stream'))) return response;
+  if (!response.ok || !response.body || (provider !== 'openai-codex'
+      && contentType && !contentType.includes('text/event-stream'))) return response;
   const decoder = new TextDecoder();
   let buffer = '';
   let data = [];
@@ -531,7 +587,14 @@ async function executeModel(request, { apiKey, fetch = globalThis.fetch, signal,
   const options = {
     // Use the existing SDK serializer/parser only. Its native WebSocket path
     // silently retries/falls back even with maxRetries:0, violating our contract.
-    apiKey, transport: 'sse', cacheRetention: 'none', maxRetries: 0, timeoutMs: request.timeout_seconds * 1000,
+    apiKey, transport: 'sse', cacheRetention: request.promptCacheKey === null ? 'none' : 'short',
+    ...(request.promptCacheKey === null ? {} : { sessionId: request.promptCacheKey }),
+    ...(request.promptCachePrefix === null ? {} : { headers: {
+      'x-openai-internal-codex-responses-lite': 'true',
+      'x-codex-routing-hint': `model=${request.model.id}`,
+      'thread-id': request.promptCacheKey,
+    } }),
+    maxRetries: 0, timeoutMs: request.timeout_seconds * 1000,
     signal: abort,
     reasoningEffort: ['provider-default', 'on'].includes(request.reasoning) ? undefined : request.reasoning === 'off' ? 'none' : request.reasoning,
     ...(request.max_output_tokens === null ? {} : { maxTokens: request.max_output_tokens }),
@@ -552,7 +615,8 @@ async function executeModel(request, { apiKey, fetch = globalThis.fetch, signal,
         timing.error_ms = elapsed();
         throw error;
       }
-      const observed = observeResponse(response, responseMetadata, timing, elapsed, redact, request.debug?.echo_upstream_body);
+      const observed = observeResponse(response, responseMetadata, timing, elapsed, redact, request.debug?.echo_upstream_body,
+        request.model.provider);
       // observeResponse sees the in-process parser interface. Never report its
       // synthetic status as a successful HTTP request to the server.
       if (request.transport === 'websocket' && !offline) responseMetadata.http_status = 101;
@@ -682,6 +746,8 @@ const help = `Usage: run-model.sh preview|run [CONFIG.json] [--send]
 Reads one JSON config from file or stdin; writes one JSON result to stdout.
 Required: provider, model, reasoning, prompt (sent exactly as supplied).
 Optional: schema, timeout_seconds (default 300), transport (sse default; websocket for subscription only).
+Subscription prompt_cache_key sets stable affinity. prompt_cache_prefix enables GPT-6.1 Sol Responses Lite
+with that exact instruction prefix and a required key; prompt equal to prefix sends instructions only.
 No tools, history, retries, prompt repair, or WebSocket-to-SSE fallback.
 Providers: openai-codex subscription; OpenRouter chat via pi-ai; Jev via System One.
 Jev prompt: JSON encoding of {state, questions}; reasoning must be provider-default.

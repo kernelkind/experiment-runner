@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --test model.test.mjs auth.test.mjs systemone.test.mjs websocket.test.mjs backoff.test.mjs billing.test.mjs"
+    "test": "node --test model.test.mjs auth.test.mjs systemone.test.mjs websocket.test.mjs backoff.test.mjs billing.test.mjs cache-cli.test.mjs"
   },
   "engines": {
     "node": ">=24"

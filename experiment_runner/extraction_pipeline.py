@@ -897,6 +897,8 @@ class PromptRunnerConfig:
     output_schema: dict[str, object] | None = None
     concurrency: int = 16
     transport: str = "sse"
+    prompt_cache_key: str | None = None
+    prompt_cache_prefix: str | None = None
 
     @classmethod
     def load(cls, path: Path) -> "PromptRunnerConfig":
@@ -915,7 +917,7 @@ class PromptRunnerConfig:
                 "reasoning_effort",
                 "prompts",
             }
-            | (({"output_schema", "concurrency", "transport"} | RUNTIME_FIELDS) & value.keys()),
+            | (({"output_schema", "concurrency", "transport", "prompt_cache_key", "prompt_cache_prefix"} | RUNTIME_FIELDS) & value.keys()),
         )
         if value["schema_version"] != SCHEMA_VERSION:
             raise RunnerError("unsupported config schema version")
@@ -968,8 +970,27 @@ class PromptRunnerConfig:
             output_schema=output_schema,
             concurrency=concurrency,
             transport=transport,
+            prompt_cache_key=value.get("prompt_cache_key"),
+            prompt_cache_prefix=value.get("prompt_cache_prefix"),
         )
+        if "prompt_cache_key" in value:
+            _validate_prompt_cache_key(config.prompt_cache_key, config.provider, config.transport)
+        if "prompt_cache_prefix" in value:
+            prefix = config.prompt_cache_prefix
+            if (config.provider != "openai-codex" or config.model != "gpt-6.1-sol"
+                    or config.prompt_cache_key is None
+                    or not isinstance(prefix, str) or not prefix.strip()
+                    or any(not p.text.startswith(prefix) for p in config.prompts)):
+                raise RunnerError("prompt_cache_prefix requires an exact nonempty prefix, GPT-6.1 Sol subscription and prompt_cache_key")
         return config
+
+
+def _validate_prompt_cache_key(key, provider, transport):
+    if provider != "openai-codex" or transport != "sse":
+        raise RunnerError("prompt_cache_key requires subscription Responses over SSE")
+    if (not isinstance(key, str) or not 1 <= len(key) <= 64
+            or any(not 0x21 <= ord(c) <= 0x7e for c in key)):
+        raise RunnerError("prompt_cache_key must contain 1–64 visible ASCII characters without spaces")
 
 
 def _load_notes(path: Path) -> tuple[Note, ...]:
@@ -1125,6 +1146,10 @@ def _build_prompt_manifest(
         )
     if config.transport != "sse":
         manifest["transport"] = config.transport
+    if config.prompt_cache_key is not None:
+        manifest["prompt_cache_key"] = config.prompt_cache_key
+    if config.prompt_cache_prefix is not None:
+        manifest["prompt_cache_prefix"] = config.prompt_cache_prefix
     return manifest
 
 
@@ -1943,12 +1968,42 @@ def _same_json(left: Any, right: Any) -> bool:
     return left == right
 
 
-def _wire_prompt(result: dict[str, Any], provider: str) -> str:
+def _native_content_id(kind: str, content: object) -> str:
+    import uuid
+    name = kind + "\0" + json.dumps(content, ensure_ascii=False, separators=(",", ":"))
+    return kind + "_" + str(uuid.uuid5(uuid.NAMESPACE_DNS, name))
+
+
+def _native_message(role: str, text: str) -> dict[str, Any]:
+    content = [{"type": "input_text", "text": text}]
+    return {"type": "message", "id": _native_content_id("msg", {"role": role, "content": content}),
+            "role": role, "content": content,
+            "internal_chat_message_metadata_passthrough": {
+                "content_item_kinds": ["model.base_instructions" if role == "developer" else "user.text"]}}
+
+
+def _wire_prompt(result: dict[str, Any], provider: str, *, cache_prefix: str | None = None) -> str:
     body = _expect_object(
         _expect_object(result.get("request"), "model request").get("body"),
         "model request body",
     )
     messages = body.get("input") if provider == "openai-codex" else body.get("messages")
+    if cache_prefix is not None:
+        if provider != "openai-codex" or not isinstance(messages, list) or len(messages) not in (2, 3):
+            raise RunnerError("model result native cache prefix input differs")
+        tools = {"type": "additional_tools", "id": _native_content_id("at", []),
+                 "role": "developer", "tools": []}
+        if messages[:2] != [tools, _native_message("developer", cache_prefix)]:
+            raise RunnerError("model result native cache prefix or item IDs differ")
+        suffix = ""
+        if len(messages) == 3:
+            try:
+                suffix = messages[2]["content"][0]["text"]
+            except (KeyError, IndexError, TypeError) as error:
+                raise RunnerError("model result native suffix is invalid") from error
+            if not isinstance(suffix, str) or not suffix or messages[2] != _native_message("user", suffix):
+                raise RunnerError("model result native suffix or item ID differs")
+        return cache_prefix + suffix
     if (
         not isinstance(messages, list)
         or len(messages) != 1
@@ -2007,6 +2062,29 @@ def _validate_model_result(
         _expect_object(result.get("request"), "model request").get("body"),
         "model request body",
     )
+    key = getattr(config, "prompt_cache_key", None)
+    prefix = getattr(config, "prompt_cache_prefix", None)
+    if config.provider == "openai-codex":
+        headers = _expect_object(result["request"].get("headers", {}), "model request headers")
+        session = [v for k, v in headers.items() if k.lower() == 'session-id']
+        client = [v for k, v in headers.items() if k.lower() == 'x-client-request-id']
+        if key is not None:
+            _validate_prompt_cache_key(key, config.provider, transport)
+            if body.get('prompt_cache_key') != key or session != [key] or client != [key]:
+                raise RunnerError("model result cache affinity differs from frozen request")
+        elif 'prompt_cache_key' in body or session:
+            raise RunnerError("model result unexpectedly adds cache affinity")
+        if prefix is not None:
+            if (headers.get("x-openai-internal-codex-responses-lite") != "true"
+                    or headers.get("x-codex-routing-hint") != "model=gpt-6.1-sol"
+                    or headers.get("thread-id") != key
+                    or body.get("client_metadata") != {"session_id": key, "thread_id": key}
+                    or (body.get("reasoning") or {}).get("context") != "all_turns"
+                    or body.get("tool_choice") != "auto"
+                    or body.get("parallel_tool_calls") is not False
+                    or body.get("include") != ["reasoning.encrypted_content"]
+                    or "instructions" in body or "tools" in body):
+                raise RunnerError("model result native cache prefix settings differ")
     if transport == "websocket" and (
         result["request"].get("method") != "GET"
         or not result["request"].get("url", "").startswith(("ws://", "wss://"))
@@ -2034,7 +2112,7 @@ def _validate_model_result(
             raise RunnerError("System One request differs from exact state/questions")
         text = prompt
     else:
-        text = _wire_prompt(result, config.provider)
+        text = _wire_prompt(result, config.provider, cache_prefix=prefix)
     if (
         text != prompt
         or body.get("model") != stage.model
@@ -2108,6 +2186,10 @@ def _invoke_model(
     }
     if getattr(config, "transport", "sse") != "sse":
         request["transport"] = config.transport
+    if getattr(config, "prompt_cache_key", None) is not None:
+        request["prompt_cache_key"] = config.prompt_cache_key
+    if getattr(config, "prompt_cache_prefix", None) is not None:
+        request["prompt_cache_prefix"] = config.prompt_cache_prefix
     if schema is not None:
         request["schema"] = schema
     if config.max_output_tokens is not None:
@@ -2402,6 +2484,10 @@ def _prompt_request_key(manifest: dict[str, Any], prompt: str) -> str:
     # Preserve historical SSE keys; alternate transports are distinct requests.
     if manifest.get("transport", "sse") != "sse":
         request["transport"] = manifest["transport"]
+    if manifest.get("prompt_cache_key") is not None:
+        request["prompt_cache_key"] = manifest["prompt_cache_key"]
+    if manifest.get("prompt_cache_prefix") is not None:
+        request["prompt_cache_prefix"] = manifest["prompt_cache_prefix"]
     return _sha256_bytes(_canonical_json_bytes(request))
 
 
@@ -2460,6 +2546,8 @@ def _read_request_source(reference: object, request_key: str, *,
             model=manifest["model"], reasoning_effort=manifest["reasoning_effort"],
             prompts=(PromptJob(prompt["prompt_id"], prompt["text"]),), output_schema=schema,
             transport=manifest.get("transport", "sse"),
+            prompt_cache_key=manifest.get("prompt_cache_key"),
+            prompt_cache_prefix=manifest.get("prompt_cache_prefix"),
         )
         if (record["manifest_sha256"] != reference["manifest_sha256"]
                 or _prompt_request_key(manifest, prompt["text"]) != request_key

@@ -9,6 +9,179 @@ import { test } from 'node:test';
 import { Agent, getGlobalDispatcher, setGlobalDispatcher } from 'undici';
 import { prepare, preview, execute, VERSION } from './model.mjs';
 
+test('native cache affinity changes only the key and matching routing headers', async () => {
+  const base = { provider: 'openai-codex', model: 'gpt-6.1-sol', reasoning: 'medium',
+    prompt: 'Fixed instructions. Different comparison data.', schema };
+  const plain = await preview(await prepare(base));
+  const key = 'affinity-trial-0123456789';
+  for (const prompt of [base.prompt, base.prompt, base.prompt.replace('Different', 'Other')]) {
+    const routed = await preview(await prepare({ ...base, prompt, prompt_cache_key: key }));
+    assert.equal(routed.body.prompt_cache_key, key);
+    assert.equal(routed.headers['session-id'], key);
+    assert.equal(routed.headers['x-client-request-id'], key);
+    assert.equal(routed.credentials_read, false);
+    assert.equal(routed.network_requests, 0);
+    const body = structuredClone(routed.body);
+    delete body.prompt_cache_key;
+    const expected = structuredClone(plain.body);
+    expected.input[0].content[0].text = prompt;
+    assert.deepEqual(body, expected);
+    const headers = { ...routed.headers };
+    delete headers['session-id'];
+    delete headers['x-client-request-id'];
+    assert.deepEqual(headers, plain.headers);
+  }
+  for (const key of ['', ' padded ', '\n', 'x'.repeat(65), '🌿', null, 123]) {
+    await assert.rejects(prepare({ ...base, prompt_cache_key: key }), /prompt_cache_key/);
+  }
+  await assert.rejects(prepare({ ...base, provider: 'openrouter', prompt_cache_key: key }), /subscription/);
+});
+
+test('native affinity survives production transport serialization and accounting', async () => {
+  const instructions = 'Fixed 🍵 instructions.\r\n';
+  const local = instructions + '{"local": {"meaning": "Food"}';
+  const prepared = await prepare({ provider: 'openai-codex', model: 'gpt-6.1-sol', reasoning: 'medium',
+    prompt: local + ', "canonical": {"meaning": "Cooking"}}', schema,
+    prompt_cache_key: 'native-affinity-success', prompt_cache_prefix: instructions });
+  const expected = (await preview(prepared)).body;
+  const item = { id: 'msg-cache', type: 'message', role: 'assistant', status: 'completed',
+    content: [{ type: 'output_text', text: '{"count":2,"label":null}', annotations: [] }] };
+  const token = 'test.' + Buffer.from(JSON.stringify({ 'https://api.openai.com/auth': {
+    chatgpt_account_id: 'test-account' } })).toString('base64') + '.signature';
+  const result = await execute(prepared, { apiKey: token, fetch: async (url, options) => {
+    const sent = new Request(url, options);
+    assert.equal(sent.headers.get('session-id'), 'native-affinity-success');
+    assert.equal(sent.headers.get('x-client-request-id'), 'native-affinity-success');
+    let body = Buffer.from(await sent.arrayBuffer());
+    if (sent.headers.get('content-encoding') === 'zstd') body = zstdDecompressSync(body);
+    assert.deepEqual(JSON.parse(body.toString('utf8')), expected);
+    return sse([
+      { type: 'response.created', response: { id: 'resp-cache', status: 'in_progress' } },
+      { type: 'response.output_item.added', output_index: 0, item: { ...item, content: [] } },
+      { type: 'response.output_item.done', output_index: 0, item },
+      { type: 'response.completed', response: { id: 'resp-cache', model: 'gpt-6.1-sol', status: 'completed',
+        output: [item], usage: { input_tokens: 100, output_tokens: 10,
+          input_tokens_details: { cached_tokens: 60, cache_write_tokens: 20 },
+          output_tokens_details: { reasoning_tokens: 3 } } } },
+    ]);
+  } });
+  assert.equal(result.valid, true, result.error);
+  assert.equal(result.http_attempts, 1);
+  assert.deepEqual(result.request.body, expected);
+  assert.equal(result.usage.input, 20);
+  assert.equal(result.usage.cacheRead, 60);
+  assert.equal(result.usage.cacheWrite, 20);
+  assert.equal(result.usage.output, 10);
+  assert.deepEqual(result.response_metadata.usage.input_tokens_details, { cached_tokens: 60, cache_write_tokens: 20 });
+  assert.equal(result.response_metadata.usage.output_tokens_details.reasoning_tokens, 3);
+  assert.equal(result.usage.cost.total, (20 * 2 + 60 * 0.1 + 20 * 2.5 + 10 * 10) / 1e6);
+});
+
+test('native prefix format uses fixed developer instructions and independent comparison data', async () => {
+  const prefix = 'Fixed 🍵 instructions.\r\n<input>\n';
+  const base = { provider: 'openai-codex', model: 'gpt-6.1-sol', reasoning: 'medium',
+    prompt: prefix + '{"local":"Food"}\n</input>\n', schema,
+    prompt_cache_prefix: prefix, prompt_cache_key: 'native-prefix-test' };
+  const prepared = await prepare(base);
+  assert.equal(prepared.promptCachePrefix, prefix);
+  const comparison = await preview(prepared);
+  const seed = await preview(await prepare({ ...base, prompt: prefix }));
+  const other = await preview(await prepare({ ...base, prompt: prefix + '{"local":"Cooking"}' }));
+  const differentKey = await preview(await prepare({ ...base, prompt_cache_key: 'native-other-key' }));
+  assert.equal(comparison.body.input.length, 3);
+  assert.equal(seed.body.input.length, 2);
+  assert.deepEqual(seed.body.input, comparison.body.input.slice(0, 2));
+  assert.deepEqual(other.body.input.slice(0, 2), seed.body.input);
+  assert.deepEqual(differentKey.body.input, comparison.body.input);
+  assert.deepEqual(comparison.body.input[0].tools, []);
+  assert.equal(comparison.body.input[0].type, 'additional_tools');
+  assert.equal(comparison.body.input[0].role, 'developer');
+  assert.equal(comparison.body.input[1].role, 'developer');
+  assert.equal(comparison.body.input[1].content[0].text, prefix);
+  assert.equal(comparison.body.input[2].role, 'user');
+  assert.equal(comparison.body.input.slice(1).map(i => i.content[0].text).join(''), base.prompt);
+  assert.notEqual(other.body.input[2].id, comparison.body.input[2].id);
+  for (const item of comparison.body.input) assert.match(item.id, /^(at|msg)_[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+  assert.deepEqual(comparison.body.reasoning, { effort: 'medium', context: 'all_turns' });
+  assert.equal(comparison.body.instructions, undefined);
+  assert.equal(comparison.body.tools, undefined);
+  assert.equal(comparison.body.tool_choice, 'auto');
+  assert.equal(comparison.body.parallel_tool_calls, false);
+  assert.deepEqual(comparison.body.include, ['reasoning.encrypted_content']);
+  assert.equal(comparison.headers['x-openai-internal-codex-responses-lite'], 'true');
+  assert.equal(comparison.headers['x-codex-routing-hint'], 'model=gpt-6.1-sol');
+  assert.equal(comparison.headers['session-id'], base.prompt_cache_key);
+  assert.equal(comparison.headers['thread-id'], base.prompt_cache_key);
+  assert.equal(comparison.body.prompt_cache_key, base.prompt_cache_key);
+  assert.deepEqual(comparison.body.client_metadata, { session_id: base.prompt_cache_key, thread_id: base.prompt_cache_key });
+  assert.equal(comparison.body.prompt_cache_options, undefined);
+  assert.equal(comparison.body.input[1].content[0].prompt_cache_breakpoint, undefined);
+  const defaultConfig = { provider: base.provider, model: base.model, reasoning: base.reasoning, prompt: base.prompt, schema };
+  assert.equal((await prepare(defaultConfig)).promptCachePrefix, null);
+  const ordinary = await preview(await prepare(defaultConfig));
+  assert.equal(ordinary.body.input.length, 1);
+  assert.equal(ordinary.body.input[0].content[0].text, base.prompt);
+  assert.equal(ordinary.body.instructions, '');
+  assert.equal(ordinary.headers['x-openai-internal-codex-responses-lite'], undefined);
+});
+
+test('cache affinity and prefix reject unvalidated WebSocket use', async () => {
+  const config = { provider: 'openai-codex', model: 'gpt-6.1-sol', reasoning: 'medium',
+    prompt: 'Fixed instructions. Data.', prompt_cache_key: 'sse-only', transport: 'websocket' };
+  await assert.rejects(prepare(config), /prompt_cache_key.*SSE/);
+  await assert.rejects(prepare({ ...config, prompt_cache_prefix: 'Fixed instructions. ' }), /prompt_cache_key.*SSE/);
+});
+
+test('native instructions-only seed keeps one rejected SDK transport attempt', async () => {
+  const prefix = 'Fixed instructions.\n';
+  const prepared = await prepare({ provider: 'openai-codex', model: 'gpt-6.1-sol', reasoning: 'medium',
+    prompt: prefix, prompt_cache_prefix: prefix, prompt_cache_key: 'seed-rejection', schema });
+  const expected = (await preview(prepared)).body;
+  const token = 'test.' + Buffer.from(JSON.stringify({ 'https://api.openai.com/auth': {
+    chatgpt_account_id: 'test-account' } })).toString('base64') + '.signature';
+  let calls = 0;
+  const result = await execute(prepared, { apiKey: token, fetch: async (url, options) => {
+    calls++;
+    const sent = new Request(url, options);
+    let body = Buffer.from(await sent.arrayBuffer());
+    if (sent.headers.get('content-encoding') === 'zstd') body = zstdDecompressSync(body);
+    assert.deepEqual(JSON.parse(body.toString('utf8')), expected);
+    assert.equal(sent.headers.get('x-openai-internal-codex-responses-lite'), 'true');
+    assert.equal(expected.input.length, 2);
+    return new Response('{"error":{"message":"Unsupported input format","type":"invalid_request_error"}}', { status: 400 });
+  } });
+  assert.equal(calls, 1);
+  assert.equal(result.http_attempts, 1);
+  assert.equal(result.valid, false);
+  assert.equal(result.response_metadata.http_status, 400);
+  assert.match(result.error, /Unsupported input format/);
+  assert.equal(result.request.body.input.length, 2);
+});
+
+test('native prefix rejects invalid settings before serialization', async () => {
+  const base = { provider: 'openai-codex', model: 'gpt-6.1-sol', reasoning: 'medium',
+    prompt: 'Fixed instructions. Data', prompt_cache_prefix: 'Fixed instructions. ', prompt_cache_key: 'prefix-test' };
+  for (const change of [
+    { prompt_cache_prefix: '' }, { prompt_cache_prefix: ' ' }, { prompt_cache_prefix: null },
+    { prompt_cache_prefix: 2 }, { prompt_cache_prefix: 'Other' },
+    { prompt_cache_prefix: '\ud800' }, { model: 'gpt-6-sol' },
+    { provider: 'openrouter', model: 'deepseek/deepseek-v4.1-flash' },
+    { prompt_cache_key: undefined },
+  ]) await assert.rejects(prepare({ ...base, ...change }), /prompt_cache_(prefix|key)/);
+  const withoutKey = { ...base };
+  delete withoutKey.prompt_cache_key;
+  await assert.rejects(prepare(withoutKey), /prompt_cache_prefix.*prompt_cache_key/);
+});
+
+test('retired explicit cache configuration is rejected before serialization', async () => {
+  for (const mode of ['explicit', 'implicit']) {
+    await assert.rejects(prepare({ provider: 'openai-codex', model: 'gpt-6.1-sol',
+      reasoning: 'medium', prompt: 'Static instructions. Changing comparison.',
+      prompt_cache: { mode, prefixes: ['Static instructions. '] } }),
+    /Unknown config field: prompt_cache/);
+  }
+});
+
 for (const script of ['model.mjs']) {
   test(`${script}: CLI help preserves spending approval without requiring provider caps`, () => {
     const result = spawnSync(process.execPath, [new URL(script, import.meta.url).pathname, '--help'],
@@ -345,6 +518,46 @@ test('chunked multiline SSE preserves native metadata and exact text', async () 
   assert.equal(result.response_metadata.id, 'multiline-response');
   assert.equal(result.response_metadata.provider, 'native-provider');
   assert.equal(result.response_metadata.usage.completion_tokens, 2);
+});
+
+test('Codex SSE accepted by the SDK retains raw usage even under an application/json header', async () => {
+  const request = await prepare(config({ ...codex, model: 'gpt-6.1-sol', reasoning: 'medium' }, { schema }));
+  const expected = (await preview(request)).body;
+  const text = '{"count":2,"label":"🦉"}';
+  const item = { id: 'msg-mime', type: 'message', role: 'assistant', status: 'completed',
+    content: [{ type: 'output_text', text, annotations: [] }] };
+  const usage = { input_tokens: 100, output_tokens: 10, total_tokens: 110,
+    input_tokens_details: { cached_tokens: 60, cache_write_tokens: 0 },
+    output_tokens_details: { reasoning_tokens: 3 },
+    attribution: { items: { 'msg-fixed': { input_tokens: 60, cached_tokens: 60, cache_write_tokens: 0 } } } };
+  const events = [
+    { type: 'response.created', response: { id: 'resp-mime', status: 'in_progress' } },
+    { type: 'response.output_item.added', output_index: 0, item: { ...item, content: [] } },
+    { type: 'response.output_item.done', output_index: 0, item },
+    { type: 'response.completed', response: { id: 'resp-mime', model: 'gpt-6.1-sol', status: 'completed', output: [item], usage } },
+  ];
+  const bytes = Buffer.from(events.map(event => `data: ${JSON.stringify(event)}\n\n`).join(''));
+  const key = 'test.' + Buffer.from(JSON.stringify({ 'https://api.openai.com/auth': {
+    chatgpt_account_id: 'test-account' } })).toString('base64url') + '.signature';
+  let calls = 0;
+  const result = await execute(request, { apiKey: key, fetch: async () => {
+    calls++;
+    return new Response(new ReadableStream({ start(controller) {
+      for (let offset = 0; offset < bytes.length; offset += 3) controller.enqueue(bytes.subarray(offset, offset + 3));
+      controller.close();
+    } }), { headers: { 'content-type': 'application/json', 'x-agent-request-id': 'proxy-mime' } });
+  } });
+  assert.equal(result.valid, true, result.error);
+  assert.equal(result.response_id, 'resp-mime');
+  assert.equal(result.usage.cacheRead, 60);
+  assert.deepEqual(result.response_metadata.usage, usage);
+  assert.equal(result.response_metadata.terminal_event, 'response.completed');
+  assert.equal(result.timing.byte_count, bytes.length);
+  assert.equal(result.timing.event_count, events.length);
+  assert.equal(result.raw_text, text);
+  assert.deepEqual(result.request.body, expected);
+  assert.equal(calls, 1);
+  assert.equal(result.http_attempts, 1);
 });
 
 test('streamed errors retain distinguishing codes and safe fields before SDK normalization', async () => {
