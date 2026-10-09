@@ -7,13 +7,14 @@ import { spawn } from 'node:child_process';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { zstdDecompressSync } from 'node:zlib';
+import { createHash } from 'node:crypto';
 
 test('shared CLI warms the exact SSE prefix and accounts for real worker receipts', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'experiment-cache-cli-'));
   const cli = process.env.EXPERIMENT_RUNNER_TEST_CLI || fileURLToPath(new URL('../../bin/experiment-runner', import.meta.url));
   const worker = process.env.EXPERIMENT_RUNNER_TEST_WORKER || fileURLToPath(new URL('../run-model.sh', import.meta.url));
-  const prefix = 'Compare the supplied data. Return the requested JSON.\r\n';
-  const key = 'offline-sse-prefix';
+  const prefix = 'Compare the supplied data. Return the requested JSON.' + ' word'.repeat(1100) + '\r\n';
+  const key = 'prefix-' + createHash('sha256').update(prefix).digest('hex').slice(0, 56);
   const credential = 'fixture.' + Buffer.from(JSON.stringify({ 'https://api.openai.com/auth': {
     chatgpt_account_id: 'offline-account' } })).toString('base64url') + '.invalid';
   const schema = { type: 'object', properties: { answer: { type: 'string' } }, required: ['answer'], additionalProperties: false };
@@ -105,24 +106,27 @@ test('shared CLI warms the exact SSE prefix and accounts for real worker receipt
   }
   try {
     await command('prepare', 'ordinary', '--spec', 'spec.json');
-    await command('prepare', 'cached', '--from', 'ordinary', '--prompt-cache-key', key, '--prompt-cache-prefix', path.join(root, 'prefix.txt'));
-    await command('prepare', 'warm', '--from', 'cached', '--cache-warmup');
+    await command('prepare', 'cached', '--from', 'ordinary', '--prompt-cache-prefix', path.join(root, 'prefix.txt'));
     assert.equal(observations.length, 0);
-    for (const name of ['ordinary', 'warm', 'cached']) await command('run', name, '--attempt-budget', path.join(root, 'budget.json'));
+    for (const name of ['ordinary', 'cached']) await command('run', name, '--attempt-budget', path.join(root, 'budget.json'));
     assert.equal(observations.length, 5); assert.equal(load('budget.json').used, 5);
     assert.equal(observations[2].text, prefix);
     for (const comparison of observations.slice(3)) assert.deepEqual(comparison.body.input.slice(0, 2), observations[2].body.input);
     assert.notDeepEqual(observations[3].body.input[2], observations[4].body.input[2]);
-    for (const name of ['ordinary', 'warm', 'cached']) {
+    for (const name of ['ordinary', 'cached']) {
       const report = load(name + '/report.json'); assert.equal(report.summary.failed, 0); assert.equal(report.usage.attempts_without_usage, 0);
-      for (const c of report.cases) assert.equal(c.parsed.answer, name === 'warm' ? 'warmup' : 'comparison');
+      for (const c of report.cases) assert.equal(c.parsed.answer, 'comparison');
       for (const line of fs.readFileSync(path.join(root, name, 'run/results.jsonl'), 'utf8').trim().split('\n')) {
         const r = JSON.parse(line); assert.equal(r.model_result.http_attempts, 1); assert(r.model_result.response_metadata.usage);
         assert(!line.includes(credential));
       }
     }
     assert.equal(load('cached/report.json').usage.cached_input_tokens, 120);
-    const total = ['ordinary', 'warm', 'cached'].reduce((sum, name) => sum + load(name + '/report.json').usage.catalog_cost_estimate_usd, 0);
+    assert.equal(load('cached/report.json').summary.attempts, 3);
+    assert.equal(load('cached/report.json').cache_warmup.attempts, 1);
+    const warmup = load('cached/cache-warmups/0001/report.json');
+    assert.equal(warmup.cases[0].parsed.answer, 'warmup');
+    const total = ['ordinary', 'cached'].reduce((sum, name) => sum + load(name + '/report.json').usage.catalog_cost_estimate_usd, 0);
     assert(Math.abs(total - 0.001272) < 1e-12);
     const receipts = fs.readFileSync(path.join(root, 'cached/run/results.jsonl'));
     await command('prepare', 'reused', '--from', 'cached');

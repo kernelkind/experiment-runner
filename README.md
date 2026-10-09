@@ -25,8 +25,8 @@ Use this launcher for experiment execution. Do not substitute an immutable Nix
 package or require a system installation for this workflow.
 
 `experiment-runner --help` lists commands and points to the cache workflow.
-`experiment-runner prepare --help` includes prefix/key setup, a complete
-warmup-and-batch example, and worker migration. `experiment-runner run --help`
+`experiment-runner prepare --help` includes the prefix option, an automatic
+warming example, and worker migration. `experiment-runner run --help`
 explains shared attempt bounds and cache-cost accounting.
 
 `prepare`, `show`, `revise`, attributed `review` and `reconcile-costs` retain their
@@ -100,26 +100,14 @@ with `--from` and `--runner-binary` to migrate, as described above.
 
 ## SSE prefix caching
 
-Version 1.1.0 adds opt-in prefix caching for the `openai-codex` subscription
-route, with `gpt-6.1-sol` and SSE. The tested configuration sends fixed
-instructions in a developer input item, changing case data in a separate user
-item, and a stable cache key in the body and routing headers. Each request is
-independent: earlier answers are never included. It uses the existing admission,
-retry, receipt-validation and exact-answer-reuse paths.
-
-Prepare a nonempty UTF-8 file containing the **exact beginning of every rendered
-prompt**, including spaces and line endings. Put fixed instructions there and
-changing case data after it. The runner refuses a prefix mismatch. Choose a
-stable key of 1–64 visible ASCII characters without spaces; reuse it for the
-same fixed instructions across the warmup and comparison batches. Do not
-generate a new key for each case or directory.
-
-The following workflow assumes an existing comparison experiment
-`target/comparisons-v1` and its fixed prefix in `prompts/compare-prefix.txt`.
-Replace those two paths with your experiment and prefix file. Run from your
-project checkout. Preparation makes no model calls; the two `run`
-commands use your existing inference authorization. Set the attempt bounds to
-your allowance, including warmup and possible retries.
+Version 1.2.0 provides one caching option: `--prompt-cache-prefix FILE`.
+It is supported for `openai-codex`, `gpt-6.1-sol` and SSE. Supply a nonempty
+UTF-8 file containing the **exact beginning of every rendered prompt**, including
+whitespace. Fixed instructions go there; changing case data follows them. The
+runner refuses mismatches, derives a stable namespaced key from the prefix's
+SHA-256 hash, and freezes both the prefix and key. The same prefix gets the same
+key across cases and batches; changing whitespace changes it. The backend still
+receives and checks the actual input text; a key does not substitute for it.
 
 ```bash
 cd ~/src/notedeck_worktrees/algos/oracle-mvp
@@ -128,48 +116,65 @@ cd ~/src/notedeck_worktrees/algos/oracle-mvp
   --runner-binary ../experiment-runner/experiment_runner/run-model.sh \
   --provider openai-codex --model gpt-6.1-sol --reasoning-effort medium \
   --transport sse --concurrency 8 \
-  --prompt-cache-key hierarchy-compare-v1 \
   --prompt-cache-prefix prompts/compare-prefix.txt
-../experiment-runner/bin/experiment-runner prepare target/compare-warmup-v1 \
-  --from target/compare-cached-v1 --cache-warmup
-../experiment-runner/bin/experiment-runner run target/compare-warmup-v1 \
-  --max-new-attempts 1
 ../experiment-runner/bin/experiment-runner run target/compare-cached-v1 \
-  --max-new-attempts 128
+  --max-new-attempts 129
 ```
 
-The warmup is one ordinary instructions-only inference request, prepared at
-concurrency one. It keeps the comparison schema and key, intentionally sends
-again instead of reusing a saved answer, and records its own usage. Its answer
-does not become a comparison answer, baseline or hierarchy input. Finish the
-warmup before running the comparison batch. Prepare another uniquely named
-warmup with `--from` that batch when intentionally warming a later batch;
-do not reset existing receipts or budgets. Warmup preparation rejects runner
-setting overrides so its key and model settings match that comparison batch.
+Replace the example's experiment and prefix paths with your own. Preparation
+makes no model calls. The single `run` command first checks exact-answer reuse.
+Immediately before the first comparison requiring a new attempt, it sends one
+instructions-only warmup and waits for completion, then runs the comparisons.
+This uses the tested developer-prefix/user-data format and native subscription
+key/routing headers. Each request remains independent; no previous answer is
+included.
 
-If you already use a persistent allowance, pass
-`--attempt-budget target/attempt-budget.json` to **both** `run` commands, using
-the existing counter. Every actual attempt, including warmup, retries and
-failures, consumes it. `--max-new-attempts` bounds each command; the persistent
-counter bounds their combined work. Keep the selected subscription, model,
-schema, prefix and key stable for the comparison. Later batches prepared with
-`--from` inherit the prefix/key; a new spec can set the same options explicitly.
+Automatic warming requires a prefix with at least **1,024 locally estimated
+`o200k_base` tokens** and allowance for warmup plus a comparison. The count covers
+only the supplied text, excludes message/schema overhead and is not an exact
+subscription tokenizer contract. The documented public API threshold is 1,024
+visible tokens ([OpenAI caching guide](https://developers.openai.com/api/docs/guides/prompt-caching));
+backend eligibility and cache hits remain unguaranteed. Short
+prefixes keep the instruction/data format but skip warming. All-reused or
+completed batches skip warming; with only one attempt left, the comparison takes
+priority. A resumed invocation with new comparisons may warm again. A failed
+warmup stops that invocation before comparisons; a later resume preserves the
+old receipts and records any new warmup separately.
 
-For specs, `runner.prompt_cache_key` is the key string and
-`runner.prompt_cache_prefix` is the literal prefix text. The CLI's
-`--prompt-cache-prefix` instead reads a file and freezes its bytes and hash.
-Omitting these settings keeps the previous one-user-message format. Existing
-experiments retain their frozen worker; select the shared source worker when
-preparing a new experiment as above. Intentionally independent repeat trials
-require `prepare --repeat`; ordinary identical comparisons reuse saved answers.
-Cache options with WebSocket are refused before dispatch.
+Token counting uses Python `tiktoken`; install the declared Python dependencies
+in your runtime, or the runner uses its Nix dependency runtime fallback when
+`tiktoken` is unavailable. It never substitutes a packaged runner for the shared
+source. The local check sends no provider probe.
 
-Read usage through `show EXPERIMENT --json` or its saved `report.json`: input,
-cached input, cache writes, output/reasoning and known catalog-cost subtotal are
-retained. Add warmup and comparison costs when measuring savings. Reasoning is
-already part of output cost. A failed call without final usage keeps the total
-unknown; zero SDK placeholders are not evidence of a free attempt. Raw provider
-usage remains in immutable model receipts.
+Every actual attempt, including warmup, retries and failures, consumes the same
+`--max-new-attempts` command cap and existing `--attempt-budget PATH` counter.
+Programmatic additional counters apply to warmup too. Set your authorized
+allowance to include this overhead; do not create/reset counters to warm. The
+warmup keeps the comparison schema and model settings, intentionally dispatches
+instead of reusing a saved answer, and is preserved in `cache-warmups/` with a
+verified parent reference in `cache-warmups.jsonl`. Its answer cannot become a
+comparison answer, baseline or hierarchy input.
+
+`show EXPERIMENT --json` and `report.json` include warmup in batch attempt and
+usage/cost totals. `cache_warmup` separately shows the frozen eligibility check,
+actual warmup attempts, token/cost usage and native receipt references. These
+warmup totals cover the experiment even in a filtered case view; warming is
+shared overhead. Input, cached input, cache writes, output and reasoning remain
+available. Output cost already includes reasoning. A failed call without final
+usage leaves complete cost unknown. Raw provider usage stays in immutable
+receipts. `--generation-costs` also includes the original warmup once when
+tracing multiple answers reused from the same batch.
+
+For specs, set literal `runner.prompt_cache_prefix` text without a manual key.
+The CLI option reads and hashes a file. Later `prepare --from` batches inherit
+the automatic policy. Omission preserves the previous one-user-message format.
+Old manual-key/warmup experiments retain their frozen behavior; the legacy
+options remain accepted for compatibility but are hidden from normal help.
+Supply the prefix option again to opt an older experiment into the automatic
+workflow. Existing worker identity checks still require selecting the shared
+worker for a newly prepared experiment. `prepare --repeat` requests independent
+fresh trials; otherwise identical comparisons reuse saved answers. WebSocket
+cache options are refused before dispatch.
 
 The completed 1,032-attempt, eight-block comparison measured **13.0659% lower
 total API-equivalent cost**, including eight warmups, with no failures or

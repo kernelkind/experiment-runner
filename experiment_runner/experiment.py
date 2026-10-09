@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+from contextvars import copy_context
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -21,12 +22,15 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+from types import SimpleNamespace
 
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from experiment_runner import extraction_pipeline as engine, project
 from experiment_runner.project import inputs
+from experiment_runner.prompt_cache import prefix_policy
 
 
 def read(path):
@@ -173,6 +177,8 @@ def prepare(args, *, preparation_context=None, include_request_preview=True):
         inherited_history = old_manifest.get("request_reuse", {}).get("history_root")
         setup = {k: old[k] for k in ("prompt", "dataset", "cases", "runner", "sources")}
         setup['preparation'] = old.get('preparation')
+        if 'cache_warmup' in old:
+            setup['cache_warmup'] = old['cache_warmup']
         baseline = report(Path(args.from_experiment).resolve(), include_request_preview=include_request_preview)
     else:
         setup = spec_setup(args.spec, preparation_context=preparation_context,
@@ -213,6 +219,15 @@ def prepare(args, *, preparation_context=None, include_request_preview=True):
         prefix_path = prefix_path.expanduser().resolve()
         setup["runner"]["prompt_cache_prefix"] = prefix_path.read_bytes().decode()
         setup["sources"] = {**setup["sources"], str(prefix_path): engine._sha256_file(prefix_path)}
+    prefix = setup['runner'].get('prompt_cache_prefix')
+    # Preserve explicit legacy key/manual-warmup experiments. New prefix-only
+    # preparation is the public interface; inherited automatic plans retain it.
+    if prefix and not args.import_config:
+        if getattr(args, 'prompt_cache_key', None) is not None:
+            setup.pop('cache_warmup', None)
+        elif prefix_path is not None or 'prompt_cache_key' not in setup['runner']:
+            setup['runner']['prompt_cache_key'] = 'prefix-' + engine._sha256_bytes(prefix.encode())[:56]
+            setup['cache_warmup'] = prefix_policy(prefix)
     warmup = getattr(args, "cache_warmup", False)
     if warmup:
         prefix = setup["runner"].get("prompt_cache_prefix")
@@ -226,6 +241,7 @@ def prepare(args, *, preparation_context=None, include_request_preview=True):
                            "prompt": prefix, "evidence": {"kind": "instructions-only-cache-warmup"}}]
         setup["preparation"] = {"version": "prompt-cache-warmup-v1", "cases": 1, "application_allowed": False}
         setup["runner"] = {**setup["runner"], "concurrency": 1}
+        setup.pop('cache_warmup', None)
         baseline = None
     if args.prompt:
         if not args.prompt_id:
@@ -301,6 +317,8 @@ def prepare(args, *, preparation_context=None, include_request_preview=True):
                 config, engine._runner_version(config)
             )
             manifest["config_path"] = str(destination / "runner-config.json")
+            if warmup:
+                manifest['cache_warmup'] = True
             engine._request_history_options(
                 config,
                 manifest,
@@ -462,7 +480,8 @@ def usage_summary(calls, *, strict=True):
     return usage
 
 
-def generation_usage(config, manifest, selected, records, latest, files, reconciled_costs):
+def generation_usage(config, manifest, selected, records, latest, files, reconciled_costs,
+                     warmup_calls=(), warmup_sources=()):
     """Account for original calls once by verified file/line, not request text."""
     ledger = (config.run_directory / "results.jsonl").resolve()
     jobs = {"prompt:" + c.get("job_id", c["id"]): c for c in selected}
@@ -528,10 +547,66 @@ def generation_usage(config, manifest, selected, records, latest, files, reconci
                             result_sha256=engine._sha256_bytes(line),
                             job_key=record.get("job_key"), status=record.get("status"),
                             added_from_reuse=added))
-    return {**usage_summary(calls, strict=True), "original_calls": len(originals),
-            "source_calls_added": len(originals) - local_count,
-            "failed_calls": sum(r.get("status") == "failed" for r, _ in originals.values()),
+    calls.extend(warmup_calls)
+    sources.extend(warmup_sources)
+    seen_warmups = {(s['results_path'], s['result_line']) for s in warmup_sources}
+    inherited_warmups = 0
+    # Tracing a reused generation must include the warmup paid by its original
+    # batch, once even when several selected cases share that batch.
+    for source_ledger in source_ledgers:
+        source_directory = source_ledger.parent.parent
+        if source_ledger == ledger or not (source_directory / 'cache-warmups.jsonl').exists():
+            continue
+        source_plan, source_config, _ = load(source_directory)
+        prior_calls, prior_sources = cache_warmup_records(source_directory, source_plan, source_config)
+        for call, source in zip(prior_calls, prior_sources):
+            key = (source['results_path'], source['result_line'])
+            if key not in seen_warmups:
+                calls.append(call)
+                sources.append({**source, 'added_from_reuse': True})
+                seen_warmups.add(key)
+                inherited_warmups += 1
+    return {**usage_summary(calls, strict=True), "original_calls": len(calls),
+            "source_calls_added": len(originals) - local_count + inherited_warmups,
+            "failed_calls": sum(r.get("status") == "failed" for r, _ in calls),
             "sources": sources}
+
+
+def cache_warmup_records(directory, plan, config):
+    """Verify separately preserved warmups and include their actual attempts."""
+    index = directory / 'cache-warmups.jsonl'
+    calls, sources = [], []
+    seen = set()
+    for entry in [json.loads(line) for line in index.read_bytes().splitlines()] if index.exists() else []:
+        child = directory / 'cache-warmups' / entry['directory']
+        if child.parent != directory / 'cache-warmups' or child in seen:
+            raise ValueError('invalid cache warmup reference')
+        seen.add(child)
+        warm_plan, warm_config, warm_manifest = load(child)
+        if (entry['parent_manifest_sha256'] != plan['manifest_sha256']
+                or entry['manifest_sha256'] != warm_plan['manifest_sha256']
+                or not warm_manifest.get('cache_warmup')
+                or warm_plan['preparation'].get('application_allowed') is not False
+                or len(warm_config.prompts) != 1
+                or warm_config.prompts[0].text != config.prompt_cache_prefix
+                or replace(warm_config, config_path=config.config_path,
+                           run_directory=config.run_directory, prompts=config.prompts,
+                           concurrency=config.concurrency) != config):
+            raise ValueError('cache warmup does not match the frozen comparison settings')
+        warm_report = report(child, generation_costs=True, include_request_preview=False)
+        if warm_report['summary']['invalid_receipt']:
+            raise ValueError('invalid cache warmup receipt')
+        for source in warm_report['generation_usage']['sources']:
+            path = Path(source['results_path'])
+            raw = engine.ReceiptFiles().line(path, source['result_line'])
+            if engine._sha256_bytes(raw) != source['result_sha256']:
+                raise engine.RunnerError('cache warmup receipt changed while reporting')
+            record = json.loads(raw)
+            costs = engine.load_reconciled_costs(path.parent,
+                [json.loads(line) for line in path.read_bytes().splitlines()])
+            calls.append((record, engine.provider_cost(record, costs)))
+            sources.append(source)
+    return calls, sources
 
 
 def report(directory, only=None, note_ids=None, *, generation_costs=False, include_request_preview=True):
@@ -671,14 +746,16 @@ def report(directory, only=None, note_ids=None, *, generation_costs=False, inclu
         cases.append(row)
     attempts = [r for r in records if r.get("execution") != "cross_run_reuse"
                 and r.get("job_key") in selected_jobs]
-    usage = usage_summary((r, engine.provider_cost(r, reconciled_costs)) for r in attempts)
+    warmup_calls, warmup_sources = cache_warmup_records(directory, plan, config)
+    usage = usage_summary([*((r, engine.provider_cost(r, reconciled_costs)) for r in attempts),
+                           *warmup_calls])
     summary = {
         s: sum(c["status"] == s for c in cases)
         for s in ("valid", "empty", "malformed", "invalid_receipt", "failed", "unrun")
     }
     summary.update(
         cases=len(cases),
-        attempts=len(attempts),
+        attempts=len(attempts) + len(warmup_calls),
         reused=sum(c.get("reused", False) for c in cases),
     )
     result = {
@@ -699,6 +776,11 @@ def report(directory, only=None, note_ids=None, *, generation_costs=False, inclu
         "cases": cases,
         "baseline_only": sorted(set(baseline) - {c["id"] for c in cases}),
     }
+    if plan.get('cache_warmup') or warmup_calls:
+        result['cache_warmup'] = {**plan.get('cache_warmup', {}),
+                                  'attempts': len(warmup_calls),
+                                  'usage': usage_summary(warmup_calls),
+                                  'sources': warmup_sources}
     execution_settings = directory / 'execution-settings.jsonl'
     if execution_settings.exists():
         with execution_settings.open() as f:
@@ -725,7 +807,8 @@ def report(directory, only=None, note_ids=None, *, generation_costs=False, inclu
         selected_extension.enrich_report(result, plan, cases)
     if generation_costs:
         result["generation_usage"] = generation_usage(
-            config, manifest, selected, records, latest, files, reconciled_costs)
+            config, manifest, selected, records, latest, files, reconciled_costs,
+            warmup_calls, warmup_sources)
     return result
 
 
@@ -850,6 +933,53 @@ def run(directory, max_new_attempts=None, runner_upgrade_reason=None, *,
                 plan["dataset"], cases[job.prompt_id], raw, config.output_schema
             )
 
+        warmup_lock = threading.Lock()
+        warmup_checked = False
+        warmup_error = None
+        context = copy_context()
+
+        def warm_before_dispatch(budget):
+            nonlocal warmup_checked, warmup_error
+            with warmup_lock:
+                if warmup_error is not None:
+                    raise warmup_error
+                if warmup_checked:
+                    return
+                # Keep room for a real comparison. Persistent admission is
+                # rechecked on every launch, including the warmup.
+                if budget.remaining() < 2:
+                    warmup_checked = True
+                    return
+                def warm():
+                    parent = directory / 'cache-warmups'
+                    parent.mkdir(exist_ok=True)
+                    number = len(list(parent.iterdir())) + 1
+                    child = parent / f'{number:04d}'
+                    args = SimpleNamespace(destination=child, from_experiment=directory,
+                        spec=None, baseline=None, only=None, prompt=None, prompt_id=None,
+                        import_config=None, repeat=True, history_root=Path(manifest['request_reuse']['history_root']),
+                        cache_warmup=True, prompt_cache_prefix=None,
+                        **{k: None for k in ('model', 'reasoning_effort', 'provider', 'concurrency',
+                            'max_output_tokens', 'transport', 'runner_binary', 'prompt_cache_key')})
+                    prepare(args, include_request_preview=False)
+                    warm_plan, warm_config, warm_manifest = load(child)
+                    engine._append_json_line(directory / 'cache-warmups.jsonl', dict(
+                        directory=child.name, parent_manifest_sha256=plan['manifest_sha256'],
+                        manifest_sha256=warm_plan['manifest_sha256']))
+                    try:
+                        engine._execute_prompt_batch(warm_config, warm_manifest, retry_failed=False,
+                            new_job_budget=budget,
+                            validate_output=lambda job, raw: inputs.validate(
+                                {'adapter': 'generic'}, warm_plan['cases'][0], raw, config.output_schema))
+                    finally:
+                        write(child / 'report.json', report(child, include_request_preview=False))
+                try:
+                    context.run(warm)
+                except (engine.RunnerError, ValueError) as caught:
+                    warmup_error = caught
+                    raise
+                warmup_checked = True
+
         try:
             engine._execute_prompt_batch(
                 config,
@@ -863,6 +993,7 @@ def run(directory, max_new_attempts=None, runner_upgrade_reason=None, *,
                 attempt_budget_path=attempt_budget_path,
                 additional_attempt_budget_paths=additional_attempt_budget_paths,
                 runner_upgrade_reason=runner_upgrade_reason if wrapper_changed else None,
+                before_new_attempt=(warm_before_dispatch if plan.get('cache_warmup', {}).get('eligible') else None),
             )
         except engine.RunnerError as caught:
             error = caught
@@ -967,42 +1098,41 @@ def parser():
         prog="experiment-runner", description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Global options: --project-root PATH selects project adapters; --version prints the shared release.\n\n"
-        "SSE prefix caching: experiment-runner prepare --help explains prefix/key setup,\n"
+        "SSE prefix caching: experiment-runner prepare --help explains the single prefix option,\n"
         "instructions-only warmup and comparison batches. experiment-runner run --help\n"
         "explains attempt budgets and cache-cost accounting.")
     commands = root.add_subparsers(dest="command", required=True)
     p = commands.add_parser(
         "prepare", help="freeze inputs/settings and baseline; no inference",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""SSE prefix caching (openai-codex, gpt-6.1-sol):
+        epilog="""SSE prefix caching (openai-codex, gpt-6.1-sol, SSE):
   Put the exact beginning of every rendered prompt in a nonempty UTF-8 file,
   preserving whitespace. Fixed instructions go there; case data follows them.
-  Choose one stable key of 1-64 visible ASCII characters without spaces.
-  Reuse the prefix/key across warmup and batches; do not change it per case.
+  The stable key is derived from the exact prefix; no manual key is needed.
 
-Example from your project checkout (replace the spec, prefix and destinations):
+Example from your project checkout (replace the spec, prefix and destination):
   experiment-runner prepare target/cached-v1 --spec comparisons.json \\
     --provider openai-codex --model gpt-6.1-sol --reasoning-effort medium \\
-    --transport sse --concurrency 8 --prompt-cache-key compare-v1 \\
-    --prompt-cache-prefix prompts/compare-prefix.txt
-  experiment-runner prepare target/warmup-v1 --from target/cached-v1 --cache-warmup
-  experiment-runner run target/warmup-v1 --max-new-attempts 1
-  experiment-runner run target/cached-v1 --max-new-attempts 128
+    --transport sse --concurrency 8 --prompt-cache-prefix prompts/compare-prefix.txt
+  experiment-runner run target/cached-v1 --max-new-attempts 129
 
-  Finish the warmup before running the comparison batch. Warmup is one real
-  instructions-only inference request at concurrency one; its answer is never
-  supplied to comparisons. It inherits the schema/key/settings and refuses
-  overrides. Preparing either experiment makes no model calls.
-  Use your authorized attempt bounds, including warmup and retries. Pass the
-  same existing attempt budget via --attempt-budget PATH to both run commands.
+  run automatically warms before the first comparison requiring a new attempt
+  when the prefix has at least 1,024 estimated o200k_base tokens and the attempt
+  allowance has room for warmup plus a comparison. Reused/completed batches do
+  not warm. Short prefixes keep the instruction/data format without warming.
+  This is a local eligibility check, not a guarantee of backend cache hits.
+  Warmup is real inference, uses the same schema/settings and never supplies its
+  answer to comparisons. Its usage/cost is included in the batch report.
+  Your existing attempt budget (--attempt-budget PATH) and command cap include
+  warmup, comparisons, retries and failures. Preparation makes no model calls.
 
   To migrate saved inputs, replace --spec with --from OLD_EXPERIMENT and select
-  the current release's worker with --runner-binary CURRENT_WORKER. Otherwise
-  --from retains the old frozen worker. It also inherits the saved prefix/key.
+  the shared worker with --runner-binary CURRENT_WORKER. Otherwise --from retains
+  the old frozen worker. It inherits automatic caching from an automatic plan;
+  old manual-cache plans retain their frozen behavior unless a prefix is supplied.
   Ordinary identical comparisons reuse answers; --repeat requests fresh trials.
-  Specs use runner.prompt_cache_key and literal runner.prompt_cache_prefix text;
-  the CLI prefix option reads a file. WebSocket cache options are refused.
-  Cache hits are not guaranteed. See experiment-runner run --help for costs."""
+  Specs use literal runner.prompt_cache_prefix text; the CLI reads a file.
+  WebSocket cache options are refused. See experiment-runner run --help for costs."""
     )
     p.add_argument("destination", type=Path)
     start = p.add_mutually_exclusive_group(required=True)
@@ -1025,11 +1155,11 @@ Example from your project checkout (replace the spec, prefix and destinations):
     p.add_argument("--transport", choices=("sse", "websocket"),
                    help="explicit transport; websocket is subscription-only, without fallback")
     p.add_argument("--prompt-cache-key",
-                   help="opt-in stable subscription SSE cache affinity; sends matching session-id and prompt_cache_key")
+                   help=argparse.SUPPRESS)
     p.add_argument("--prompt-cache-prefix", type=Path,
-                   help="exact UTF-8 prefix file; opt in to GPT-6.1 Sol subscription SSE instruction/data format")
+                   help="exact UTF-8 fixed-prefix file; derives key and enables eligible automatic warming")
     p.add_argument("--cache-warmup", action="store_true",
-                   help="prepare an intentional instructions-only request from a native-prefix experiment; answer never supplied to comparisons")
+                   help=argparse.SUPPRESS)
     p.add_argument(
         "--import-config",
         type=Path,
@@ -1040,14 +1170,19 @@ Example from your project checkout (replace the spec, prefix and destinations):
         help="execute a prepared experiment; retry only temporary provider errors",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""SSE prefix caching:
-  See experiment-runner prepare --help for prefix/key and warmup preparation.
-  Finish the warmup before the comparison batch; run both with the same existing
-  --attempt-budget PATH. Every warmup, retry and failed attempt consumes it.
-  --max-new-attempts caps this command; the shared counter caps their total.
+  Enable with prepare --prompt-cache-prefix FILE; see prepare --help.
+  run automatically sends an instructions-only warmup before new comparisons
+  when its frozen prefix is eligible and there is room for warmup + comparison.
+  All-reused/completed batches and insufficient allowances skip warming.
+  A resume with new comparisons can warm again; each invocation records its
+  warmup separately. A failed warmup stops that invocation before comparisons.
+  Every warmup, retry and failed attempt consumes --max-new-attempts and the
+  same --attempt-budget PATH. With one slot left, the comparison takes priority.
 
   Inspect usage with experiment-runner show EXPERIMENT --json or report.json.
-  Add warmup and comparison costs, including input, cached input, cache writes
-  and output. Output already includes reasoning; do not charge it twice.
+  Batch totals INCLUDE warmup input, cached input, cache writes and output;
+  cache_warmup separates its usage and native receipt references for inspection.
+  Output already includes reasoning; do not charge it twice.
   Missing failed-call usage leaves the complete cost unknown. Saved receipts
   retain raw provider usage. Cache hits are not guaranteed.""",
     )

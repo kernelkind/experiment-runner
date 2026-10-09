@@ -326,6 +326,11 @@ class NewJobBudget:
     def exhausted(self) -> bool:
         return self.limit is not None and self.used >= self.limit
 
+    def remaining(self) -> float:
+        with self.lock:
+            return min(float('inf') if self.limit is None else self.limit - self.used,
+                       self.persistent.remaining() if self.persistent is not None else float('inf'))
+
     def claim(self, job_key: str | None = None) -> None:
         with self.lock:
             if self.limit is not None and self.used >= self.limit:
@@ -2488,6 +2493,8 @@ def _prompt_request_key(manifest: dict[str, Any], prompt: str) -> str:
         request["prompt_cache_key"] = manifest["prompt_cache_key"]
     if manifest.get("prompt_cache_prefix") is not None:
         request["prompt_cache_prefix"] = manifest["prompt_cache_prefix"]
+    if manifest.get('cache_warmup'):
+        request['cache_warmup'] = True
     return _sha256_bytes(_canonical_json_bytes(request))
 
 
@@ -3634,6 +3641,8 @@ def _execute_prompt_batch(
     max_request_cost_usd: float | None = None,
     attempt_budget_path: Path | None = None,
     additional_attempt_budget_paths: Sequence[Path] = (),
+    new_job_budget: NewJobBudget | None = None,
+    before_new_attempt: Callable[[NewJobBudget], None] | None = None,
 ) -> dict[str, object]:
     if additional_attempt_budget_paths and attempt_budget_path is None:
         raise RunnerError('additional attempt budgets require a primary attempt_budget_path')
@@ -3675,7 +3684,7 @@ def _execute_prompt_batch(
             max_cost_usd=max_cost_usd, max_request_cost_usd=max_request_cost_usd,
             prior_spend_micro_usd=spend.spent, manifest_sha256=manifest_sha256,
             wrapper_sha256=provenance.active_wrapper_sha256))
-    budget = NewJobBudget(max_new_attempts, spend=spend,
+    budget = new_job_budget or NewJobBudget(max_new_attempts, spend=spend,
                          persistent=PersistentAttemptBudget(
                              attempt_budget_path, tuple(additional_attempt_budget_paths))
                          if attempt_budget_path is not None else None)
@@ -3723,12 +3732,17 @@ def _execute_prompt_batch(
             execution_wrapper_sha256=provenance.active_wrapper_sha256,
             receipt_files=history.files,
         )
+        def dispatch():
+            if (before_new_attempt is not None
+                    and (previous is None or arguments['retry_failed'])):
+                before_new_attempt(budget)
+            return _run_job(**arguments)
         if previous is not None:
-            response = _run_job(**arguments)
+            response = dispatch()
         else:
             key = _prompt_request_key(manifest, prompt.text)
             if options["intentional_repeat"]:
-                response = _run_job(**arguments)
+                response = dispatch()
                 with history.lock(key):
                     remember(key, prompt)
             else:
@@ -3740,7 +3754,7 @@ def _execute_prompt_batch(
                         reusable = reference, source
                         break
                     if reusable is None:
-                        response = _run_job(**arguments)
+                        response = dispatch()
                         remember(key, prompt)
                     else:
                         reference, source = reusable

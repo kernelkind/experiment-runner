@@ -20,12 +20,11 @@ class SharedRunnerTests(unittest.TestCase):
                 (('--help',), ('SSE prefix caching', 'experiment-runner prepare --help')),
                 (('prepare', '--help'), (
                     'exact beginning of every rendered prompt',
-                    '1-64 visible ASCII characters',
+                    'derived from the exact prefix',
                     'experiment-runner prepare target/cached-v1',
-                    'experiment-runner prepare target/warmup-v1',
-                    'experiment-runner run target/warmup-v1',
                     'experiment-runner run target/cached-v1',
-                    'Finish the warmup before running',
+                    '1,024',
+                    'automatically',
                     'existing attempt budget',
                     '--runner-binary',
                 )),
@@ -156,6 +155,153 @@ class SharedRunnerTests(unittest.TestCase):
 
 
 class NativePrefixTests(unittest.TestCase):
+    def automatic_prefix(self, tokens=1100):
+        # GENERIC PROMPT is four o200k_base tokens; every appended ' word' is one.
+        text = 'GENERIC PROMPT' + ' word' * (tokens - 4)
+        prefix = self.root / 'prefix.txt'
+        prefix.write_text(text)
+        self.prompt.write_text(text + '{POST}')
+        return prefix
+
+    def test_warming_threshold_uses_prefix_tokens_not_full_prompt_or_characters(self):
+        for tokens in (1023, 1024):
+            with self.subTest(tokens=tokens):
+                prefix = self.automatic_prefix(tokens)
+                name = f'tokens-{tokens}'
+                self.prepare(name, '--model', 'gpt-6.1-sol', '--prompt-cache-prefix', prefix)
+                prepared = self.show(name)
+                self.assertEqual(prepared['cache_warmup']['estimated_prefix_tokens'], tokens)
+                before = len(self.calls())
+                self.cli('run', name, '--max-new-attempts', '3')
+                new = self.calls()[before:]
+                self.assertEqual(len(new), 2 + (tokens >= 1024))
+                if tokens >= 1024:
+                    self.assertEqual(new[0]['prompt'], prefix.read_text())
+
+    def test_warmup_never_consumes_the_only_slot_and_resume_rechecks_capacity(self):
+        prefix = self.automatic_prefix()
+        self.prepare('limited', '--model', 'gpt-6.1-sol', '--prompt-cache-prefix', prefix)
+        self.cli('run', 'limited', '--max-new-attempts', '1', ok=False)
+        self.assertEqual(len(self.calls()), 1)
+        self.assertNotEqual(self.calls()[0]['prompt'], prefix.read_text())
+        self.assertEqual(self.show('limited')['cache_warmup']['attempts'], 0)
+        self.cli('run', 'limited', '--max-new-attempts', '2')
+        self.assertEqual(len(self.calls()), 3)
+        self.assertEqual(self.calls()[1]['prompt'], prefix.read_text())
+        self.assertEqual(self.show('limited')['summary']['attempts'], 3)
+
+    def test_additional_budget_with_one_slot_skips_warmup(self):
+        from unittest.mock import patch
+        from experiment_runner import experiment, extraction_pipeline as engine, project
+        prefix = self.automatic_prefix()
+        self.prepare('limited', '--model', 'gpt-6.1-sol', '--prompt-cache-prefix', prefix)
+        stage = self.write('stage.json', dict(schema_version=1, limit=3, used=0))
+        shared = self.write('shared.json', dict(schema_version=1, limit=1, used=0))
+        project.configure(self.root)
+        with patch.dict(os.environ, {'FAKE_RUNNER_LOG': str(self.log)}):
+            with self.assertRaises(engine.RunnerError):
+                experiment.run(self.root / 'limited', max_new_attempts=3,
+                               attempt_budget_path=stage, additional_attempt_budget_paths=(shared,))
+        self.assertEqual(len(self.calls()), 1)
+        self.assertNotEqual(self.calls()[0]['prompt'], prefix.read_text())
+        self.assertEqual(json.loads(stage.read_text())['used'], 1)
+        self.assertEqual(json.loads(shared.read_text())['used'], 1)
+
+    def test_command_cap_counts_warmup_and_both_persistent_counters(self):
+        from unittest.mock import patch
+        from experiment_runner import experiment, extraction_pipeline as engine, project
+        prefix = self.automatic_prefix()
+        self.prepare('limited', '--model', 'gpt-6.1-sol', '--prompt-cache-prefix', prefix,
+                     '--concurrency', '2')
+        stage = self.write('stage.json', dict(schema_version=1, limit=3, used=0))
+        shared = self.write('shared.json', dict(schema_version=1, limit=3, used=0))
+        project.configure(self.root)
+        with patch.dict(os.environ, {'FAKE_RUNNER_LOG': str(self.log)}):
+            with self.assertRaises(engine.RunnerError):
+                experiment.run(self.root / 'limited', max_new_attempts=2,
+                               attempt_budget_path=stage, additional_attempt_budget_paths=(shared,))
+        self.assertEqual(len(self.calls()), 2)
+        self.assertEqual(self.calls()[0]['prompt'], prefix.read_text())
+        self.assertEqual(json.loads(stage.read_text())['used'], 2)
+        self.assertEqual(json.loads(shared.read_text())['used'], 2)
+        self.assertEqual(self.show('limited')['summary']['unrun'], 1)
+
+    def test_warmup_answer_cannot_satisfy_an_identical_real_comparison(self):
+        prefix = self.automatic_prefix()
+        cases = json.loads(self.cases.read_text())
+        cases['cases'][0]['inputs']['POST'] = ''
+        self.cases.write_text(json.dumps(cases))
+        self.prepare('same', '--model', 'gpt-6.1-sol', '--prompt-cache-prefix', prefix)
+        self.cli('run', 'same', '--max-new-attempts', '3')
+        self.assertEqual([c['prompt'] for c in self.calls()].count(prefix.read_text()), 2)
+        self.assertEqual(self.show('same')['summary']['reused'], 0)
+
+    def test_failed_warmup_blocks_concurrent_comparisons_and_keeps_unknown_cost(self):
+        prefix = self.automatic_prefix()
+        self.prepare('failed', '--model', 'gpt-6.1-sol', '--prompt-cache-prefix', prefix,
+                     '--concurrency', '2')
+        budget = self.write('budget.json', dict(schema_version=1, limit=3, used=0))
+        self.cli('run', 'failed', '--attempt-budget', budget, ok=False,
+                 env={'FAKE_RUNNER_FAIL_STAGE': 'prompt'})
+        self.assertEqual(len(self.calls()), 1)
+        self.assertEqual(self.calls()[0]['prompt'], prefix.read_text())
+        self.assertEqual(json.loads(budget.read_text())['used'], 1)
+        saved = self.show('failed')
+        self.assertEqual(saved['summary']['unrun'], 2)
+        self.assertEqual(saved['summary']['attempts'], 1)
+        self.assertEqual(saved['usage']['attempts_without_usage'], 1)
+        self.assertIsNone(saved['usage']['catalog_cost_estimate_usd'])
+
+    def test_key_is_stable_across_experiments_and_changes_with_prefix_whitespace(self):
+        prefix = self.automatic_prefix()
+        self.prepare('one', '--model', 'gpt-6.1-sol', '--prompt-cache-prefix', prefix)
+        self.prepare('two', '--model', 'gpt-6.1-sol', '--prompt-cache-prefix', prefix)
+        self.assertEqual(self.show('one')['settings']['prompt_cache_key'],
+                         self.show('two')['settings']['prompt_cache_key'])
+        prefix.write_text(prefix.read_text() + '\n')
+        self.prompt.write_text(prefix.read_text() + '{POST}')
+        self.prepare('three', '--model', 'gpt-6.1-sol', '--prompt-cache-prefix', prefix)
+        self.assertNotEqual(self.show('one')['settings']['prompt_cache_key'],
+                            self.show('three')['settings']['prompt_cache_key'])
+
+    def test_invalid_budget_settings_fail_before_warming(self):
+        prefix = self.automatic_prefix()
+        self.prepare('invalid', '--model', 'gpt-6.1-sol', '--prompt-cache-prefix', prefix)
+        failed = self.cli('run', 'invalid', '--max-cost-usd', '1',
+                          '--max-request-cost-usd', '0.1', ok=False)
+        self.assertIn('requires provider-reported OpenRouter billing', failed.stderr)
+        self.assertEqual(self.calls(), [])
+
+    def test_prefix_only_automatically_warms_and_counts_the_shared_allowance(self):
+        prefix = self.root / 'prefix.txt'
+        text = 'GENERIC PROMPT' + ' word' * 1100 + '\n'
+        prefix.write_text(text)
+        self.prompt.write_text(text + '{POST}')
+        self.prepare('auto', '--model', 'gpt-6.1-sol', '--prompt-cache-prefix', prefix,
+                     '--concurrency', '2')
+        settings = self.show('auto')['settings']
+        self.assertEqual(settings['prompt_cache_key'],
+                         'prefix-' + hashlib.sha256(prefix.read_bytes()).hexdigest()[:56])
+        budget = self.write('budget.json', dict(schema_version=1, limit=3, used=0))
+        self.cli('run', 'auto', '--max-new-attempts', '3', '--attempt-budget', budget)
+        self.assertEqual(self.calls()[0]['prompt'], text)
+        self.assertEqual(len(self.calls()), 3)
+        result = self.show('auto')
+        self.assertEqual(result['summary']['attempts'], 3)
+        self.assertEqual(result['cache_warmup']['attempts'], 1)
+        self.assertEqual(result['usage']['input_tokens'], 300)
+        self.assertEqual(json.loads(budget.read_text())['used'], 3)
+        self.assertTrue(all(c['output'] != 'Response to: ' + text for c in result['cases']))
+        self.cli('prepare', 'reused-auto', '--from', 'auto')
+        self.cli('run', 'reused-auto', '--attempt-budget', budget)
+        self.cli('run', 'auto', '--attempt-budget', budget)
+        self.assertEqual(len(self.calls()), 3)
+        self.assertEqual(self.show('reused-auto')['summary']['reused'], 2)
+        traced = self.show('reused-auto', '--generation-costs')['generation_usage']
+        self.assertEqual(traced['original_calls'], 3)
+        self.assertEqual(traced['input_tokens'], 300)
+        self.assertEqual(traced['source_calls_added'], 3)
+
     def test_warmup_cannot_change_the_comparison_key_or_model_settings(self):
         prefix = self.root / 'prefix.txt'
         prefix.write_text('GENERIC PROMPT ')
