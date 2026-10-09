@@ -11,7 +11,9 @@ inference. Tests use local fixtures.
 
 ## Use
 
-The source checkout is `~/src/notedeck_worktrees/algos/experiment-runner`.
+Use the shared launcher at
+`~/src/notedeck_worktrees/algos/experiment-runner/bin/experiment-runner`.
+It loads code directly from the shared `main` checkout.
 With the pinned Node dependencies installed in
 `experiment_runner/frontier_runner`, its CLI is immediately usable:
 
@@ -19,10 +21,8 @@ With the pinned Node dependencies installed in
 ~/src/notedeck_worktrees/algos/experiment-runner/bin/experiment-runner --help
 ```
 
-Build the immutable package with `nix build`. The package contains the pinned
-Python/Node runtime and Node dependencies. It provides the same
-`experiment-runner` executable. System installation belongs to `/opt/nixos`;
-source changes, releases and tests belong to this repository.
+Use this launcher for experiment execution. Do not substitute an immutable Nix
+package or require a system installation for this workflow.
 
 `experiment-runner --help` lists commands and points to the cache workflow.
 `experiment-runner prepare --help` includes prefix/key setup, a complete
@@ -53,8 +53,8 @@ cost and prompt-only filters cannot be combined with this input-only view.
 
 Preparation freezes the exact runner code hashes, model-worker identity,
 settings and inputs. The release identifier is available with `--version`.
-Source files and installed packages have distinct immutable identities; install
-or select the release before preparing new experiments.
+Preparation records hashes; it does not preserve a separate copy of the runner
+code. Later source changes can cause execution checks to refuse a resume.
 
 Saved receipts remain readable. A prepared experiment cannot silently switch
 code or transport. Existing `--runner-upgrade-reason` checks and audit ledgers
@@ -69,31 +69,30 @@ a new directory with `--runner-binary
 This selects the worker only for the new experiment; it does not resume or
 rewrite the previous experiment.
 
-Oracle's old Python/shell/Node entry points delegate to this package. For an
-explicit source-version pin, set `EXPERIMENT_RUNNER_ROOT` to a checkout of this
-repository. A project worktree itself does not select a runner revision.
+Oracle's old Python/shell/Node entry points delegate to this package.
+`EXPERIMENT_RUNNER_ROOT` can select another checkout for compatibility callers;
+the shared `main` checkout is the standard. A project worktree itself does not
+select a runner revision.
 
 ## Update the shared binary after code merges
 
-After **every code change merged into local `main`**, rebuild and update the
-shared runner binary from that clean checkout. This includes CLI, worker,
-dependency and packaging changes. Documentation-only and other non-code changes
-do not require a binary update.
+After **every code change merged into local `main`**, verify that the shared
+launcher runs the updated code from that clean checkout. The launcher loads the
+merged source directly, so the merge updates its implementation. If pinned Node
+dependencies changed, update them with `npm ci --ignore-scripts` in
+`experiment_runner/frontier_runner` before verification. Documentation-only and
+other non-code changes do not require a binary update.
 
 ```bash
 cd ~/src/notedeck_worktrees/algos/experiment-runner
-runner_package="$(nix build . --no-link --print-out-paths)"
-"$runner_package/bin/experiment-runner" --version
-"$runner_package/bin/experiment-runner" --help
-"$runner_package/bin/experiment-runner" prepare --help
+bin/experiment-runner --version
+bin/experiment-runner --help
+bin/experiment-runner prepare --help
 ```
 
-Verify the built binary's relevant behavior, then update any shared installation
-to that build and verify the installed command matches it. A successful build
-alone does not update an installed command. System installation is owned by
-`/opt/nixos` and follows its merge and activation permissions; report a pending
-installation explicitly. When no installation exists, give callers the exact
-built binary path rather than claiming it is available on `PATH`.
+Verify the shared launcher's relevant behavior and report its stable path and
+release version. This workflow uses the checkout launcher, not a command
+installed on `PATH`.
 
 Use the updated binary and its worker for newly prepared experiments. Existing
 experiments retain their frozen worker and receipts; prepare a new directory
@@ -118,25 +117,24 @@ generate a new key for each case or directory.
 The following workflow assumes an existing comparison experiment
 `target/comparisons-v1` and its fixed prefix in `prompts/compare-prefix.txt`.
 Replace those two paths with your experiment and prefix file. Run from your
-project checkout. Building the package makes no model calls; the two `run`
+project checkout. Preparation makes no model calls; the two `run`
 commands use your existing inference authorization. Set the attempt bounds to
 your allowance, including warmup and possible retries.
 
 ```bash
 cd ~/src/notedeck_worktrees/algos/oracle-mvp
-runner_package="$(nix build ../experiment-runner --no-link --print-out-paths)"
-"$runner_package/bin/experiment-runner" prepare target/compare-cached-v1 \
+../experiment-runner/bin/experiment-runner prepare target/compare-cached-v1 \
   --from target/comparisons-v1 \
-  --runner-binary "$runner_package/lib/experiment-runner/experiment_runner/run-model.sh" \
+  --runner-binary ../experiment-runner/experiment_runner/run-model.sh \
   --provider openai-codex --model gpt-6.1-sol --reasoning-effort medium \
   --transport sse --concurrency 8 \
   --prompt-cache-key hierarchy-compare-v1 \
   --prompt-cache-prefix prompts/compare-prefix.txt
-"$runner_package/bin/experiment-runner" prepare target/compare-warmup-v1 \
+../experiment-runner/bin/experiment-runner prepare target/compare-warmup-v1 \
   --from target/compare-cached-v1 --cache-warmup
-"$runner_package/bin/experiment-runner" run target/compare-warmup-v1 \
+../experiment-runner/bin/experiment-runner run target/compare-warmup-v1 \
   --max-new-attempts 1
-"$runner_package/bin/experiment-runner" run target/compare-cached-v1 \
+../experiment-runner/bin/experiment-runner run target/compare-cached-v1 \
   --max-new-attempts 128
 ```
 
@@ -161,7 +159,7 @@ For specs, `runner.prompt_cache_key` is the key string and
 `runner.prompt_cache_prefix` is the literal prefix text. The CLI's
 `--prompt-cache-prefix` instead reads a file and freezes its bytes and hash.
 Omitting these settings keeps the previous one-user-message format. Existing
-experiments retain their frozen worker; select the new packaged worker when
+experiments retain their frozen worker; select the shared source worker when
 preparing a new experiment as above. Intentionally independent repeat trials
 require `prepare --repeat`; ordinary identical comparisons reuse saved answers.
 Cache options with WebSocket are refused before dispatch.
