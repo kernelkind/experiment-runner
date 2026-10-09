@@ -1003,6 +1003,8 @@ def parser():
                    help="limit cases and usage to saved evidence.note_id (repeatable)")
     p.add_argument("--generation-costs", action="store_true",
                    help="trace verified original generation costs, counting reused sources once; no inference")
+    p.add_argument('--inputs-only', action='store_true',
+                   help='show only IDs, exact inputs and input hashes; hide prompts, answers and review evidence')
     p.add_argument("--json", action="store_true")
     p = commands.add_parser(
         "revise",
@@ -1069,6 +1071,19 @@ def main(argv=None):
         elif args.command == 'reconcile-costs':
             compact(reconcile_costs(args.experiment))
         elif args.command == 'show':
+            if args.inputs_only:
+                if args.note or args.generation_costs or args.prompt_only:
+                    raise ValueError('--inputs-only supports --case/--only, without evidence, cost or prompt filters')
+                plan, _, _ = load(args.experiment)
+                requested = set(args.only or []) | ({args.case} if args.case else set())
+                available = {case['id'] for case in plan['cases']}
+                if requested - available:
+                    raise ValueError('unknown case')
+                cases = [{key: case[key] for key in ('id', 'inputs', 'input_sha256')}
+                         for case in plan['cases'] if not requested or case['id'] in requested]
+                print(json.dumps(cases[0] if args.case and not args.only else {'cases': cases},
+                                 ensure_ascii=False, indent=2))
+                return 0
             if args.prompt_only and (not args.case):
                 raise ValueError('--prompt-only requires --case')
             if (args.experiment / 'bounded-build.json').exists():

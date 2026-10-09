@@ -132,6 +132,40 @@ def enrich_report(result, plan, cases):
         self.assertEqual(json.loads(stage.path.read_text())['used'], 0)
         self.assertEqual(json.loads(shared.path.read_text())['used'], 0)
 
+    def test_native_cli_inputs_only_returns_exact_inputs_without_answers_or_previews(self):
+        from contextlib import redirect_stdout, redirect_stderr
+        from io import StringIO
+        self.prepare()
+        experiment.run(self.root / 'E1', include_request_preview=False)
+        before = (self.root / 'calls.json').read_bytes()
+        plan = json.loads((self.root / 'E1/experiment.json').read_text())['plan']
+        exact = [{key: case[key] for key in ('id', 'inputs', 'input_sha256')}
+                 for case in plan['cases']]
+        def show(*options):
+            stdout, stderr = StringIO(), StringIO()
+            with redirect_stdout(stdout), redirect_stderr(stderr), patch.object(
+                    experiment, 'report', side_effect=AssertionError('answer report invoked')):
+                status = experiment.main(['show', str(self.root / 'E1'), '--inputs-only', *options])
+            return status, stdout.getvalue(), stderr.getvalue()
+        status, output, error = show('--json')
+        self.assertEqual(status, 0, error)
+        self.assertEqual(json.loads(output), {'cases': exact})
+        status, output, error = show('--case', 'two')
+        self.assertEqual(status, 0, error)
+        self.assertEqual(json.loads(output), exact[1])
+        status, output, error = show('--only', 'three', '--only', 'one')
+        self.assertEqual(status, 0, error)
+        self.assertEqual(json.loads(output), {'cases': [exact[0], exact[2]]})
+        status, output, error = show('--case', 'one', '--only', 'three')
+        self.assertEqual(status, 0, error)
+        self.assertEqual(json.loads(output), {'cases': [exact[0], exact[2]]})
+        for options in (('--case', 'missing'), ('--note', 'one'),
+                        ('--generation-costs',), ('--case', 'one', '--prompt-only')):
+            status, output, error = show(*options)
+            self.assertEqual(status, 1, (options, output, error))
+            self.assertEqual(output, '')
+        self.assertEqual((self.root / 'calls.json').read_bytes(), before)
+
     def test_native_accounting_reports_known_subtotals_and_deduplicated_reuse_costs(self):
         self.prepare()
         with patch.dict(os.environ, {'FAKE_RUNNER_RESULT_OVERRIDE': json.dumps({
