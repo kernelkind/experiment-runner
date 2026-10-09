@@ -69,7 +69,7 @@ def load(directory):
     return plan, config, manifest
 
 
-def spec_setup(path):
+def spec_setup(path, *, preparation_context=None, include_request_preview=True):
     path = Path(path).resolve()
     spec = read(path)
     engine._expect_fields(
@@ -92,7 +92,11 @@ def spec_setup(path):
         {"adapter", "path"} | ({"select", "mask_format", "combine_masks", "prominence_basis"} & dataset.keys()),
     )
     source_path = resolve(dataset["path"], path.parent)
-    cases, sources, preparation = inputs.prepare_file(dataset, source_path, prompt["text"], report)
+    context = {} if preparation_context is None else {'preparation_context': preparation_context}
+    cases, sources, preparation = inputs.prepare_file(
+        dataset, source_path, prompt["text"],
+        lambda directory: report(directory, include_request_preview=include_request_preview),
+        **context)
     runner = dict(spec["runner"])
     if "output_schema_path" in runner:
         if "output_schema" in runner:
@@ -159,7 +163,7 @@ def request_preview(plan, manifest, cases):
     }
 
 
-def prepare(args):
+def prepare(args, *, preparation_context=None, include_request_preview=True):
     destination = args.destination.expanduser().resolve()
     if destination.exists():
         raise ValueError("experiment destination already exists")
@@ -169,10 +173,11 @@ def prepare(args):
         inherited_history = old_manifest.get("request_reuse", {}).get("history_root")
         setup = {k: old[k] for k in ("prompt", "dataset", "cases", "runner", "sources")}
         setup['preparation'] = old.get('preparation')
-        baseline = report(Path(args.from_experiment).resolve())
+        baseline = report(Path(args.from_experiment).resolve(), include_request_preview=include_request_preview)
     else:
-        setup = spec_setup(args.spec)
-        baseline = report(args.baseline.resolve()) if args.baseline else None
+        setup = spec_setup(args.spec, preparation_context=preparation_context,
+                           include_request_preview=include_request_preview)
+        baseline = report(args.baseline.resolve(), include_request_preview=include_request_preview) if args.baseline else None
     if args.only:
         requested = set(args.only)
         unknown = requested - {c["id"] for c in setup["cases"]}
@@ -298,7 +303,7 @@ def prepare(args):
                         for name, path in project.code_files(plan['dataset']).items()}
         plan["requests_at_prepare"] = (
             request_preview(plan, manifest, plan["cases"])
-            if not args.import_config
+            if include_request_preview and not args.import_config
             else None
         )
         write(staged / "experiment.json", {"sha256": inputs.digest(plan), "plan": plan})
@@ -308,7 +313,7 @@ def prepare(args):
         destination.mkdir()
         for child in staged.iterdir():
             child.rename(destination / child.name)
-    result = report(destination)
+    result = report(destination, include_request_preview=include_request_preview)
     write(destination / "report.json", result)
     return result
 
@@ -507,7 +512,7 @@ def generation_usage(config, manifest, selected, records, latest, files, reconci
             "sources": sources}
 
 
-def report(directory, only=None, note_ids=None, *, generation_costs=False):
+def report(directory, only=None, note_ids=None, *, generation_costs=False, include_request_preview=True):
     directory = Path(directory).resolve()
     files = engine.ReceiptFiles()
     plan, config, manifest = load(directory)
@@ -679,7 +684,7 @@ def report(directory, only=None, note_ids=None, *, generation_costs=False):
         if any(r['manifest_sha256'] != manifest_hash for r in result['execution_settings']):
             raise ValueError('execution settings belong to another manifest')
     result["requests"] = (
-        request_preview(plan, manifest, cases) if not plan["imported"] else None
+        request_preview(plan, manifest, cases) if include_request_preview and not plan["imported"] else None
     )
     if result["adapter"] == "bounded_comparisons":
         token_counts = [case["evidence"]["input_tokens"] for case in cases]
@@ -782,10 +787,11 @@ def reconcile_costs(directory):
 
 def run(directory, max_new_attempts=None, runner_upgrade_reason=None, *,
         max_cost_usd=None, max_request_cost_usd=None, attempt_budget_path=None,
+        additional_attempt_budget_paths=(), include_request_preview=True,
         max_concurrency=None):
     directory = directory.resolve()
     if (directory / 'bounded-build.json').exists():
-        if any(x is not None for x in (max_cost_usd, max_request_cost_usd, attempt_budget_path, max_concurrency)):
+        if any(x is not None for x in (max_cost_usd, max_request_cost_usd, attempt_budget_path, max_concurrency)) or additional_attempt_budget_paths:
             raise ValueError('bounded builds use their frozen shared attempt budget and subscription route')
         run_build = project.import_module('bounded_hierarchy_build').run_build
         return run_build(directory, max_new_attempts, runner_upgrade_reason)
@@ -833,12 +839,13 @@ def run(directory, max_new_attempts=None, runner_upgrade_reason=None, *,
                 max_cost_usd=max_cost_usd,
                 max_request_cost_usd=max_request_cost_usd,
                 attempt_budget_path=attempt_budget_path,
+                additional_attempt_budget_paths=additional_attempt_budget_paths,
                 runner_upgrade_reason=runner_upgrade_reason if wrapper_changed else None,
             )
         except engine.RunnerError as caught:
             error = caught
         finally:
-            result = report(directory)
+            result = report(directory, include_request_preview=include_request_preview)
             write(directory / "report.json", result)
         if error:
             raise engine.RunnerError(

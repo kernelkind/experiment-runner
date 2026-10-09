@@ -21,8 +21,9 @@ import tempfile
 import threading
 import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field, replace
+from datetime import datetime
 from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from email.utils import parsedate_to_datetime
 from functools import lru_cache
@@ -209,26 +210,106 @@ class RetryDirective:
 
 @dataclass
 class PersistentAttemptBudget:
-    """An irreversible launch counter shared by separate saved experiments."""
+    """An irreversible launch counter with an optional UTC admission deadline."""
     path: Path
+    additional_paths: tuple[Path, ...] = ()
 
-    def claim(self, job_key: str | None = None) -> None:
-        path = self.path.resolve()
+    @staticmethod
+    def _read_value(path):
+        value = _expect_object(_load_json(path, 'attempt budget'), 'attempt budget')
+        expected = {'schema_version', 'limit', 'used'}
+        if 'deadline_utc' in value:
+            expected.add('deadline_utc')
+        _expect_fields(value, 'attempt budget', expected)
+        if (type(value['schema_version']) is not int or value['schema_version'] != 1
+                or type(value['limit']) is not int or type(value['used']) is not int
+                or value['limit'] < 1 or not 0 <= value['used'] <= value['limit']):
+            raise RunnerError('invalid persistent attempt budget')
+        deadline = None
+        if 'deadline_utc' in value:
+            raw = value['deadline_utc']
+            if not isinstance(raw, str) or not re.fullmatch(
+                    r'[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}'
+                    r'(?:\.[0-9]+)?(?:Z|\+00:00)', raw):
+                raise RunnerError('invalid persistent attempt budget deadline_utc')
+            try:
+                deadline = datetime.fromisoformat(raw).timestamp()
+            except (ValueError, OverflowError, OSError) as error:
+                raise RunnerError('invalid persistent attempt budget deadline_utc') from error
+        return value, deadline
+
+    def initialize(self, limit):
+        """Create only the primary counter, or validate it without changing it.
+
+        Initialization takes the same lock as claims. Existing usage and an
+        optional deadline are preserved byte-for-byte; a different limit or
+        malformed existing counter fails rather than replacing the allowance.
+        Existing claims also prevent recreating or rolling back spent allowance.
+        This neither reserves a launch nor initializes additional_paths.
+        """
+        if type(limit) is not int or limit < 1:
+            raise RunnerError('attempt budget limit must be a positive integer')
+        path = Path(self.path).resolve()
+        path.parent.mkdir(parents=True, exist_ok=True)
         with path.with_suffix(path.suffix + '.lock').open('a') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            value = _load_json(path, 'attempt budget')
-            _expect_fields(value, 'attempt budget', {'schema_version', 'limit', 'used'})
-            if (value['schema_version'] != 1 or type(value['limit']) is not int
-                    or type(value['used']) is not int or value['limit'] < 1
-                    or not 0 <= value['used'] <= value['limit']):
-                raise RunnerError('invalid persistent attempt budget')
-            if value['used'] >= value['limit']:
+            claims = path.with_suffix(path.suffix + '.claims.jsonl')
+            if path.exists():
+                value, _ = self._read_value(path)
+                if value['limit'] != limit:
+                    raise RunnerError('existing attempt budget limit differs')
+                if claims.exists():
+                    try:
+                        with claims.open('rb') as records:
+                            for line in records:
+                                claim = json.loads(line)
+                                ordinal = claim['ordinal']
+                                if type(ordinal) is not int or ordinal < 1:
+                                    raise RunnerError('invalid attempt budget claims ledger')
+                                if ordinal > value['used']:
+                                    raise RunnerError('attempt budget rollback differs from existing claims')
+                    except (OSError, ValueError, KeyError, TypeError) as error:
+                        raise RunnerError('invalid attempt budget claims ledger') from error
+            else:
+                if claims.exists():
+                    raise RunnerError('missing attempt budget has existing claims; cannot reset allowance')
+                _atomic_write(path, _canonical_json_bytes(dict(schema_version=1, limit=limit, used=0)))
+
+    @contextmanager
+    def _values(self):
+        paths = sorted({Path(path).resolve() for path in (self.path, *self.additional_paths)})
+        with ExitStack() as locks:
+            for path in paths:
+                lock = locks.enter_context(path.with_suffix(path.suffix + '.lock').open('a'))
+                fcntl.flock(lock, fcntl.LOCK_EX)
+            values = []
+            deadlines = []
+            for path in paths:
+                value, deadline = self._read_value(path)
+                if deadline is not None:
+                    deadlines.append(deadline)
+                values.append((path, value))
+            # Validate every locked counter before considering exhaustion.
+            yield values, min(deadlines, default=None)
+
+    def remaining(self) -> int:
+        with self._values() as (values, deadline):
+            if deadline is not None and time.time() >= deadline:
+                return 0
+            return min(value['limit'] - value['used'] for _, value in values)
+
+    def claim(self, job_key: str | None = None) -> None:
+        with self._values() as (values, deadline):
+            if ((deadline is not None and time.time() >= deadline)
+                    or any(value['used'] >= value['limit'] for _, value in values)):
                 raise NewJobLimitReached
-            value['used'] += 1
-            # Reserve before invoking the transport; interruptions never refund a call.
-            _atomic_write(path, _canonical_json_bytes(value))
-            _append_json_line(path.with_suffix(path.suffix + '.claims.jsonl'),
-                              {'ordinal': value['used'], 'job_key': job_key})
+            for path, value in values:
+                value['used'] += 1
+                # All reservations precede transport. Interrupted writes can
+                # consume allowance, but never launch an unreserved call.
+                _atomic_write(path, _canonical_json_bytes(value))
+                _append_json_line(path.with_suffix(path.suffix + '.claims.jsonl'),
+                                  {'ordinal': value['used'], 'job_key': job_key})
 
 
 @dataclass
@@ -3464,7 +3545,10 @@ def _execute_prompt_batch(
     max_cost_usd: float | None = None,
     max_request_cost_usd: float | None = None,
     attempt_budget_path: Path | None = None,
+    additional_attempt_budget_paths: Sequence[Path] = (),
 ) -> dict[str, object]:
+    if additional_attempt_budget_paths and attempt_budget_path is None:
+        raise RunnerError('additional attempt budgets require a primary attempt_budget_path')
     runner_version = manifest["runner_version"]
     proposed_manifest = {**manifest, "wrapper_sha256": _sha256_file(Path(__file__).resolve())}
     prepared_manifest = _prepare_manifest_directory(
@@ -3504,7 +3588,8 @@ def _execute_prompt_batch(
             prior_spend_micro_usd=spend.spent, manifest_sha256=manifest_sha256,
             wrapper_sha256=provenance.active_wrapper_sha256))
     budget = NewJobBudget(max_new_attempts, spend=spend,
-                         persistent=PersistentAttemptBudget(attempt_budget_path)
+                         persistent=PersistentAttemptBudget(
+                             attempt_budget_path, tuple(additional_attempt_budget_paths))
                          if attempt_budget_path is not None else None)
     (config.run_directory / "output.json").unlink(missing_ok=True)
     options = manifest["request_reuse"]

@@ -72,6 +72,29 @@ extensions register project commands, collection and views, and declare their
 code files. These files are hashed alongside the executor in each prepared plan.
 The selected validator is resolved before worker threads start.
 
+## Hierarchy clients and shared attempt bounds
+
+Project constructors can call `prepare`, `report` and `run` with
+`include_request_preview=False` to skip request-availability previews. Preparation
+still freezes exact inputs and code; execution still validates receipts and
+checks exact request reuse. Nonempty `preparation_context` is passed to the
+selected project input adapter, which owns its validation.
+
+A constructor can use `PersistentAttemptBudget.initialize(limit)` for its stage
+counter and `remaining()` to inspect admission capacity. Initialization preserves
+existing usage and deadlines; a changed limit, malformed counter or claims
+showing rollback fails instead of resetting the allowance.
+
+`run(..., attempt_budget_path=stage, additional_attempt_budget_paths=(shared,))`
+reserves both stage and shared counters before dispatch. Counters are locked in
+stable path order, duplicate paths count once, and every counter is validated
+before admission. Any exhausted counter or expired optional `deadline_utc`
+blocks the request without charging the others. Failed or interrupted launched
+attempts are never refunded. A crash during reservation can consume allowance
+without launching a call; it cannot launch an unreserved call. Additional
+counters must already exist and require a primary counter. These options do not
+create a new spending authorization.
+
 ## Verification
 
 ```bash
