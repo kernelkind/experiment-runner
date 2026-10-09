@@ -137,8 +137,35 @@ def spec_setup(path, *, preparation_context=None, include_request_preview=True):
     }
 
 
+def uses_mechanical(manifest, case):
+    return "mechanical" in case and not manifest.get("request_reuse", {}).get("intentional_repeat", False)
+
+
+def mechanical_result(dataset, case, schema):
+    """Validate an adapter's frozen decision; never manufacture a model receipt."""
+    decision = case["mechanical"]
+    engine._expect_fields(decision, "case.mechanical", {"output", "evidence"})
+    raw, evidence = decision["output"], decision["evidence"]
+    if not isinstance(raw, str) or not raw.strip():
+        raise ValueError("case.mechanical.output must be a nonempty JSON string")
+    if not isinstance(evidence, dict) or not evidence:
+        raise ValueError("case.mechanical.evidence must be a nonempty JSON object")
+    json.dumps(evidence, allow_nan=False)
+
+    def invalid_constant(value):
+        raise ValueError(f"invalid JSON constant in mechanical output: {value}")
+    json.loads(raw, object_pairs_hook=engine._position_decoder().unique_object,
+               parse_constant=invalid_constant)
+    result = inputs.validate(dataset, case, raw, schema)
+    if result.get("status") not in {"valid", "empty"}:
+        raise ValueError("mechanical output failed adapter validation")
+    return {**result, "origin": "mechanical", "mechanical_evidence": evidence,
+            "mechanical_sha256": inputs.digest(decision), "attempts": 0, "reused": False}
+
+
 def request_preview(plan, manifest, cases):
-    pending = [case for case in cases if case.get("status", "unrun") == "unrun"]
+    pending = [case for case in cases if case.get("status", "unrun") == "unrun"
+               and not uses_mechanical(manifest, case)]
     reusable = 0
     if pending and not manifest["request_reuse"]["intentional_repeat"]:
         history = engine.RequestHistory(
@@ -344,6 +371,9 @@ def prepare(args, *, preparation_context=None, include_request_preview=True):
             plan["cases"] = cases
         write(staged / "runner-config.json", config_value)
         config = engine.PromptRunnerConfig.load(staged / "runner-config.json")
+        for case in plan["cases"]:
+            if "mechanical" in case:
+                mechanical_result(plan["dataset"], case, config.output_schema)
         if not args.import_config:
             manifest = engine._build_prompt_manifest(
                 config, engine._runner_version(config)
@@ -807,6 +837,8 @@ def report(directory, only=None, note_ids=None, *, generation_costs=False, inclu
                         )
                     except (ValueError, engine.RunnerError) as error:
                         row.update(status="malformed", error=str(error))
+        elif uses_mechanical(manifest, case):
+            row.update(mechanical_result(plan["dataset"], case, config.output_schema))
         prior = baseline.get(case["id"])
         if prior is None:
             row["comparison"] = "missing_baseline"
@@ -860,6 +892,8 @@ def report(directory, only=None, note_ids=None, *, generation_costs=False, inclu
         attempts=len(attempts) + len(warmup_calls),
         reused=sum(c.get("reused", False) for c in cases),
     )
+    if any("mechanical" in case for case in selected):
+        summary["mechanical"] = sum(c.get("origin") == "mechanical" for c in cases)
     result = {
         "experiment": str(directory),
         "prompt_id": plan["prompt"]["id"],
@@ -1011,6 +1045,14 @@ def run(directory, max_new_attempts=None, runner_upgrade_reason=None, *,
         if max_concurrency is not None and not 1 <= max_concurrency <= config.concurrency:
             raise ValueError('execution concurrency cap must be positive and at most the prepared concurrency')
         concurrency = config.concurrency if max_concurrency is None else max_concurrency
+        cases = {c["id"]: c for c in plan["cases"]}
+        jobs = tuple(job for job in config.prompts
+                     if not uses_mechanical(manifest, cases[job.prompt_id]))
+        if not jobs:
+            execution_upgrade(directory, plan, runner_upgrade_reason)
+            result = report(directory, include_request_preview=include_request_preview)
+            write(directory / "report.json", result)
+            return result
         identity = engine._runner_identity(config)
         if any(identity[k] != manifest[k] for k in ("runner_version", "runner_sha256")):
             raise ValueError("model runner changed since preparation")
@@ -1026,7 +1068,6 @@ def run(directory, max_new_attempts=None, runner_upgrade_reason=None, *,
         )
         wrapper_changed = provenance.active_wrapper_sha256 != engine._sha256_file(Path(engine.__file__))
         error = None
-        cases = {c["id"]: c for c in plan["cases"]}
         # Resolve the selected project validator before entering worker threads.
         validate = inputs.validate
 
@@ -1084,7 +1125,7 @@ def run(directory, max_new_attempts=None, runner_upgrade_reason=None, *,
 
         try:
             engine._execute_prompt_batch(
-                config,
+                replace(config, prompts=jobs),
                 manifest,
                 retry_failed=False,
                 concurrency=concurrency,
@@ -1266,7 +1307,9 @@ Example from your project checkout (replace the spec and destination):
   Specs can set runner.prompt_cache to true (a JSON boolean).
   New specs without caching keep the ordinary request format. Adding caching
   changes request identity, so uncached answers are not reused as cached answers.
-  Identical cached requests reuse answers; --repeat requests fresh trials.
+  Adapter-provided mechanical results need no model call and appear in show.
+  Identical requests reuse answers; --repeat requests fresh trials
+  and disables mechanical routing, executing the original prompts.
   WebSocket cache options are refused. See experiment-runner run --help for costs."""
     )
     p.add_argument("destination", type=Path)
@@ -1308,6 +1351,8 @@ Example from your project checkout (replace the spec and destination):
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""SSE prefix caching:
   Enable with prepare --prompt-cache; see prepare --help.
+  Mechanical results skip dispatch, warming and attempt budgets; mixed batches
+  execute only residual jobs. Explicit prepare --repeat disables that routing.
   run automatically sends an instructions-only warmup before new comparisons
   when its frozen prefix is eligible and there is room for warmup + comparison.
   All-reused/completed batches and insufficient allowances skip warming.

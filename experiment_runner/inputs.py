@@ -47,7 +47,7 @@ def prepare_file(dataset, path, template, load_report=None):
         raise ValueError('dataset contains no cases')
     ids = set()
     for case in cases:
-        engine._expect_fields(case, 'case', {'id', 'inputs'} | ({'evidence'} & case.keys()))
+        engine._expect_fields(case, 'case', {'id', 'inputs'} | ({'evidence', 'mechanical'} & case.keys()))
         identifier = engine._expect_identifier(case['id'], 'case.id')
         if identifier in ids:
             raise ValueError('duplicate case identity')

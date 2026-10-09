@@ -266,6 +266,43 @@ extensions register project commands, collection and views, and declare their
 code files. These files are hashed alongside the executor in each prepared plan.
 The selected validator is resolved before worker threads start.
 
+### Mechanical results
+
+Version 1.2.3 accepts an optional adapter-provided field on each prepared case:
+
+```json
+{
+  "mechanical": {
+    "output": "{\"valid\":true,\"reason\":\"Exact trusted wording.\"}",
+    "evidence": {"rule": "exact_teacher_subject", "teacher_numbers": ["1.1"]}
+  }
+}
+```
+
+The generic adapter also accepts this field in its source cases. Adapters own
+the rule and source evidence; the runner adds no project-specific semantic
+rules. Only `output` and a nonempty evidence object are accepted. Preparation
+rejects malformed JSON, duplicate output keys and nonfinite JSON constants,
+then passes the output through the selected adapter's normal validator. Schema
+and semantic validation remain that adapter's responsibility; generic validation
+parses JSON without independently enforcing JSON Schema constraints.
+
+The complete metadata is bound by the prepared plan's digest. `prepare` and
+`show` expose validated results immediately with `origin: "mechanical"`,
+`mechanical_evidence`, `mechanical_sha256` and `attempts: 0`. Their native summary
+includes a `mechanical` count. These cases have no model receipt and add no
+attempts, token usage, generation costs or cache hits. Attributed reviews bind
+their input and output digests normally. A mechanical result does not establish
+model qualification.
+
+`run` filters mechanical cases from dispatch while retaining the original
+prompts, config and manifest. An all-mechanical batch requires no model worker
+execution, warming or attempt-budget admission. Mixed batches execute and account
+for only residual requests and any eligible warmup. Execution code provenance
+checks still apply. Explicit `prepare --repeat` disables mechanical routing and
+executes the normal prompts as fresh model trials. Cases without this metadata
+retain the existing request, receipt, import and `--from` behavior.
+
 ## Hierarchy clients and shared attempt bounds
 
 Project constructors can call `prepare`, `report` and `run` with
