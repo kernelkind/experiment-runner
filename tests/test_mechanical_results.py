@@ -149,12 +149,11 @@ class MechanicalResultsTests(unittest.TestCase):
 
     def test_all_mechanical_cached_batch_never_warms(self):
         prefix = 'GENERIC PROMPT' + ' word' * 1100
-        (self.root / 'prefix.txt').write_text(prefix)
         (self.root / 'prompt.txt').write_text(prefix + '{TASK}')
         spec = json.loads((self.root / 'spec.json').read_text())
         spec['runner']['model'] = 'gpt-6.1-sol'
         self.write('spec.json', spec)
-        self.cli('prepare', 'cached', '--spec', 'spec.json', '--prompt-cache-prefix', 'prefix.txt')
+        self.cli('prepare', 'cached', '--spec', 'spec.json', '--prompt-cache')
         self.assertTrue(self.show('cached')['cache_warmup']['eligible'])
         budget = self.write('budget.json', {'schema_version': 1, 'limit': 1, 'used': 1})
         self.cli('run', 'cached', '--attempt-budget', budget)
@@ -169,12 +168,11 @@ class MechanicalResultsTests(unittest.TestCase):
         del self.cases[1]['mechanical']
         self.write('cases.json', {'cases': self.cases})
         prefix = 'GENERIC PROMPT' + ' word' * 1100
-        (self.root / 'prefix.txt').write_text(prefix)
         (self.root / 'prompt.txt').write_text(prefix + '{TASK}')
         spec = json.loads((self.root / 'spec.json').read_text())
         spec['runner']['model'] = 'gpt-6.1-sol'
         self.write('spec.json', spec)
-        self.cli('prepare', 'cached', '--spec', 'spec.json', '--prompt-cache-prefix', 'prefix.txt')
+        self.cli('prepare', 'cached', '--spec', 'spec.json', '--prompt-cache')
         budget = self.write('budget.json', {'schema_version': 1, 'limit': 2, 'used': 0})
         self.cli('run', 'cached', '--attempt-budget', budget, '--max-new-attempts', '2')
         shown = self.show('cached')

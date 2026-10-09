@@ -268,7 +268,7 @@ The selected validator is resolved before worker threads start.
 
 ### Mechanical results
 
-Version 1.2.3 accepts an optional adapter-provided field on each prepared case:
+Version 1.3.1 accepts an optional adapter-provided field on each prepared case:
 
 ```json
 {
