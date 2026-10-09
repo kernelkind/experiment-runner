@@ -75,6 +75,37 @@ test('native affinity survives production transport serialization and accounting
   assert.deepEqual(result.response_metadata.usage.input_tokens_details, { cached_tokens: 60, cache_write_tokens: 20 });
   assert.equal(result.response_metadata.usage.output_tokens_details.reasoning_tokens, 3);
   assert.equal(result.usage.cost.total, (20 * 2 + 60 * 0.1 + 20 * 2.5 + 10 * 10) / 1e6);
+  assert(Math.abs(result.uncached_catalog_cost_estimate_usd - 0.0003) < 1e-12);
+});
+
+test('uncached cost snapshot handles all-cached input and full-request pricing tiers', async () => {
+  for (const [input, read, write, output, expected] of [
+    [100, 100, 0, 10, 0.0003],
+    [300000, 290000, 5000, 50, 1.20075],
+  ]) {
+    const request = await prepare({ provider: 'openai-codex', model: 'gpt-6.1-sol',
+      reasoning: 'medium', prompt: 'Return the count and label.', schema });
+    const item = { id: 'cost-msg', type: 'message', role: 'assistant', status: 'completed',
+      content: [{ type: 'output_text', text: '{"count":2,"label":null}', annotations: [] }] };
+    const token = 'test.' + Buffer.from(JSON.stringify({ 'https://api.openai.com/auth': {
+      chatgpt_account_id: 'test-account' } })).toString('base64') + '.signature';
+    const result = await execute(request, { apiKey: token, fetch: async () => sse([
+      { type: 'response.created', response: { id: 'cost-response', status: 'in_progress' } },
+      { type: 'response.output_item.added', output_index: 0, item: { ...item, content: [] } },
+      { type: 'response.output_item.done', output_index: 0, item },
+      { type: 'response.completed', response: { id: 'cost-response', model: 'gpt-6.1-sol',
+        status: 'completed', output: [item], usage: { input_tokens: input, output_tokens: output,
+          input_tokens_details: { cached_tokens: read, cache_write_tokens: write },
+          output_tokens_details: { reasoning_tokens: 3 } } } },
+    ]) });
+    assert.equal(result.valid, true, result.error);
+    assert(Math.abs(result.uncached_catalog_cost_estimate_usd - expected) < 1e-12);
+    assert.equal(result.usage.input, input - read - write);
+    assert.equal(result.usage.cacheRead, read);
+    assert.equal(result.usage.cacheWrite, write);
+    const actual = input > 272000 ? 0.10375 : 0.00011;
+    assert(Math.abs(result.usage.cost.total - actual) < 1e-12);
+  }
 });
 
 test('native prefix format uses fixed developer instructions and independent comparison data', async () => {

@@ -187,6 +187,54 @@ guaranteed hit rate. The configuration uses no public-API explicit cache options
 or breakpoint fields. Frozen study evidence is preserved in the Oracle worktree
 `oracle-mvp-canonical-cache-controls-v1/target/canonical-cache-sse-controlled-v4/`.
 
+## API-equivalent cost statistics
+
+Version 1.2.1 adds `usage.cost_statistics` to native `report.json`,
+`show --json` and `--generation-costs` reports. Readable `run` and batch `show`
+output print total, mean, median and p95 request cost, comparison cache-hit rate,
+and estimated net dollars/percentage saved. `run --help` and `show --help`
+explain the calculation. No extra model request is used for reporting.
+
+Costs use the saved SDK catalog estimates, including cache reads, cache writes
+and output. They are API-equivalent estimates, not subscription charges or quota
+measurements. New model receipts save `uncached_catalog_cost_estimate_usd` with
+the same catalog and full-request pricing tier used by the original call. The
+counterfactual prices all observed input at the uncached rate and keeps the same
+output, which already includes reasoning. Reports never reprice old calls using
+today's catalog. For older receipts, the saved uncached-input cost component can
+establish their input rate; ambiguous legacy input scope or an unavailable rate
+leaves savings unknown.
+
+For a batch, let **U** be the sum of uncached estimates for comparison attempts,
+and **C** its saved actual catalog cost, including warmup and all retries:
+
+```text
+net_cache_savings_usd = U - C
+net_cache_savings_percent = 100 * (U - C) / U
+```
+
+Warmup contributes to **C**, not **U**. A tiny batch can therefore have negative
+savings even when every comparison hits the cache. Cache-hit rate counts
+comparison attempts reporting positive cached input; warmup and exact-answer
+reuse are excluded. Per-request distributions include every actual attempt,
+including warmup and retries. P95 uses nearest rank. Reused answers add zero new
+attempts/cost; `--generation-costs` reports their unique original attempts and
+original warmup instead.
+
+These figures estimate caching's price effect on the **observed tokens**. They
+do not measure how a separate uncached run would change outputs, token counts,
+failures or latency. Use a controlled experiment for that comparison.
+
+Missing usage or cost keeps the complete total/distribution and net savings
+unknown; existing known cost subtotals remain available. Missing historical
+pricing can leave savings unknown while actual-cost statistics remain known.
+`requests_without_cost`, `comparison_requests_without_usage` and
+`comparison_requests_without_uncached_cost` show coverage.
+An empty request set has zero total cost, but no mean/median/p95, hit rate or
+percentage saved. A zero uncached denominator also has no defined savings
+percentage. Filters retain the experiment's shared warmup overhead as described
+above, without allocating it between cases.
+
 ## Project extensions
 
 An `experiment-runner.json` file declares `schema_version: 1`, an `inputs`

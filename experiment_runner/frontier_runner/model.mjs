@@ -13,7 +13,7 @@ import Ajv2019 from 'ajv/dist/2019.js';
 import Ajv2020 from 'ajv/dist/2020.js';
 import addFormats from 'ajv-formats';
 import { Agent } from 'undici';
-import { getSupportedThinkingLevels } from '@earendil-works/pi-ai';
+import { calculateCost, getSupportedThinkingLevels } from '@earendil-works/pi-ai';
 import { OPENAI_CODEX_MODELS } from '@earendil-works/pi-ai/providers/openai-codex.models';
 import { OPENROUTER_MODELS } from '@earendil-works/pi-ai/providers/openrouter.models';
 import { stream as codexStream } from '@earendil-works/pi-ai/api/openai-codex-responses';
@@ -630,6 +630,16 @@ async function executeModel(request, { apiKey, fetch = globalThis.fetch, signal,
   const result = await events.result();
   if (abort.aborted) responseMetadata.abort_reason = errorDetails(abort.reason, redact);
   const raw = result.content.filter(item => item.type === 'text').map(item => item.text).join('');
+  // Save the counterfactual with the same catalog/tier as the actual cost.
+  // Repricing reports later would change historical savings. Output already
+  // includes reasoning; replace only the input cache buckets.
+  const counts = [result.usage.input, result.usage.cacheRead, result.usage.cacheWrite, result.usage.output];
+  const reported = responseMetadata.usage;
+  const uncachedCost = Number.isFinite(reported?.input_tokens ?? reported?.prompt_tokens)
+    && Number.isFinite(reported?.output_tokens ?? reported?.completion_tokens) && object(request.model.cost)
+    && counts.every(value => Number.isFinite(value) && value >= 0)
+    ? calculateCost(request.model, { ...result.usage, input: counts[0] + counts[1] + counts[2],
+      cacheRead: 0, cacheWrite: 0, cacheWrite1h: 0, cost: {} }).total : null;
   return {
     ...provenance, provider: request.model.provider, model: request.model.id, reasoning: request.reasoning, transport: request.transport,
     prompt_sha256: request.prompt_sha256, schema_sha256: request.schema_sha256,
@@ -639,6 +649,7 @@ async function executeModel(request, { apiKey, fetch = globalThis.fetch, signal,
     http_attempts: calls, stop_reason: result.stopReason, raw_stop_reason: result.rawStopReason ?? null,
     diagnostics: redact(result.diagnostics ?? []), error: redact(result.errorMessage ?? null),
     raw_text: raw, usage: result.usage,
+    uncached_catalog_cost_estimate_usd: uncachedCost,
     usage_note: 'pi-ai input excludes cacheRead/cacheWrite; output includes reasoning. SDK cost is a catalog estimate, not an invoice or subscription charge.',
     ...checkOutput(request, raw, result.stopReason),
   };

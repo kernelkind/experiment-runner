@@ -29,6 +29,7 @@ class SharedRunnerTests(unittest.TestCase):
                     '--runner-binary',
                 )),
                 (('run', '--help'), ('warmup', 'cached input', 'reasoning', 'unknown')),
+                (('show', '--help'), ('usage.cost_statistics', 'API-equivalent', 'percent', 'pricing')),
             ):
                 with self.subTest(arguments=arguments):
                     result = subprocess.run([str(CLI), *arguments], cwd=project,
@@ -155,6 +156,57 @@ class SharedRunnerTests(unittest.TestCase):
 
 
 class NativePrefixTests(unittest.TestCase):
+    def test_cost_statistics_use_saved_components_without_repricing_old_receipts(self):
+        self.prepare('costs')
+        usage = dict(input=20, cacheRead=60, cacheWrite=20, output=10, reasoning=3,
+                     cost=dict(input=0.00004, cacheRead=0.000006, cacheWrite=0.00005,
+                               output=0.0001, total=0.000196))
+        ran = self.cli('run', 'costs', env={'FAKE_RUNNER_RESULT_OVERRIDE': json.dumps({'usage': usage})})
+        self.assertIn('API-equivalent request cost (USD):', ran.stdout)
+        self.assertIn('Estimated net cache savings:', ran.stdout)
+        stats = self.show('costs')['usage']['cost_statistics']
+        self.assertEqual(stats['requests'], 2)
+        self.assertEqual(stats['cache_hit_rate_percent'], 100)
+        self.assertAlmostEqual(stats['total_cost_usd'], 0.000392)
+        self.assertAlmostEqual(stats['uncached_comparison_cost_usd'], 0.0006)
+        self.assertAlmostEqual(stats['net_cache_savings_percent'], 100 * 0.000208 / 0.0006)
+        self.cli('prepare', 'reuse-costs', '--from', 'costs')
+        self.cli('run', 'reuse-costs')
+        reused = self.show('reuse-costs', '--generation-costs')
+        self.assertEqual(reused['usage']['cost_statistics']['requests'], 0)
+        self.assertIsNone(reused['usage']['cost_statistics']['net_cache_savings_percent'])
+        self.assertEqual(reused['generation_usage']['cost_statistics'], stats)
+        self.assertEqual(len(self.calls()), 2)
+
+    def test_unknown_historical_input_rate_keeps_savings_unknown(self):
+        self.prepare('costs')
+        usage = dict(input=0, cacheRead=100, cacheWrite=0, output=10, reasoning=3,
+                     cost=dict(input=0, cacheRead=0.00001, cacheWrite=0,
+                               output=0.0001, total=0.00011))
+        self.cli('run', 'costs', env={'FAKE_RUNNER_RESULT_OVERRIDE': json.dumps({'usage': usage})})
+        stats = self.show('costs')['usage']['cost_statistics']
+        self.assertAlmostEqual(stats['total_cost_usd'], 0.00022)
+        self.assertEqual(stats['cache_hit_rate_percent'], 100)
+        self.assertIsNone(stats['net_cache_savings_percent'])
+        self.assertIsNone(stats['uncached_comparison_cost_usd'])
+        self.assertEqual(stats['comparison_requests_without_uncached_cost'], 2)
+
+    def test_successful_sdk_output_without_reported_usage_is_not_free(self):
+        self.prepare('missing-usage')
+        override = dict(usage=dict(input=0, output=0, cacheRead=0, cacheWrite=0,
+                                   reasoning=0, cost={'total': 0}),
+                        usage_note='pi-ai input excludes cacheRead/cacheWrite; output includes reasoning.',
+                        uncached_catalog_cost_estimate_usd=None)
+        self.cli('run', 'missing-usage', env={'FAKE_RUNNER_RESULT_OVERRIDE': json.dumps(override)})
+        report = self.show('missing-usage')
+        self.assertEqual(report['summary']['valid'], 2)
+        stats = report['usage']['cost_statistics']
+        self.assertEqual(stats['requests_without_cost'], 2)
+        self.assertIsNone(stats['total_cost_usd'])
+        self.assertIsNone(stats['mean_request_cost_usd'])
+        self.assertIsNone(stats['net_cache_savings_percent'])
+        self.assertIsNone(stats['cache_hit_rate_percent'])
+
     def automatic_prefix(self, tokens=1100):
         # GENERIC PROMPT is four o200k_base tokens; every appended ' word' is one.
         text = 'GENERIC PROMPT' + ' word' * (tokens - 4)

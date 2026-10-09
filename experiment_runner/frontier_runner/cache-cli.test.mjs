@@ -103,6 +103,7 @@ test('shared CLI warms the exact SSE prefix and accounts for real worker receipt
       child.once('exit', code => { clearTimeout(timer); resolve(code); });
     });
     assert.deepEqual(failures, []); assert.equal(code, 0, output);
+    return output;
   }
   try {
     await command('prepare', 'ordinary', '--spec', 'spec.json');
@@ -124,6 +125,18 @@ test('shared CLI warms the exact SSE prefix and accounts for real worker receipt
     assert.equal(load('cached/report.json').usage.cached_input_tokens, 120);
     assert.equal(load('cached/report.json').summary.attempts, 3);
     assert.equal(load('cached/report.json').cache_warmup.attempts, 1);
+    const stats = load('cached/report.json').usage.cost_statistics;
+    assert.equal(stats.requests, 3);
+    assert.equal(stats.comparison_requests, 2);
+    assert.equal(stats.warmup_requests, 1);
+    assert.equal(stats.cache_hit_rate_percent, 100);
+    assert(Math.abs(stats.total_cost_usd - 0.000672) < 1e-12);
+    assert(Math.abs(stats.mean_request_cost_usd - 0.000224) < 1e-12);
+    assert(Math.abs(stats.median_request_cost_usd - 0.000186) < 1e-12);
+    assert(Math.abs(stats.p95_request_cost_usd - 0.0003) < 1e-12);
+    assert(Math.abs(stats.uncached_comparison_cost_usd - 0.0006) < 1e-12);
+    assert(Math.abs(stats.net_cache_savings_usd - (-0.000072)) < 1e-12);
+    assert(Math.abs(stats.net_cache_savings_percent - (-12)) < 1e-9);
     const warmup = load('cached/cache-warmups/0001/report.json');
     assert.equal(warmup.cases[0].parsed.answer, 'warmup');
     const total = ['ordinary', 'cached'].reduce((sum, name) => sum + load(name + '/report.json').usage.catalog_cost_estimate_usd, 0);
@@ -132,6 +145,10 @@ test('shared CLI warms the exact SSE prefix and accounts for real worker receipt
     await command('prepare', 'reused', '--from', 'cached');
     await command('run', 'reused', '--attempt-budget', path.join(root, 'budget.json'));
     assert.equal(load('reused/report.json').summary.reused, 2);
+    assert.equal(load('reused/report.json').usage.cost_statistics.requests, 0);
+    assert.equal(load('reused/report.json').usage.cost_statistics.net_cache_savings_percent, null);
+    const traced = JSON.parse(await command('show', 'reused', '--json', '--generation-costs'));
+    assert.deepEqual(traced.generation_usage.cost_statistics, stats);
     assert.equal(observations.length, 5); assert.equal(load('budget.json').used, 5);
     assert.deepEqual(fs.readFileSync(path.join(root, 'cached/run/results.jsonl')), receipts);
     assert(scopeCalls >= 5);

@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 import fcntl
 import json
 import math
+import statistics
 from pathlib import Path
 import shlex
 import shutil
@@ -427,7 +428,59 @@ def import_setup(path, setup):
     return config, manifest, cases
 
 
-def usage_summary(calls, *, strict=True):
+def _nonnegative_number(value):
+    return type(value) in (int, float) and math.isfinite(value) and value >= 0
+
+
+def _uncached_cost(record, values, actual):
+    model_result = record.get('model_result') or {}
+    if 'uncached_catalog_cost_estimate_usd' in model_result:
+        saved = model_result['uncached_catalog_cost_estimate_usd']
+        return saved if _nonnegative_number(saved) else None
+    if not values[1] and not values[2]:
+        return actual
+    # Older receipts sometimes retain enough SDK cost components to recover
+    # their own input rate. Legacy input_tokens alone has ambiguous cache scope.
+    usage = record['usage']
+    cost = usage.get('cost', {})
+    if (usage.get('input', 0) > 0 and all(_nonnegative_number(cost.get(k))
+            for k in ('input', 'cacheRead', 'cacheWrite'))):
+        baseline = actual - cost['cacheRead'] - cost['cacheWrite'] + (
+            cost['input'] / usage['input']) * (values[1] + values[2])
+        return baseline if _nonnegative_number(baseline) else None
+    return None
+
+
+def cost_statistics(observations):
+    """API-equivalent cost on observed tokens, including warmup overhead."""
+    priced = [cost for _, _, cost, _ in observations if cost is not None]
+    comparisons = [o for o in observations if not o[3]]
+    unknown_usage = sum(values is None for _, values, _, _ in comparisons)
+    hits = sum(values is not None and values[1] > 0 for _, values, _, _ in comparisons)
+    uncached = [_uncached_cost(record, values, cost) if values is not None and cost is not None else None
+                for record, values, cost, _ in comparisons]
+    complete = len(priced) == len(observations)
+    total = math.fsum(priced) if complete else None
+    baseline = math.fsum(uncached) if all(v is not None for v in uncached) else None
+    savings = baseline - total if baseline is not None and total is not None else None
+    return dict(
+        basis='saved_catalog_estimates', requests=len(observations),
+        requests_without_cost=len(observations) - len(priced),
+        comparison_requests=len(comparisons), warmup_requests=len(observations) - len(comparisons),
+        comparison_requests_without_usage=unknown_usage, cache_hit_requests=hits,
+        comparison_requests_without_uncached_cost=sum(v is None for v in uncached),
+        cache_hit_rate_percent=100 * hits / len(comparisons) if comparisons and not unknown_usage else None,
+        total_cost_usd=total,
+        mean_request_cost_usd=statistics.fmean(priced) if priced and complete else None,
+        median_request_cost_usd=statistics.median(priced) if priced and complete else None,
+        p95_request_cost_usd=sorted(priced)[math.ceil(0.95 * len(priced)) - 1] if priced and complete else None,
+        uncached_comparison_cost_usd=baseline,
+        net_cache_savings_usd=savings,
+        net_cache_savings_percent=100 * savings / baseline if savings is not None and baseline > 0 else None,
+    )
+
+
+def usage_summary(calls, *, strict=True, warmup_calls=()):
     """Total saved usage; strict generation reports keep missing failures unknown."""
     fields = (
         ("input_tokens", "input", "input_tokens"),
@@ -440,7 +493,9 @@ def usage_summary(calls, *, strict=True):
     usage.update(attempts_without_usage=0, catalog_cost_estimate_usd=0,
                  attempts_without_cost_estimate=0, provider_reported_cost_usd=0,
                  attempts_without_provider_cost=0)
-    for record, charge in calls:
+    observations = []
+    for record, charge, warmup in [*((r, c, False) for r, c in calls),
+                                  *((r, c, True) for r, c in warmup_calls)]:
         if type(charge) in (int, float) and math.isfinite(charge) and charge >= 0:
             usage["provider_reported_cost_usd"] += charge
         else:
@@ -455,7 +510,15 @@ def usage_summary(calls, *, strict=True):
                      and all(type(v) in (int, float) and math.isfinite(v) and v >= 0
                              for v in values)
                      and not (record.get("status") == "failed" and not any(values)))
+            if known and not any(values):
+                model = record.get('model_result') or {}
+                raw = (model.get('response_metadata') or {}).get('usage') or {}
+                if (model.get('usage_note', '').startswith('pi-ai')
+                        and not (_nonnegative_number(raw.get('input_tokens', raw.get('prompt_tokens')))
+                                 and _nonnegative_number(raw.get('output_tokens', raw.get('completion_tokens'))))):
+                    known = False
         if not known:
+            observations.append((record, None, None, warmup))
             usage["attempts_without_usage"] += 1
             usage["attempts_without_cost_estimate"] += 1
             continue
@@ -465,6 +528,7 @@ def usage_summary(calls, *, strict=True):
             usage[field] += value
         cost = saved.get("cost") or {}
         estimate = cost.get("total") if isinstance(cost, dict) else None
+        observations.append((record, values, estimate if _nonnegative_number(estimate) else None, warmup))
         if estimate is None or (strict and not (
                 type(estimate) in (int, float) and math.isfinite(estimate) and estimate >= 0)):
             usage["attempts_without_cost_estimate"] += 1
@@ -477,6 +541,7 @@ def usage_summary(calls, *, strict=True):
         usage["catalog_cost_estimate_usd"] = None
     if usage["attempts_without_provider_cost"]:
         usage["provider_reported_cost_usd"] = None
+    usage['cost_statistics'] = cost_statistics(observations)
     return usage
 
 
@@ -547,7 +612,7 @@ def generation_usage(config, manifest, selected, records, latest, files, reconci
                             result_sha256=engine._sha256_bytes(line),
                             job_key=record.get("job_key"), status=record.get("status"),
                             added_from_reuse=added))
-    calls.extend(warmup_calls)
+    all_warmups = list(warmup_calls)
     sources.extend(warmup_sources)
     seen_warmups = {(s['results_path'], s['result_line']) for s in warmup_sources}
     inherited_warmups = 0
@@ -562,13 +627,18 @@ def generation_usage(config, manifest, selected, records, latest, files, reconci
         for call, source in zip(prior_calls, prior_sources):
             key = (source['results_path'], source['result_line'])
             if key not in seen_warmups:
-                calls.append(call)
+                all_warmups.append(call)
                 sources.append({**source, 'added_from_reuse': True})
                 seen_warmups.add(key)
                 inherited_warmups += 1
-    return {**usage_summary(calls, strict=True), "original_calls": len(calls),
+    # Instructions-only experiments contain warmup attempts, not comparisons.
+    if manifest.get('cache_warmup'):
+        all_warmups.extend(calls)
+        calls = []
+    return {**usage_summary(calls, strict=True, warmup_calls=all_warmups),
+            "original_calls": len(calls) + len(all_warmups),
             "source_calls_added": len(originals) - local_count + inherited_warmups,
-            "failed_calls": sum(r.get("status") == "failed" for r, _ in calls),
+            "failed_calls": sum(r.get("status") == "failed" for r, _ in [*calls, *all_warmups]),
             "sources": sources}
 
 
@@ -747,8 +817,9 @@ def report(directory, only=None, note_ids=None, *, generation_costs=False, inclu
     attempts = [r for r in records if r.get("execution") != "cross_run_reuse"
                 and r.get("job_key") in selected_jobs]
     warmup_calls, warmup_sources = cache_warmup_records(directory, plan, config)
-    usage = usage_summary([*((r, engine.provider_cost(r, reconciled_costs)) for r in attempts),
-                           *warmup_calls])
+    comparison_calls = [(r, engine.provider_cost(r, reconciled_costs)) for r in attempts]
+    usage = usage_summary([] if manifest.get('cache_warmup') else comparison_calls,
+                          warmup_calls=[*warmup_calls, *(comparison_calls if manifest.get('cache_warmup') else [])])
     summary = {
         s: sum(c["status"] == s for c in cases)
         for s in ("valid", "empty", "malformed", "invalid_receipt", "failed", "unrun")
@@ -779,7 +850,7 @@ def report(directory, only=None, note_ids=None, *, generation_costs=False, inclu
     if plan.get('cache_warmup') or warmup_calls:
         result['cache_warmup'] = {**plan.get('cache_warmup', {}),
                                   'attempts': len(warmup_calls),
-                                  'usage': usage_summary(warmup_calls),
+                                  'usage': usage_summary([], warmup_calls=warmup_calls),
                                   'sources': warmup_sources}
     execution_settings = directory / 'execution-settings.jsonl'
     if execution_settings.exists():
@@ -1061,8 +1132,20 @@ def compact(result, *, prepared=False):
     else:
         print(
             "Usage (new attempts only; reasoning already included in output): "
-            + json.dumps(result["usage"])
+            + json.dumps({k: v for k, v in result["usage"].items() if k != 'cost_statistics'})
         )
+        stats = result['usage'].get('cost_statistics')
+        if stats is not None:
+            def number(value):
+                return 'unknown' if value is None else format(value, '.6g')
+            print('API-equivalent request cost (USD): ' + '; '.join(
+                f'{label}={number(stats[field])}' for label, field in (
+                    ('total', 'total_cost_usd'), ('mean', 'mean_request_cost_usd'),
+                    ('median', 'median_request_cost_usd'), ('p95', 'p95_request_cost_usd'))))
+            print(f"Estimated net cache savings: {number(stats['net_cache_savings_usd'])} USD "
+                  f"({number(stats['net_cache_savings_percent'])}%); "
+                  f"comparison cache hits: {stats['cache_hit_requests']}/{stats['comparison_requests']} "
+                  f"({number(stats['cache_hit_rate_percent'])}%)")
         if "generation_usage" in result:
             print("Generation usage (unique original calls; includes traced reused sources): "
                   + json.dumps({k: v for k, v in result["generation_usage"].items()
@@ -1100,7 +1183,7 @@ def parser():
         epilog="Global options: --project-root PATH selects project adapters; --version prints the shared release.\n\n"
         "SSE prefix caching: experiment-runner prepare --help explains the single prefix option,\n"
         "instructions-only warmup and comparison batches. experiment-runner run --help\n"
-        "explains attempt budgets and cache-cost accounting.")
+        "explains attempt budgets and API-equivalent cost statistics.")
     commands = root.add_subparsers(dest="command", required=True)
     p = commands.add_parser(
         "prepare", help="freeze inputs/settings and baseline; no inference",
@@ -1184,7 +1267,18 @@ Example from your project checkout (replace the spec, prefix and destination):
   cache_warmup separates its usage and native receipt references for inspection.
   Output already includes reasoning; do not charge it twice.
   Missing failed-call usage leaves the complete cost unknown. Saved receipts
-  retain raw provider usage. Cache hits are not guaranteed.""",
+  retain raw provider usage. Cache hits are not guaranteed.
+
+  Reports show total/mean/median/p95 API-equivalent request cost and comparison
+  cache-hit rate. p95 uses nearest rank; distributions include warmup and retries.
+  Estimated net caching savings = (uncached comparison cost - total actual cost)
+  / uncached comparison cost * 100. The uncached estimate prices the same observed
+  input/output tokens without cache reads or writes and excludes warmup. Actual
+  cost includes warmup, cache writes, retries and output (reasoning included).
+  Negative savings are possible. This is not a separate uncached experiment or
+  subscription billing. Missing usage/pricing keeps affected statistics unknown.
+  show --json exposes usage.cost_statistics; --generation-costs traces original
+  requests once, so answer reuse is not counted as a cache hit or new savings.""",
     )
     p.add_argument("experiment", type=Path)
     p.add_argument("--max-new-attempts", type=int,
@@ -1201,7 +1295,16 @@ Example from your project checkout (replace the spec, prefix and destination):
     p = commands.add_parser('reconcile-costs', help='lookup missing OpenRouter charges; no inference')
     p.add_argument('experiment', type=Path)
     p = commands.add_parser(
-        "show", help="inspect all cases, or exact case evidence; no inference"
+        "show", help="inspect all cases, or exact case evidence; no inference",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""Cost statistics:
+  The batch view prints API-equivalent total/mean/median/p95 request cost,
+  comparison cache-hit rate and estimated net dollars/percent saved including
+  warmup overhead. --json exposes usage.cost_statistics. Estimates use saved
+  catalog pricing and observed tokens; they are not subscription billing or a
+  matched uncached experiment. Unknown usage/pricing is not treated as zero.
+  --generation-costs includes original reused calls and their warmup once.
+  See run --help for the savings formula and accounting details.""",
     )
     p.add_argument("experiment", type=Path)
     p.add_argument("--case")
