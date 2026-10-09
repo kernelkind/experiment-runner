@@ -1,0 +1,1105 @@
+#!/usr/bin/env python3
+"""Prepare, run, compare, revise and review preserved prompt experiments.
+
+Only `run` performs inference. See this repository's README and the selected
+project's workflow documentation.
+"""
+
+from __future__ import annotations
+
+import argparse
+from collections import Counter
+from contextlib import contextmanager
+from dataclasses import replace
+from datetime import datetime, timezone
+import fcntl
+import json
+import math
+from pathlib import Path
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+
+if not __package__:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from experiment_runner import extraction_pipeline as engine, project
+from experiment_runner.project import inputs
+
+
+def read(path):
+    return engine._load_json(Path(path), str(path))
+
+
+def write(path, value):
+    # Schema property order is part of request identity; do not sort nested keys.
+    engine._atomic_write(Path(path), engine._ordered_json_bytes(value))
+
+
+def resolve(path, base):
+    path = Path(path).expanduser()
+    return (base / path).resolve() if not path.is_absolute() else path.resolve()
+
+
+@contextmanager
+def locked(directory):
+    with (directory / ".experiment.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise ValueError("experiment is already active") from error
+        yield
+
+
+def load(directory):
+    directory = Path(directory).resolve()
+    envelope = read(directory / "experiment.json")
+    plan = envelope["plan"]
+    if inputs.digest(plan) != envelope["sha256"]:
+        raise ValueError("prepared experiment changed; prepare a new experiment")
+    for name, expected in plan["files"].items():
+        if engine._sha256_file(directory / name) != expected:
+            raise ValueError(f"prepared {name} changed; prepare a new experiment")
+    config = engine.PromptRunnerConfig.load(directory / "runner-config.json")
+    manifest = read(Path(plan["run_directory"]) / "manifest.json")
+    if inputs.digest(manifest) != plan["manifest_sha256"]:
+        raise ValueError("prepared run manifest changed")
+    return plan, config, manifest
+
+
+def spec_setup(path):
+    path = Path(path).resolve()
+    spec = read(path)
+    engine._expect_fields(
+        spec, "experiment spec", {"schema_version", "prompt", "dataset", "runner"}
+    )
+    if type(spec["schema_version"]) is not int or spec["schema_version"] != 1:
+        raise ValueError("expected experiment schema_version 1")
+    prompt = spec["prompt"]
+    engine._expect_fields(prompt, "prompt", {"id", "path"})
+    prompt_path = resolve(prompt["path"], path.parent)
+    prompt = {
+        "id": engine._expect_identifier(prompt["id"], "prompt.id"),
+        "text": prompt_path.read_bytes().decode(),
+        "source_path": str(prompt_path),
+    }
+    dataset = spec["dataset"]
+    engine._expect_fields(
+        dataset,
+        "dataset",
+        {"adapter", "path"} | ({"select", "mask_format", "combine_masks", "prominence_basis"} & dataset.keys()),
+    )
+    source_path = resolve(dataset["path"], path.parent)
+    cases, sources, preparation = inputs.prepare_file(dataset, source_path, prompt["text"], report)
+    runner = dict(spec["runner"])
+    if "output_schema_path" in runner:
+        if "output_schema" in runner:
+            raise ValueError("choose output_schema or output_schema_path, not both")
+        schema_path = resolve(runner.pop("output_schema_path"), path.parent)
+        schema_bytes = schema_path.read_bytes()
+        runner["output_schema"] = json.loads(schema_bytes)
+        sources[str(schema_path)] = engine._sha256_bytes(schema_bytes)
+    runner["runner_binary"] = str(
+        engine._resolve_executable(
+            runner.get("runner_binary", str(engine.DEFAULT_RUNNER)),
+            "runner_binary",
+            path.parent,
+        )
+    )
+    runner["auth_file"] = (
+        str(resolve(runner["auth_file"], path.parent))
+        if runner.get("auth_file")
+        else None
+    )
+    return {
+        "prompt": prompt,
+        "dataset": {**dataset, "path": str(source_path)},
+        "cases": cases,
+        "preparation": preparation,
+        "runner": runner,
+        "sources": {
+            **sources,
+            str(path): engine._sha256_file(path),
+            str(prompt_path): engine._sha256_file(prompt_path),
+        },
+    }
+
+
+def request_preview(plan, manifest, cases):
+    pending = [case for case in cases if case.get("status", "unrun") == "unrun"]
+    reusable = 0
+    if pending and not manifest["request_reuse"]["intentional_repeat"]:
+        history = engine.RequestHistory(
+            Path(manifest["request_reuse"]["history_root"]),
+            exclude_run=Path(plan["run_directory"]),
+        )
+        for case in pending:
+            for _, source in history.matches(
+                engine._prompt_request_key(manifest, case["prompt"])
+            ):
+                try:
+                    inputs.validate(
+                        plan["dataset"],
+                        case,
+                        source["final_output_raw"],
+                        plan["runner"].get("output_schema"),
+                    )
+                except (ValueError, engine.RunnerError):
+                    continue
+                reusable += 1
+                break
+    unrun = len(pending)
+    return {
+        "unrun": unrun,
+        "reusable": reusable,
+        "new": unrun - reusable,
+        "note": "lookup at inspection time; run rechecks verified receipts",
+    }
+
+
+def prepare(args):
+    destination = args.destination.expanduser().resolve()
+    if destination.exists():
+        raise ValueError("experiment destination already exists")
+    inherited_history = None
+    if args.from_experiment:
+        old, _, old_manifest = load(args.from_experiment)
+        inherited_history = old_manifest.get("request_reuse", {}).get("history_root")
+        setup = {k: old[k] for k in ("prompt", "dataset", "cases", "runner", "sources")}
+        setup['preparation'] = old.get('preparation')
+        baseline = report(Path(args.from_experiment).resolve())
+    else:
+        setup = spec_setup(args.spec)
+        baseline = report(args.baseline.resolve()) if args.baseline else None
+    if args.only:
+        requested = set(args.only)
+        unknown = requested - {c["id"] for c in setup["cases"]}
+        if unknown:
+            raise ValueError(f"unknown --only case IDs: {', '.join(sorted(unknown))}")
+        setup["cases"] = [c for c in setup["cases"] if c["id"] in requested]
+        if baseline is not None:
+            baseline = {**baseline, "cases": [c for c in baseline["cases"] if c["id"] in requested]}
+    # Job IDs from historical batches are not the candidate's stable case IDs.
+    setup["cases"] = [
+        {k: v for k, v in c.items() if k != "job_id"} for c in setup["cases"]
+    ]
+    overrides = {
+        k: getattr(args, k)
+        for k in (
+            "model",
+            "reasoning_effort",
+            "provider",
+            "concurrency",
+            "max_output_tokens",
+            "transport",
+            "runner_binary",
+        )
+        if getattr(args, k) is not None
+    }
+    setup["runner"] = {**setup["runner"], **overrides}
+    if args.runner_binary is not None:
+        setup["runner"]["runner_binary"] = str(engine._resolve_executable(
+            str(args.runner_binary), "runner_binary", Path.cwd()))
+    if args.prompt:
+        if not args.prompt_id:
+            raise ValueError("--prompt requires --prompt-id")
+        path = args.prompt.expanduser().resolve()
+        setup["prompt"] = {
+            "id": args.prompt_id,
+            "text": path.read_bytes().decode(),
+            "source_path": str(path),
+        }
+        setup["sources"] = {**setup["sources"], str(path): engine._sha256_file(path)}
+        setup["cases"] = [
+            {**c, "prompt": inputs.render(setup["prompt"]["text"], c["inputs"])}
+            for c in setup["cases"]
+        ]
+    elif args.prompt_id:
+        raise ValueError("--prompt-id requires --prompt")
+    if args.import_config and (
+        args.from_experiment or args.baseline or args.prompt or args.repeat or args.only or overrides
+    ):
+        raise ValueError(
+            "--import-config requires an exact spec, without baseline, prompt override, repeat or --only"
+        )
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(
+        prefix=".experiment-prepare-", dir=destination.parent
+    ) as temporary:
+        staged = Path(temporary)
+        # Preserve the immediate baseline, not an ever-growing chain of old comparisons.
+        snapshot = (
+            None
+            if baseline is None
+            else {
+                "experiment": baseline["experiment"],
+                "prompt_id": baseline["prompt_id"],
+                "cases": [
+                    {k: v for k, v in c.items() if k not in {"baseline", "reviews"}}
+                    for c in baseline["cases"]
+                ],
+            }
+        )
+        plan = {
+            "schema_version": 1,
+            **setup,
+            "imported": bool(args.import_config),
+            "baseline": snapshot,
+            "baseline_prompt_id": baseline["prompt_id"] if baseline else None,
+        }
+        config_value = {
+            "schema_version": 1,
+            **setup["runner"],
+            "run_directory": str(destination / "run"),
+            "prompts": [
+                {"prompt_id": c["id"], "text": c["prompt"]} for c in setup["cases"]
+            ],
+        }
+        if args.import_config:
+            config, manifest, cases = import_setup(args.import_config, setup)
+            # Equality above verifies the schema; retain the recorded key order
+            # as well, because native receipt identity hashes those exact bytes.
+            if config.output_schema is not None:
+                config_value["output_schema"] = config.output_schema
+                plan["runner"] = {**plan["runner"], "output_schema": config.output_schema}
+            config_value["run_directory"] = str(config.run_directory)
+            config_value["prompts"] = [
+                {"prompt_id": p.prompt_id, "text": p.text} for p in config.prompts
+            ]
+            plan["cases"] = cases
+        write(staged / "runner-config.json", config_value)
+        config = engine.PromptRunnerConfig.load(staged / "runner-config.json")
+        if not args.import_config:
+            manifest = engine._build_prompt_manifest(
+                config, engine._runner_version(config)
+            )
+            manifest["config_path"] = str(destination / "runner-config.json")
+            engine._request_history_options(
+                config,
+                manifest,
+                repeat=args.repeat,
+                history_root=args.history_root
+                or (
+                    Path(inherited_history) if inherited_history else destination.parent
+                ),
+            )
+            (staged / "run").mkdir()
+            engine._atomic_write(
+                staged / "run" / "manifest.json", engine._canonical_json_bytes(manifest)
+            )
+        plan["run_directory"] = str(config.run_directory)
+        plan["manifest_sha256"] = inputs.digest(manifest)
+        plan["files"] = {
+            "runner-config.json": engine._sha256_file(staged / "runner-config.json")
+        }
+        plan["code"] = {name: engine._sha256_file(path)
+                        for name, path in project.code_files(plan['dataset']).items()}
+        plan["requests_at_prepare"] = (
+            request_preview(plan, manifest, plan["cases"])
+            if not args.import_config
+            else None
+        )
+        write(staged / "experiment.json", {"sha256": inputs.digest(plan), "plan": plan})
+        # Every artifact in this directory is generated, never reusable source.
+        (staged / ".gitignore").write_text("*\n")
+        # Reserve the destination exclusively; never replace someone else's experiment.
+        destination.mkdir()
+        for child in staged.iterdir():
+            child.rename(destination / child.name)
+    result = report(destination)
+    write(destination / "report.json", result)
+    return result
+
+
+def import_setup(path, setup):
+    """Import only a demonstrated template→inputs→saved-prompt mapping, never guess."""
+    path = path.expanduser().resolve()
+    value = read(path)
+    if "prompts" in value:
+        config = engine.PromptRunnerConfig.load(path)
+    else:
+        config, _, _ = engine._load_mask_batch(path)
+    manifest = read(config.run_directory / "manifest.json")
+    saved_prompts = {p["prompt_id"]: p["text"] for p in manifest["prompts"]}
+    if saved_prompts != {p.prompt_id: p.text for p in config.prompts}:
+        raise ValueError("legacy config does not match saved manifest prompts")
+    for name in (
+        "model",
+        "reasoning_effort",
+        "provider",
+        "max_output_tokens",
+        "timeout_seconds",
+        "transport",
+    ):
+        default = {"timeout_seconds": 600, "transport": "sse"}.get(name)
+        expected = setup["runner"].get(name, default)
+        if expected != getattr(config, name) or expected != manifest.get(name, default):
+            raise ValueError(f"legacy setting mismatch: {name}")
+    if setup["runner"].get(
+        "output_schema"
+    ) != config.output_schema or config.output_schema != manifest.get(
+        "response_schema"
+    ):
+        raise ValueError("legacy schema mismatch")
+    by_prompt = {}
+    for prompt in config.prompts:
+        by_prompt.setdefault(prompt.text, []).append(prompt.prompt_id)
+    cases = []
+    for case in setup["cases"]:
+        matches = by_prompt.get(case["prompt"], [])
+        if case["id"] in matches:
+            identifier = case["id"]
+        elif case.get("evidence", {}).get("item_id") in matches:
+            identifier = case["evidence"]["item_id"]
+        elif len(matches) == 1:
+            identifier = matches[0]
+        else:
+            raise ValueError(
+                f"cannot verify unique saved input mapping for {case['id']}"
+            )
+        cases.append({**case, "job_id": identifier})
+    if len({c["job_id"] for c in cases}) != len(config.prompts) or len(cases) != len(
+        config.prompts
+    ):
+        raise ValueError("spec must account for every saved prompt exactly once")
+    manifest_hash = inputs.digest(manifest)
+    provenance = engine._load_runner_upgrades(
+        config.run_directory,
+        manifest_sha256=manifest_hash,
+        initial_wrapper_sha256=manifest["wrapper_sha256"],
+    )
+    latest = engine._load_latest_results(
+        config.run_directory / "results.jsonl", manifest_hash, provenance
+    )
+    for job in config.prompts:
+        record = latest.get("prompt:" + job.prompt_id)
+        if record and record["status"] == "succeeded":
+            engine.validate_prompt_receipt(
+                replace(config, prompts=(job,)), manifest, record
+            )
+    return config, manifest, cases
+
+
+def usage_summary(calls, *, strict=False):
+    """Total saved usage; strict generation reports keep missing failures unknown."""
+    fields = (
+        ("input_tokens", "input", "input_tokens"),
+        ("cached_input_tokens", "cacheRead", "cached_input_tokens"),
+        ("cache_write_tokens", "cacheWrite", "cache_write_tokens"),
+        ("output_tokens", "output", "output_tokens"),
+        ("reasoning_tokens", "reasoning", "reasoning_output_tokens"),
+    )
+    usage = dict.fromkeys([f[0] for f in fields], 0)
+    usage.update(attempts_without_usage=0, catalog_cost_estimate_usd=0,
+                 attempts_without_cost_estimate=0, provider_reported_cost_usd=0,
+                 attempts_without_provider_cost=0)
+    for record, charge in calls:
+        if type(charge) in (int, float) and math.isfinite(charge) and charge >= 0:
+            usage["provider_reported_cost_usd"] += charge
+        else:
+            usage["attempts_without_provider_cost"] += 1
+        saved = record.get("usage")
+        values = [saved.get(sdk, saved.get(legacy, 0))
+                  for _, sdk, legacy in fields] if isinstance(saved, dict) else []
+        known = isinstance(saved, dict)
+        if strict and known:
+            known = (any(k in saved for k in ("input", "input_tokens"))
+                     and any(k in saved for k in ("output", "output_tokens"))
+                     and all(type(v) in (int, float) and math.isfinite(v) and v >= 0
+                             for v in values)
+                     and not (record.get("status") == "failed" and not any(values)))
+        if not known:
+            usage["attempts_without_usage"] += 1
+            usage["attempts_without_cost_estimate"] += 1
+            continue
+        if not strict:
+            values = [v or 0 for v in values]
+        for (field, _, _), value in zip(fields, values):
+            usage[field] += value
+        cost = saved.get("cost") or {}
+        estimate = cost.get("total") if isinstance(cost, dict) else None
+        if estimate is None or (strict and not (
+                type(estimate) in (int, float) and math.isfinite(estimate) and estimate >= 0)):
+            usage["attempts_without_cost_estimate"] += 1
+        else:
+            usage["catalog_cost_estimate_usd"] += estimate
+    if strict:
+        usage["known_catalog_cost_estimate_usd"] = usage["catalog_cost_estimate_usd"]
+        usage["known_provider_reported_cost_usd"] = usage["provider_reported_cost_usd"]
+    if usage["attempts_without_cost_estimate"]:
+        usage["catalog_cost_estimate_usd"] = None
+    if usage["attempts_without_provider_cost"]:
+        usage["provider_reported_cost_usd"] = None
+    return usage
+
+
+def generation_usage(config, manifest, selected, records, latest, files, reconciled_costs):
+    """Account for original calls once by verified file/line, not request text."""
+    ledger = (config.run_directory / "results.jsonl").resolve()
+    jobs = {"prompt:" + c.get("job_id", c["id"]): c for c in selected}
+    source_ledgers = {ledger: records}
+    source_attempts = {}
+    originals = {}
+    for number, record in enumerate(records, 1):
+        case = jobs.get(record.get("job_key"))
+        if case is None or record.get("execution") == "cross_run_reuse":
+            continue
+        if record.get("status") == "succeeded":
+            job = engine.PromptJob(case.get("job_id", case["id"]), case["prompt"])
+            engine.validate_prompt_receipt(replace(config, prompts=(job,)), manifest,
+                                           record, files=files)
+        originals[(ledger, number)] = (record, False)
+    local_count = len(originals)
+    for case in selected:
+        record = latest.get("prompt:" + case.get("job_id", case["id"]))
+        if not record or record.get("execution") != "cross_run_reuse":
+            continue
+        job = engine.PromptJob(case.get("job_id", case["id"]), case["prompt"])
+        engine.validate_prompt_receipt(replace(config, prompts=(job,)), manifest,
+                                       record, files=files)
+        reference = record["reused_from"]
+        source = engine._read_request_source(reference,
+            engine._prompt_request_key(manifest, case["prompt"]), files=files)
+        path = Path(reference["results_path"]).resolve()
+        if path not in source_ledgers:
+            source_manifest = files.json(path.parent / "manifest.json")
+            source_provenance = files.provenance(path.parent,
+                manifest_sha256=reference["manifest_sha256"],
+                initial_wrapper_sha256=source_manifest["wrapper_sha256"])
+            engine._load_latest_results(path, reference["manifest_sha256"], source_provenance)
+            source_ledgers[path] = [json.loads(line) for line in files.lines(path)]
+        if path not in source_attempts:
+            by_job = {}
+            for number, prior in enumerate(source_ledgers[path], 1):
+                if prior.get("execution") != "cross_run_reuse":
+                    by_job.setdefault(prior.get("job_key"), []).append((number, prior))
+            source_attempts[path] = by_job
+        for number, prior in source_attempts[path].get(source["job_key"], []):
+            if number > reference["result_line"]:
+                break
+            if prior.get("status") == "succeeded":
+                engine._read_request_source({**reference, "result_line": number,
+                    "result_sha256": engine._sha256_bytes(files.line(path, number))},
+                    engine._prompt_request_key(manifest, case["prompt"]), files=files)
+            key = (path, number)
+            if key in originals and originals[key][0] != prior:
+                raise engine.RunnerError("generation source changed while reporting")
+            originals.setdefault(key, (prior, True))
+    reconciled = {config.run_directory.resolve(): reconciled_costs}
+    calls, sources = [], []
+    for (path, number), (record, added) in originals.items():
+        line = files.line(path, number)
+        if json.loads(line) != record:
+            raise engine.RunnerError("generation source changed while reporting")
+        if path.parent not in reconciled:
+            reconciled[path.parent] = engine.load_reconciled_costs(
+                path.parent, source_ledgers[path])
+        calls.append((record, engine.provider_cost(record, reconciled[path.parent])))
+        sources.append(dict(results_path=str(path), result_line=number,
+                            result_sha256=engine._sha256_bytes(line),
+                            job_key=record.get("job_key"), status=record.get("status"),
+                            added_from_reuse=added))
+    return {**usage_summary(calls, strict=True), "original_calls": len(originals),
+            "source_calls_added": len(originals) - local_count,
+            "failed_calls": sum(r.get("status") == "failed" for r, _ in originals.values()),
+            "sources": sources}
+
+
+def report(directory, only=None, note_ids=None, *, generation_costs=False):
+    directory = Path(directory).resolve()
+    files = engine.ReceiptFiles()
+    plan, config, manifest = load(directory)
+    selected = plan["cases"]
+    for requested, available, field in (
+        (only, {c["id"] for c in selected}, "case"),
+        (note_ids, {c.get("evidence", {}).get("note_id") for c in selected}, "note"),
+    ):
+        if requested is not None:
+            if len(requested) != len(set(requested)) or set(requested) - available:
+                raise ValueError(f"unknown or duplicate selected {field} ID")
+    if only is not None:
+        selected = [c for c in selected if c["id"] in only]
+    if note_ids is not None:
+        selected = [c for c in selected if c.get("evidence", {}).get("note_id") in note_ids]
+    selected_jobs = {"prompt:" + c.get("job_id", c["id"]) for c in selected}
+    manifest_hash = inputs.digest(manifest)
+    provenance = engine._load_runner_upgrades(
+        config.run_directory,
+        manifest_sha256=manifest_hash,
+        initial_wrapper_sha256=manifest["wrapper_sha256"],
+    )
+    ledger = config.run_directory / "results.jsonl"
+    latest = engine._load_latest_results(ledger, manifest_hash, provenance)
+    records = (
+        [json.loads(line) for line in ledger.read_bytes().splitlines()]
+        if ledger.exists()
+        else []
+    )
+    reconciled_costs = engine.load_reconciled_costs(config.run_directory, records)
+    reviews_path = directory / "reviews.jsonl"
+    comments_path = directory / "ui-comments.json"
+    comments = (
+        inputs.prominence_comments(read(comments_path))
+        if plan["dataset"]["adapter"] in {"prominence", "generic"} and comments_path.exists()
+        else {}
+    )
+    reviews = (
+        [json.loads(line) for line in reviews_path.read_bytes().splitlines()]
+        if reviews_path.exists()
+        else []
+    )
+    ui_path = directory / "review-ui.json"
+    if ui_path.exists():
+        for binding in read(ui_path):
+            session_path = directory / binding["session_path"]
+            if session_path.exists():
+                reviews.extend(
+                    inputs.ui_reviews(
+                        binding,
+                        read(directory / binding["batch_path"]),
+                        read(session_path),
+                    )
+                )
+    baseline = (
+        {c["id"]: c for c in plan["baseline"]["cases"]} if plan["baseline"] else {}
+    )
+    cases, comparisons = [], Counter()
+    for case in selected:
+        job = engine.PromptJob(case.get("job_id", case["id"]), case["prompt"])
+        record = latest.get("prompt:" + job.prompt_id)
+        row = {**case, "status": "unrun", "output": None, "baseline": None}
+        if record:
+            row["elapsed_seconds"] = record.get("elapsed_seconds")
+            row["receipt"] = {
+                "results_path": str(ledger),
+                "record_sha256": inputs.digest(record),
+            }
+            row["reused"] = record.get("execution") == "cross_run_reuse"
+            if record["status"] == "failed":
+                row.update(
+                    status="failed",
+                    error=record.get("error"),
+                    failure_kind=engine.prompt_failure_kind(record),
+                    output=record.get("final_output_raw"),
+                )
+            else:
+                row["output"] = record.get("final_output_raw")
+                try:
+                    engine.validate_prompt_receipt(
+                        replace(config, prompts=(job,)), manifest, record, files=files
+                    )
+                except engine.RunnerError as error:
+                    row.update(status="invalid_receipt", error=str(error))
+                else:
+                    try:
+                        row.update(
+                            inputs.validate(
+                                plan["dataset"],
+                                case,
+                                record["final_output_raw"],
+                                config.output_schema,
+                            )
+                        )
+                    except (ValueError, engine.RunnerError) as error:
+                        row.update(status="malformed", error=str(error))
+        prior = baseline.get(case["id"])
+        if prior is None:
+            row["comparison"] = "missing_baseline"
+        elif prior["inputs"] != case["inputs"]:
+            row["comparison"] = "input_mismatch"
+        else:
+            row["baseline"] = {
+                k: v
+                for k, v in prior.items()
+                if k not in {"baseline", "reviews", "evidence"}
+            }
+            if prior["status"] not in {"valid", "empty"} or row["status"] not in {
+                "valid",
+                "empty",
+            }:
+                row["comparison"] = "not_comparable"
+            else:
+                row["comparison"] = (
+                    "unchanged" if row["output"] == prior["output"] else "changed"
+                )
+        row["reviews"] = [
+            {
+                **r,
+                "current": r["input_sha256"] == case["input_sha256"]
+                and r["output_sha256"] == inputs.digest(row["output"]),
+            }
+            for r in reviews
+            if r["case_id"] == case["id"]
+        ]
+        row["reviews"].extend(
+            {"case_id": case["id"], "role": "user", "verdict": "comment",
+             "comment": comment["comment"], "source": comments_path.name,
+             "current": key == inputs.prominence_comment_key(row)}
+            for key, comment in comments.items()
+            if comment["note_id"] == case["id"] and comment["comment"]
+        )
+        comparisons[row["comparison"]] += 1
+        cases.append(row)
+    attempts = [r for r in records if r.get("execution") != "cross_run_reuse"
+                and r.get("job_key") in selected_jobs]
+    usage = usage_summary((r, engine.provider_cost(r, reconciled_costs)) for r in attempts)
+    summary = {
+        s: sum(c["status"] == s for c in cases)
+        for s in ("valid", "empty", "malformed", "invalid_receipt", "failed", "unrun")
+    }
+    summary.update(
+        cases=len(cases),
+        attempts=len(attempts),
+        reused=sum(c.get("reused", False) for c in cases),
+    )
+    result = {
+        "experiment": str(directory),
+        "prompt_id": plan["prompt"]["id"],
+        "settings": {
+            **plan["runner"],
+            "timeout_seconds": config.timeout_seconds,
+            "max_output_tokens": config.max_output_tokens,
+            "transport": config.transport,
+            "concurrency": config.concurrency,
+        },
+        "imported": plan["imported"],
+        "adapter": plan["dataset"]["adapter"],
+        "summary": summary,
+        "usage": usage,
+        "comparison": dict(comparisons),
+        "cases": cases,
+        "baseline_only": sorted(set(baseline) - {c["id"] for c in cases}),
+    }
+    execution_settings = directory / 'execution-settings.jsonl'
+    if execution_settings.exists():
+        with execution_settings.open() as f:
+            result['execution_settings'] = [json.loads(line) for line in f]
+        if any(r['manifest_sha256'] != manifest_hash for r in result['execution_settings']):
+            raise ValueError('execution settings belong to another manifest')
+    result["requests"] = (
+        request_preview(plan, manifest, cases) if not plan["imported"] else None
+    )
+    if result["adapter"] == "bounded_comparisons":
+        token_counts = [case["evidence"]["input_tokens"] for case in cases]
+        result["prepared_inputs"] = dict(
+            tokenizer="o200k_base", batches=len(cases),
+            comparisons=sum(len(case["evidence"]["pairs"]) for case in cases),
+            rendered_input_tokens=sum(token_counts),
+            min_rendered_input_tokens=min(token_counts, default=0),
+            max_rendered_input_tokens=max(token_counts, default=0))
+    if result["adapter"] == "masks":
+        result["posts"] = len({c["evidence"]["note_id"] for c in cases})
+
+
+    selected_extension = project.extension()
+    if selected_extension:
+        selected_extension.enrich_report(result, plan, cases)
+    if generation_costs:
+        result["generation_usage"] = generation_usage(
+            config, manifest, selected, records, latest, files, reconciled_costs)
+    return result
+
+
+def collect(directories, output, worker_config=None):
+    selected = project.extension()
+    if selected is None:
+        raise ValueError("this command requires a project extension")
+    return selected.collect(directories, output, worker_config)
+
+
+def execution_upgrade(directory, plan, reason):
+    """Audit an explicitly approved code transition without rewriting frozen inputs."""
+    active = plan["code"]
+    available = project.code_files(plan["dataset"])
+    current = {name: engine._sha256_file(available[name]) for name in active}
+    path = directory / "code-upgrades.jsonl"
+    results_path = Path(plan["run_directory"]) / "results.jsonl"
+    results = results_path.read_bytes() if results_path.exists() else b""
+    for line in path.read_bytes().splitlines() if path.exists() else []:
+        entry = json.loads(line)
+        if (entry["from"] != active or set(entry["to"]) != set(active)
+                or entry["results_prefix_bytes"] > len(results)
+                or entry["results_prefix_bytes"] < 0
+                or engine._sha256_bytes(results[:entry["results_prefix_bytes"]]) != entry["results_prefix_sha256"]):
+            raise ValueError("invalid execution code upgrade history")
+        active = entry["to"]
+    if current != active:
+        if not reason or not reason.strip():
+            raise ValueError("experiment code changed; inspect it and supply --runner-upgrade-reason, or prepare a new experiment")
+        engine._append_json_line(path, {
+            "from": active, "to": current, "reason": reason,
+            "results_prefix_bytes": len(results),
+            "results_prefix_sha256": engine._sha256_bytes(results),
+        })
+
+
+def reconcile_costs(directory):
+    """Read missing OpenRouter charges; never rewrite original model receipts."""
+    directory = Path(directory).resolve()
+    with locked(directory):
+        plan, config, manifest = load(directory)
+        if config.provider != 'openrouter' or plan['imported']:
+            raise ValueError('cost lookup requires a native OpenRouter experiment')
+        report(directory)  # Verify saved experiment and receipt provenance first.
+        path = config.run_directory / 'results.jsonl'
+        records = [json.loads(line) for line in path.read_bytes().splitlines()] if path.exists() else []
+        costs = engine.load_reconciled_costs(config.run_directory, records)
+        pending = [r for r in records if r.get('execution') != 'cross_run_reuse'
+                   and engine.provider_cost(r, costs) is None
+                   and (r.get('model_result') or {}).get('response_metadata', {}).get('id')]
+        if pending:
+            ids = list(dict.fromkeys(r['model_result']['response_metadata']['id'] for r in pending))
+            node = shutil.which('node')
+            argv = ([node] if node else ['nix', 'shell', 'nixpkgs#nodejs_24', '--command', 'node'])
+            argv += [str(Path(__file__).with_name('frontier_runner') / 'billing.mjs')]
+            result = subprocess.run(argv, input=json.dumps(ids), text=True, capture_output=True,
+                                    timeout=60 + 35 * len(ids))
+            if result.returncode:
+                raise ValueError('cost lookup failed; original reserves retained')
+            rows = json.loads(result.stdout)
+            if not isinstance(rows, list) or len(rows) != len(ids):
+                raise ValueError('invalid cost lookup response')
+            by_id = {r.get('id'): r for r in rows}
+            if set(by_id) != set(ids):
+                raise ValueError('cost lookup generation IDs differ')
+            for row in rows:
+                if 'error' not in row:
+                    cost = row.get('total_cost')
+                    if type(cost) not in (int, float) or not math.isfinite(cost) or cost < 0:
+                        raise ValueError('invalid cost lookup charge')
+            for record in pending:
+                row = by_id[record['model_result']['response_metadata']['id']]
+                if 'error' in row:
+                    continue  # Missing bills remain explicitly unknown.
+                engine._append_json_line(config.run_directory / 'cost-receipts.jsonl', {
+                    'source': 'openrouter/generation', 'record_sha256': inputs.digest(record),
+                    'generation': row, 'looked_up_at_utc': datetime.now(timezone.utc).isoformat(),
+                })
+        return report(directory)
+
+
+def run(directory, max_new_attempts=None, runner_upgrade_reason=None, *,
+        max_cost_usd=None, max_request_cost_usd=None, attempt_budget_path=None,
+        max_concurrency=None):
+    directory = directory.resolve()
+    if (directory / 'bounded-build.json').exists():
+        if any(x is not None for x in (max_cost_usd, max_request_cost_usd, attempt_budget_path, max_concurrency)):
+            raise ValueError('bounded builds use their frozen shared attempt budget and subscription route')
+        run_build = project.import_module('bounded_hierarchy_build').run_build
+        return run_build(directory, max_new_attempts, runner_upgrade_reason)
+    with locked(directory):
+        plan, config, manifest = load(directory)
+        if plan["imported"]:
+            raise ValueError(
+                "imported experiments are read-only; prepare --from this experiment to run a candidate"
+            )
+        if max_concurrency is not None and not 1 <= max_concurrency <= config.concurrency:
+            raise ValueError('execution concurrency cap must be positive and at most the prepared concurrency')
+        concurrency = config.concurrency if max_concurrency is None else max_concurrency
+        identity = engine._runner_identity(config)
+        if any(identity[k] != manifest[k] for k in ("runner_version", "runner_sha256")):
+            raise ValueError("model runner changed since preparation")
+        engine._validate_auth_file(config.auth_file)
+        execution_upgrade(directory, plan, runner_upgrade_reason)
+        engine._append_json_line(directory / 'execution-settings.jsonl', dict(
+            manifest_sha256=inputs.digest(manifest), concurrency=concurrency,
+            prepared_concurrency=config.concurrency,
+            started_at_utc=datetime.now(timezone.utc).isoformat()))
+        provenance = engine._load_runner_upgrades(
+            config.run_directory, manifest_sha256=inputs.digest(manifest),
+            initial_wrapper_sha256=manifest["wrapper_sha256"],
+        )
+        wrapper_changed = provenance.active_wrapper_sha256 != engine._sha256_file(Path(engine.__file__))
+        error = None
+        cases = {c["id"]: c for c in plan["cases"]}
+        # Resolve the selected project validator before entering worker threads.
+        validate = inputs.validate
+
+        def validate_output(job, raw):
+            validate(
+                plan["dataset"], cases[job.prompt_id], raw, config.output_schema
+            )
+
+        try:
+            engine._execute_prompt_batch(
+                config,
+                manifest,
+                retry_failed=False,
+                concurrency=concurrency,
+                validate_output=validate_output,
+                max_new_attempts=max_new_attempts,
+                max_cost_usd=max_cost_usd,
+                max_request_cost_usd=max_request_cost_usd,
+                attempt_budget_path=attempt_budget_path,
+                runner_upgrade_reason=runner_upgrade_reason if wrapper_changed else None,
+            )
+        except engine.RunnerError as caught:
+            error = caught
+        finally:
+            result = report(directory)
+            write(directory / "report.json", result)
+        if error:
+            raise engine.RunnerError(
+                f"{error}; partial results: {directory / 'report.json'}"
+            ) from error
+        return result
+
+
+def review(args):
+    selected = project.extension()
+    if selected:
+        return selected.review(args)
+    if args.ui:
+        raise ValueError('review UI requires a project extension')
+    with locked(args.experiment.resolve()):
+        result = report(args.experiment)
+        if not all((args.case, args.role, args.verdict, args.comment)):
+            raise ValueError('recording review requires --case, --role, --verdict and --comment')
+        case = next((c for c in result['cases'] if c['id'] == args.case), None)
+        if case is None:
+            raise ValueError('unknown case')
+        engine._append_json_line(args.experiment / 'reviews.jsonl', {
+            'case_id': args.case, 'role': args.role, 'verdict': args.verdict,
+            'comment': args.comment, 'time': datetime.now(timezone.utc).isoformat(),
+            'input_sha256': case['input_sha256'], 'output_sha256': inputs.digest(case['output'])})
+        write(args.experiment / 'report.json', report(args.experiment))
+        print(f'Recorded {args.role} review for {args.case}. Model calls made: 0')
+
+
+def compact(result, *, prepared=False):
+    print(f"{'Prepared' if prepared else 'Experiment'}: {result['experiment']}")
+    print(f"Prompt: {result['prompt_id']}")
+    settings = result["settings"]
+    print(
+        f"Model: {settings['provider']} / {settings['model']}; reasoning: {settings['reasoning_effort']}"
+    )
+    available = sum(
+        c["baseline"] is not None and c["baseline"]["status"] in {"valid", "empty"}
+        for c in result["cases"]
+    )
+    print(f"Saved baseline results available: {available}/{len(result['cases'])}")
+    if result["adapter"] == "masks":
+        print(f"Posts: {result['posts']}; subjects/calls: {result['summary']['cases']}")
+    print("Cases: " + ", ".join(f"{k}={v}" for k, v in result["summary"].items()))
+    if "prepared_inputs" in result:
+        print("Offline input sizing (rendered prompt proxy, not provider billing): "
+              + json.dumps(result["prepared_inputs"]))
+    print("Comparison (text changes, not quality): " + json.dumps(result["comparison"]))
+    if result["baseline_only"]:
+        print(
+            "Baseline-only cases (not in this experiment): "
+            + ", ".join(result["baseline_only"])
+        )
+    if result["requests"]:
+        print(
+            f"Requests remaining: {result['requests']['new']} new, {result['requests']['reusable']} reusable"
+        )
+    if prepared:
+        print("Model calls made: 0")
+    else:
+        print(
+            "Usage (new attempts only; reasoning already included in output): "
+            + json.dumps(result["usage"])
+        )
+        if "generation_usage" in result:
+            print("Generation usage (unique original calls; includes traced reused sources): "
+                  + json.dumps({k: v for k, v in result["generation_usage"].items()
+                                if k != "sources"}))
+    for case in result["cases"]:
+        print(f"  {case['id']}: {case['status']}; {case['comparison']}")
+    action = "show" if result["imported"] or not result["summary"]["unrun"] else "run"
+    command = [
+        sys.executable,
+        str(Path(__file__).resolve()),
+        *(["--project-root", str(project.root())] if project.root() else []),
+        action,
+        result["experiment"],
+    ]
+    if action == "show":
+        command += ["--case", result["cases"][0]["id"]]
+    print("Next: " + shlex.join(command))
+    if action == "run":
+        print(
+            "Inference requires user authorization; preparation is not authorization."
+        )
+
+
+def score_review(args):
+    selected = project.extension()
+    if selected is None:
+        raise ValueError("this command requires a project extension")
+    return selected.score_review(args)
+
+
+def parser():
+    root = argparse.ArgumentParser(
+        prog="experiment-runner", description=__doc__,
+        epilog="Global options: --project-root PATH selects project adapters; --version prints the shared release.")
+    commands = root.add_subparsers(dest="command", required=True)
+    p = commands.add_parser(
+        "prepare", help="freeze inputs/settings and baseline; no inference"
+    )
+    p.add_argument("destination", type=Path)
+    start = p.add_mutually_exclusive_group(required=True)
+    start.add_argument("--spec", type=Path)
+    start.add_argument("--from", dest="from_experiment", type=Path)
+    p.add_argument("--baseline", type=Path)
+    p.add_argument("--only", action="append", metavar="CASE_ID",
+                   help="prepare only this case (repeat for several); preserves exact inputs and matching baseline")
+    p.add_argument("--prompt", type=Path)
+    p.add_argument("--prompt-id")
+    p.add_argument("--repeat", action="store_true")
+    p.add_argument("--history-root", type=Path)
+    p.add_argument("--model")
+    p.add_argument("--reasoning-effort")
+    p.add_argument("--provider", choices=("openai-codex", "openrouter"))
+    p.add_argument("--concurrency", type=int)
+    p.add_argument("--runner-binary", type=Path,
+                   help="explicitly select a worker for this new experiment, including when inheriting an older run")
+    p.add_argument("--max-output-tokens", type=int)
+    p.add_argument("--transport", choices=("sse", "websocket"),
+                   help="explicit transport; websocket is subscription-only, without fallback")
+    p.add_argument(
+        "--import-config",
+        type=Path,
+        help="verify/import a historical batch without running it",
+    )
+    p = commands.add_parser(
+        "run",
+        help="execute a prepared experiment; retry only temporary provider errors",
+    )
+    p.add_argument("experiment", type=Path)
+    p.add_argument("--max-new-attempts", type=int,
+                   help="cap newly sent attempts, including provider retries; reserve spending for this allowance")
+    p.add_argument("--attempt-budget", type=Path,
+                   help="persistent cross-experiment launch counter; failed/interrupted attempts are not refunded")
+    p.add_argument('--max-concurrency', type=int,
+                   help='lower execution concurrency without changing frozen requests/settings; saved in execution receipts')
+    p.add_argument("--max-cost-usd", type=float,
+                   help="cumulative experiment spending allowance; includes prior attempts, never truncates responses")
+    p.add_argument("--max-request-cost-usd", type=float,
+                   help="caller-verified maximum cost reserved for each in-flight call; required with --max-cost-usd")
+    p.add_argument("--runner-upgrade-reason", help="explicitly approve and audit a workflow-code upgrade; frozen inputs/settings remain immutable")
+    p = commands.add_parser('reconcile-costs', help='lookup missing OpenRouter charges; no inference')
+    p.add_argument('experiment', type=Path)
+    p = commands.add_parser(
+        "show", help="inspect all cases, or exact case evidence; no inference"
+    )
+    p.add_argument("experiment", type=Path)
+    p.add_argument("--case")
+    p.add_argument("--prompt-only", action="store_true", help="print the exact rendered prompt; requires --case")
+    p.add_argument("--only", action="append", metavar="CASE_ID",
+                   help="limit cases and usage to these IDs (repeatable; read-only)")
+    p.add_argument("--note", action="append", metavar="NOTE_ID",
+                   help="limit cases and usage to saved evidence.note_id (repeatable)")
+    p.add_argument("--generation-costs", action="store_true",
+                   help="trace verified original generation costs, counting reused sources once; no inference")
+    p.add_argument("--json", action="store_true")
+    p = commands.add_parser(
+        "revise",
+        help="create a version from exact edits and print its full diff",
+        description='No model calls. Edits JSON: {"edits":[{"old":"exact original text","new":"replacement"}]}. '
+        "Optional base_sha256 pins the original; otherwise it is computed. "
+        "Matches must be unique and nonoverlapping. Original bytes are preserved; "
+        "destinations cannot exist. Prints only the full-context diff to stdout.",
+    )
+    p.add_argument("base", type=Path)
+    p.add_argument("destination", type=Path)
+    p.add_argument("--edits", required=True, help="JSON file or - for stdin")
+    p = commands.add_parser(
+        "review", help="record attributed judgments or open an existing task UI"
+    )
+    p.add_argument("experiment", type=Path)
+    p.add_argument("--case")
+    p.add_argument("--role", choices=("agent", "user"))
+    p.add_argument("--verdict", choices=("accept", "reject", "uncertain"))
+    p.add_argument("--comment")
+    p.add_argument("--ui", action="store_true")
+    p.add_argument("--view", choices=("prominence",),
+                   help="render saved generic prominence diagnostics in the existing mask viewer")
+    p.add_argument("--node", action="append", metavar="NODE_ID",
+                   help="prominence UI: show all masks of this node; repeat for several")
+    p.add_argument("--ordering", help="start in a named saved cosine-comparison ordering")
+    p.add_argument("--check", action="store_true",
+                   help="validate the prominence UI batch without opening a terminal")
+    p.add_argument("--flagged-only", action="store_true",
+                   help="title/mask/prominence UI: current reject/uncertain reviews and unresolved failures")
+    p.add_argument("--only", action="append", metavar="CASE_ID",
+                   help="title/mask/prominence UI: show this case (repeat for several); intersects --flagged-only")
+    p.add_argument("--ui-binary", type=Path)
+    p.add_argument("--cosine-comparison", type=Path,
+                   help="saved prominence_cosine/centroid comparison; adds offline ranking orders")
+    selected = project.extension()
+    if selected:
+        selected.add_commands(commands)
+    return root
+
+
+def main(argv=None):
+    args = parser().parse_args(argv)
+    try:
+        selected = project.extension()
+        handled = selected.handle_command(args) if selected else NotImplemented
+        if handled is not NotImplemented:
+            return handled
+        if args.command == 'prepare':
+            if args.from_experiment and args.baseline:
+                raise ValueError('--from already specifies the baseline')
+            compact(prepare(args), prepared=True)
+        elif args.command == 'run':
+            if args.max_new_attempts is not None and args.max_new_attempts < 1:
+                raise ValueError('--max-new-attempts must be positive')
+            if args.runner_upgrade_reason is not None and (not args.runner_upgrade_reason.strip()):
+                raise ValueError('--runner-upgrade-reason must not be blank')
+            result = run(args.experiment, args.max_new_attempts, args.runner_upgrade_reason, max_cost_usd=args.max_cost_usd, max_request_cost_usd=args.max_request_cost_usd, attempt_budget_path=args.attempt_budget, max_concurrency=args.max_concurrency)
+            if (args.experiment / 'bounded-build.json').exists():
+                print(json.dumps(result, indent=2))
+                return int(result.get('status') != 'finished')
+            compact(result)
+            return int(any((result['summary'][s] for s in ('malformed', 'invalid_receipt', 'failed', 'unrun'))))
+        elif args.command == 'reconcile-costs':
+            compact(reconcile_costs(args.experiment))
+        elif args.command == 'show':
+            if args.prompt_only and (not args.case):
+                raise ValueError('--prompt-only requires --case')
+            if (args.experiment / 'bounded-build.json').exists():
+                if any((args.case, args.only, args.note, args.generation_costs)):
+                    raise ValueError('inspect individual cases in the child experiments')
+                report_build = project.import_module('bounded_hierarchy_build').report_build
+                print(json.dumps(report_build(args.experiment), indent=2))
+                return 0
+            only = [args.case] if args.generation_costs and args.case and (args.only is None) else args.only
+            result = report(args.experiment, only, args.note, generation_costs=args.generation_costs)
+            if args.case:
+                case = next((c for c in result['cases'] if c['id'] == args.case), None)
+                if case is None:
+                    raise ValueError('unknown case')
+                result = {'settings': result['settings'], **case, **({'generation_usage': result['generation_usage']} if args.generation_costs else {})}
+            if args.prompt_only:
+                print(result['prompt'], end='')
+            elif args.json or args.case:
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+            else:
+                compact(result)
+        elif args.command == 'revise':
+            try:
+                request = json.load(sys.stdin) if args.edits == '-' else read(args.edits)
+            except (ValueError, UnicodeError) as error:
+                raise ValueError(f'could not read edits JSON: {error}') from error
+            if 'base_sha256' not in request:
+                request['base_sha256'] = engine._sha256_file(args.base)
+            sys.stdout.write(engine.revise_prompt(args.base, args.destination, request))
+            print(f'Created {args.destination}; provenance: {args.destination}.revision.json', file=sys.stderr)
+        else:
+            review(args)
+        return 0
+    except (ValueError, KeyError, TypeError, OSError, engine.RunnerError) as error:
+        print(f'Experiment failed: {error}', file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    from experiment_runner.cli import main as cli_main
+    raise SystemExit(cli_main())

@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "experiment-runner"
+version = "1.0.0"
+description = "Shared execution and audited receipts for prompt experiments"
+requires-python = ">=3.11"
+
+[project.scripts]
+experiment-runner = "experiment_runner.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["experiment_runner*"]
+
+[tool.setuptools.package-data]
+experiment_runner = ["run-model.sh", "frontier_runner/*.mjs", "frontier_runner/*.json"]
