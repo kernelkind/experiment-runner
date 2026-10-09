@@ -24,6 +24,11 @@ Python/Node runtime and Node dependencies. It provides the same
 `experiment-runner` executable. System installation belongs to `/opt/nixos`;
 source changes, releases and tests belong to this repository.
 
+`experiment-runner --help` lists commands and points to the cache workflow.
+`experiment-runner prepare --help` includes prefix/key setup, a complete
+warmup-and-batch example, and worker migration. `experiment-runner run --help`
+explains shared attempt bounds and cache-cost accounting.
+
 `prepare`, `show`, `revise`, attributed `review` and `reconcile-costs` retain their
 existing workflow. Generic cases need no project extension. For Oracle-specific
 adapters and commands, use `--project-root` or run inside a checkout containing
@@ -67,6 +72,32 @@ rewrite the previous experiment.
 Oracle's old Python/shell/Node entry points delegate to this package. For an
 explicit source-version pin, set `EXPERIMENT_RUNNER_ROOT` to a checkout of this
 repository. A project worktree itself does not select a runner revision.
+
+## Update the shared binary after code merges
+
+After **every code change merged into local `main`**, rebuild and update the
+shared runner binary from that clean checkout. This includes CLI, worker,
+dependency and packaging changes. Documentation-only and other non-code changes
+do not require a binary update.
+
+```bash
+cd ~/src/notedeck_worktrees/algos/experiment-runner
+runner_package="$(nix build . --no-link --print-out-paths)"
+"$runner_package/bin/experiment-runner" --version
+"$runner_package/bin/experiment-runner" --help
+"$runner_package/bin/experiment-runner" prepare --help
+```
+
+Verify the built binary's relevant behavior, then update any shared installation
+to that build and verify the installed command matches it. A successful build
+alone does not update an installed command. System installation is owned by
+`/opt/nixos` and follows its merge and activation permissions; report a pending
+installation explicitly. When no installation exists, give callers the exact
+built binary path rather than claiming it is available on `PATH`.
+
+Use the updated binary and its worker for newly prepared experiments. Existing
+experiments retain their frozen worker and receipts; prepare a new directory
+with `--from` and `--runner-binary` to migrate, as described above.
 
 ## SSE prefix caching
 

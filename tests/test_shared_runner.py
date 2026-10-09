@@ -13,6 +13,32 @@ CLI = ROOT / 'bin/experiment-runner'
 
 
 class SharedRunnerTests(unittest.TestCase):
+    def test_help_explains_the_cache_workflow_without_creating_an_experiment(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            for arguments, guidance in (
+                (('--help',), ('SSE prefix caching', 'experiment-runner prepare --help')),
+                (('prepare', '--help'), (
+                    'exact beginning of every rendered prompt',
+                    '1-64 visible ASCII characters',
+                    'experiment-runner prepare target/cached-v1',
+                    'experiment-runner prepare target/warmup-v1',
+                    'experiment-runner run target/warmup-v1',
+                    'experiment-runner run target/cached-v1',
+                    'Finish the warmup before running',
+                    'existing attempt budget',
+                    '--runner-binary',
+                )),
+                (('run', '--help'), ('warmup', 'cached input', 'reasoning', 'unknown')),
+            ):
+                with self.subTest(arguments=arguments):
+                    result = subprocess.run([str(CLI), *arguments], cwd=project,
+                                            text=True, capture_output=True, timeout=30)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    for text in guidance:
+                        self.assertIn(text, result.stdout)
+            self.assertEqual(list(project.iterdir()), [])
+
     def test_prepare_from_can_explicitly_select_the_shared_worker(self):
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary)

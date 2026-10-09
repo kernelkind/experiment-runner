@@ -965,10 +965,44 @@ def score_review(args):
 def parser():
     root = argparse.ArgumentParser(
         prog="experiment-runner", description=__doc__,
-        epilog="Global options: --project-root PATH selects project adapters; --version prints the shared release.")
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Global options: --project-root PATH selects project adapters; --version prints the shared release.\n\n"
+        "SSE prefix caching: experiment-runner prepare --help explains prefix/key setup,\n"
+        "instructions-only warmup and comparison batches. experiment-runner run --help\n"
+        "explains attempt budgets and cache-cost accounting.")
     commands = root.add_subparsers(dest="command", required=True)
     p = commands.add_parser(
-        "prepare", help="freeze inputs/settings and baseline; no inference"
+        "prepare", help="freeze inputs/settings and baseline; no inference",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""SSE prefix caching (openai-codex, gpt-6.1-sol):
+  Put the exact beginning of every rendered prompt in a nonempty UTF-8 file,
+  preserving whitespace. Fixed instructions go there; case data follows them.
+  Choose one stable key of 1-64 visible ASCII characters without spaces.
+  Reuse the prefix/key across warmup and batches; do not change it per case.
+
+Example from your project checkout (replace the spec, prefix and destinations):
+  experiment-runner prepare target/cached-v1 --spec comparisons.json \\
+    --provider openai-codex --model gpt-6.1-sol --reasoning-effort medium \\
+    --transport sse --concurrency 8 --prompt-cache-key compare-v1 \\
+    --prompt-cache-prefix prompts/compare-prefix.txt
+  experiment-runner prepare target/warmup-v1 --from target/cached-v1 --cache-warmup
+  experiment-runner run target/warmup-v1 --max-new-attempts 1
+  experiment-runner run target/cached-v1 --max-new-attempts 128
+
+  Finish the warmup before running the comparison batch. Warmup is one real
+  instructions-only inference request at concurrency one; its answer is never
+  supplied to comparisons. It inherits the schema/key/settings and refuses
+  overrides. Preparing either experiment makes no model calls.
+  Use your authorized attempt bounds, including warmup and retries. Pass the
+  same existing attempt budget via --attempt-budget PATH to both run commands.
+
+  To migrate saved inputs, replace --spec with --from OLD_EXPERIMENT and select
+  the current release's worker with --runner-binary CURRENT_WORKER. Otherwise
+  --from retains the old frozen worker. It also inherits the saved prefix/key.
+  Ordinary identical comparisons reuse answers; --repeat requests fresh trials.
+  Specs use runner.prompt_cache_key and literal runner.prompt_cache_prefix text;
+  the CLI prefix option reads a file. WebSocket cache options are refused.
+  Cache hits are not guaranteed. See experiment-runner run --help for costs."""
     )
     p.add_argument("destination", type=Path)
     start = p.add_mutually_exclusive_group(required=True)
@@ -1004,6 +1038,18 @@ def parser():
     p = commands.add_parser(
         "run",
         help="execute a prepared experiment; retry only temporary provider errors",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""SSE prefix caching:
+  See experiment-runner prepare --help for prefix/key and warmup preparation.
+  Finish the warmup before the comparison batch; run both with the same existing
+  --attempt-budget PATH. Every warmup, retry and failed attempt consumes it.
+  --max-new-attempts caps this command; the shared counter caps their total.
+
+  Inspect usage with experiment-runner show EXPERIMENT --json or report.json.
+  Add warmup and comparison costs, including input, cached input, cache writes
+  and output. Output already includes reasoning; do not charge it twice.
+  Missing failed-call usage leaves the complete cost unknown. Saved receipts
+  retain raw provider usage. Cache hits are not guaranteed.""",
     )
     p.add_argument("experiment", type=Path)
     p.add_argument("--max-new-attempts", type=int,
