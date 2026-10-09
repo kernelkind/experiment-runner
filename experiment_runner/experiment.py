@@ -387,7 +387,7 @@ def import_setup(path, setup):
     return config, manifest, cases
 
 
-def usage_summary(calls, *, strict=False):
+def usage_summary(calls, *, strict=True):
     """Total saved usage; strict generation reports keep missing failures unknown."""
     fields = (
         ("input_tokens", "input", "input_tokens"),

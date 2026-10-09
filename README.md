@@ -95,6 +95,14 @@ without launching a call; it cannot launch an unreserved call. Additional
 counters must already exist and require a primary counter. These options do not
 create a new spending authorization.
 
+Native reports use strict accounting for local attempts and original generations.
+They retain `known_catalog_cost_estimate_usd` and
+`known_provider_reported_cost_usd` subtotals even when a total is unknown. An
+attempt with missing token usage, including a failed response with only SDK zero
+placeholders, remains unknown and makes the complete catalog-cost total null.
+Verified reused generations are counted once by their original receipt, while
+reuse itself adds no new execution cost.
+
 ## Verification
 
 ```bash

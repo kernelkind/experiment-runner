@@ -132,6 +132,52 @@ def enrich_report(result, plan, cases):
         self.assertEqual(json.loads(stage.path.read_text())['used'], 0)
         self.assertEqual(json.loads(shared.path.read_text())['used'], 0)
 
+    def test_native_accounting_reports_known_subtotals_and_deduplicated_reuse_costs(self):
+        self.prepare()
+        with patch.dict(os.environ, {'FAKE_RUNNER_RESULT_OVERRIDE': json.dumps({
+                'usage': {'input': 100, 'output': 20, 'cost': {'total': 0.25}}})}):
+            experiment.run(self.root / 'E1', include_request_preview=False)
+        original = experiment.report(self.root / 'E1', generation_costs=True,
+                                     include_request_preview=False)
+        self.assertEqual(original['usage']['known_catalog_cost_estimate_usd'], 0.75)
+        self.assertEqual(original['usage']['catalog_cost_estimate_usd'], 0.75)
+        self.assertEqual(original['usage']['known_provider_reported_cost_usd'], 0)
+        self.assertIsNone(original['usage']['provider_reported_cost_usd'])
+        for name in ('reuse_one', 'reuse_two'):
+            args = experiment.parser().parse_args([
+                'prepare', str(self.root / name), '--from', str(self.root / 'E1')])
+            experiment.prepare(args, include_request_preview=False)
+            experiment.run(self.root / name, include_request_preview=False)
+            reused = experiment.report(self.root / name, generation_costs=True,
+                                       include_request_preview=False)
+            self.assertEqual(reused['summary']['reused'], 3)
+            self.assertEqual(reused['summary']['attempts'], 0)
+            self.assertEqual(reused['usage']['known_catalog_cost_estimate_usd'], 0)
+            self.assertEqual(reused['generation_usage']['original_calls'], 3)
+            self.assertEqual(reused['generation_usage']['source_calls_added'], 3)
+            self.assertEqual(reused['generation_usage']['known_catalog_cost_estimate_usd'], 0.75)
+        self.assertEqual(len(json.loads((self.root / 'calls.json').read_text())), 3)
+
+    def test_native_accounting_keeps_failed_sdk_zero_placeholders_unknown(self):
+        self.prepare()
+        with patch.dict(os.environ, {
+            'FAKE_RUNNER_RESULT_OVERRIDE': json.dumps({'usage': {
+                'input': 0, 'output': 0, 'cacheRead': 0, 'cacheWrite': 0,
+                'reasoning': 0, 'cost': {'total': 0}}}),
+            'FAKE_RUNNER_FAILURES': json.dumps({'one': {
+                'metadata': {'http_status': 400, 'error': {'code': 'invalid_request'}}}}),
+        }), self.assertRaises(RunnerError):
+            experiment.run(self.root / 'E1', include_request_preview=False)
+        report = experiment.report(self.root / 'E1', generation_costs=True,
+                                   include_request_preview=False)
+        for usage in (report['usage'], report['generation_usage']):
+            self.assertEqual(usage['attempts_without_usage'], 1)
+            self.assertEqual(usage['attempts_without_cost_estimate'], 1)
+            self.assertEqual(usage['known_catalog_cost_estimate_usd'], 0)
+            self.assertIsNone(usage['catalog_cost_estimate_usd'])
+        self.assertEqual(report['summary']['failed'], 1)
+        self.assertEqual(report['summary']['valid'], 2)
+
     def test_secondary_budget_requires_primary_before_any_dispatch(self):
         self.prepare()
         budget = self.root / 'secondary.json'
