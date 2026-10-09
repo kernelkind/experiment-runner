@@ -101,6 +101,8 @@ with `--from` and `--runner-binary` to migrate, as described above.
 ## SSE prefix caching
 
 Version 1.2.0 provides one caching option: `--prompt-cache-prefix FILE`.
+Use it for **large experiments sharing fixed instructions** to reduce
+API-equivalent cost.
 It is supported for `openai-codex`, `gpt-6.1-sol` and SSE. Supply a nonempty
 UTF-8 file containing the **exact beginning of every rendered prompt**, including
 whitespace. Fixed instructions go there; changing case data follows them. The
@@ -129,13 +131,16 @@ This uses the tested developer-prefix/user-data format and native subscription
 key/routing headers. Each request remains independent; no previous answer is
 included.
 
-Automatic warming requires a prefix with at least **1,024 locally estimated
-`o200k_base` tokens** and allowance for warmup plus a comparison. The count covers
+Preparation requires a prefix with at least **1,024 locally estimated
+`o200k_base` tokens** when prefix caching is requested. A shorter prefix is
+rejected with its estimated count and minimum before creating the experiment or
+spending calls. Omit the caching option (or remove `runner.prompt_cache_prefix`
+from the spec) to prepare without caching. Automatic warming also requires
+allowance for warmup plus a comparison. The count covers
 only the supplied text, excludes message/schema overhead and is not an exact
 subscription tokenizer contract. The documented public API threshold is 1,024
 visible tokens ([OpenAI caching guide](https://developers.openai.com/api/docs/guides/prompt-caching));
-backend eligibility and cache hits remain unguaranteed. Short
-prefixes keep the instruction/data format but skip warming. All-reused or
+backend eligibility and cache hits remain unguaranteed. All-reused or
 completed batches skip warming; with only one attempt left, the comparison takes
 priority. A resumed invocation with new comparisons may warm again. A failed
 warmup stops that invocation before comparisons; a later resume preserves the

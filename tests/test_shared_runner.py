@@ -17,7 +17,8 @@ class SharedRunnerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary)
             for arguments, guidance in (
-                (('--help',), ('SSE prefix caching', 'experiment-runner prepare --help')),
+                (('--help',), ('SSE prefix caching', 'experiment-runner prepare --help',
+                               'Recommended for large experiments sharing fixed instructions')),
                 (('prepare', '--help'), (
                     'exact beginning of every rendered prompt',
                     'derived from the exact prefix',
@@ -25,6 +26,8 @@ class SharedRunnerTests(unittest.TestCase):
                     'experiment-runner run target/cached-v1',
                     '1,024',
                     'automatically',
+                    'Recommended for large experiments sharing fixed instructions',
+                    'Preparation rejects shorter prefixes',
                     'existing attempt budget',
                     '--runner-binary',
                 )),
@@ -215,20 +218,45 @@ class NativePrefixTests(unittest.TestCase):
         self.prompt.write_text(text + '{POST}')
         return prefix
 
-    def test_warming_threshold_uses_prefix_tokens_not_full_prompt_or_characters(self):
-        for tokens in (1023, 1024):
-            with self.subTest(tokens=tokens):
-                prefix = self.automatic_prefix(tokens)
-                name = f'tokens-{tokens}'
-                self.prepare(name, '--model', 'gpt-6.1-sol', '--prompt-cache-prefix', prefix)
-                prepared = self.show(name)
-                self.assertEqual(prepared['cache_warmup']['estimated_prefix_tokens'], tokens)
-                before = len(self.calls())
-                self.cli('run', name, '--max-new-attempts', '3')
-                new = self.calls()[before:]
-                self.assertEqual(len(new), 2 + (tokens >= 1024))
-                if tokens >= 1024:
-                    self.assertEqual(new[0]['prompt'], prefix.read_text())
+    def test_prepare_rejects_short_cache_prefix_before_creating_experiment(self):
+        prefix = self.automatic_prefix(1023)
+        # Long case data must not make the fixed prefix qualify.
+        cases = json.loads(self.cases.read_text())
+        for case in cases['cases']:
+            case['inputs']['POST'] = ' dynamic' * 2000
+        self.cases.write_text(json.dumps(cases))
+        original_spec = self.spec.read_text()
+        self.prepare('plain')
+        for mode in ('cli', 'spec', 'manual-key', 'from-cli'):
+            with self.subTest(mode=mode):
+                spec = json.loads(original_spec)
+                spec['runner']['model'] = 'gpt-6.1-sol'
+                options = []
+                if mode == 'spec':
+                    spec['runner']['prompt_cache_prefix'] = prefix.read_text()
+                else:
+                    options = ['--prompt-cache-prefix', prefix]
+                    if mode == 'manual-key':
+                        options += ['--prompt-cache-key', 'fixed-key']
+                self.spec.write_text(json.dumps(spec))
+                source = ['--from', 'plain', '--model', 'gpt-6.1-sol'] if mode == 'from-cli' else ['--spec', self.spec]
+                failed = self.cli('prepare', mode, *source, *options, ok=False)
+                self.assertIn('prompt_cache_prefix', failed.stderr)
+                self.assertIn('1,023', failed.stderr)
+                self.assertIn('1,024', failed.stderr)
+                self.assertFalse((self.root / mode).exists())
+                self.assertEqual(self.calls(), [])
+        # Preparing the same inputs without requesting caching made no calls.
+        self.assertEqual(self.show('plain')['summary']['attempts'], 0)
+
+    def test_minimum_cache_prefix_is_accepted_and_warms_before_comparisons(self):
+        prefix = self.automatic_prefix(1024)
+        self.prepare('minimum', '--model', 'gpt-6.1-sol', '--prompt-cache-prefix', prefix)
+        prepared = self.show('minimum')
+        self.assertEqual(prepared['cache_warmup']['estimated_prefix_tokens'], 1024)
+        self.cli('run', 'minimum', '--max-new-attempts', '3')
+        self.assertEqual(len(self.calls()), 3)
+        self.assertEqual(self.calls()[0]['prompt'], prefix.read_text())
 
     def test_warmup_never_consumes_the_only_slot_and_resume_rechecks_capacity(self):
         prefix = self.automatic_prefix()
@@ -355,8 +383,7 @@ class NativePrefixTests(unittest.TestCase):
         self.assertEqual(traced['source_calls_added'], 3)
 
     def test_warmup_cannot_change_the_comparison_key_or_model_settings(self):
-        prefix = self.root / 'prefix.txt'
-        prefix.write_text('GENERIC PROMPT ')
+        prefix = self.automatic_prefix()
         self.prepare('native', '--model', 'gpt-6.1-sol', '--prompt-cache-key', 'fixed-key',
                      '--prompt-cache-prefix', prefix)
         for index, overrides in enumerate((
@@ -390,8 +417,7 @@ class NativePrefixTests(unittest.TestCase):
         from dataclasses import replace
         from experiment_runner import extraction_pipeline as engine
         key = '01234567-89ab-5cde-8012-0123456789ab'
-        prefix = self.root / 'prefix.txt'
-        prefix.write_text('GENERIC PROMPT ')
+        prefix = self.automatic_prefix()
         self.prepare('native', '--model', 'gpt-6.1-sol', '--prompt-cache-key', key,
                      '--prompt-cache-prefix', prefix)
         cfg = engine.PromptRunnerConfig.load(self.root/'native/runner-config.json')
@@ -487,8 +513,7 @@ class NativePrefixTests(unittest.TestCase):
                 engine.PromptRunnerConfig.load(path)
 
     def test_cli_rejects_invalid_native_controls_without_execution(self):
-        prefix = self.root / 'prefix.txt'
-        prefix.write_text('GENERIC PROMPT ')
+        prefix = self.automatic_prefix()
         base = ['--model', 'gpt-6.1-sol', '--prompt-cache-key', 'native-test',
                 '--prompt-cache-prefix', str(prefix)]
         for index, options in enumerate((
@@ -502,7 +527,7 @@ class NativePrefixTests(unittest.TestCase):
             failed = self.cli('prepare', name, '--spec', self.spec, *base, *options, ok=False)
             self.assertIn('prompt_cache', failed.stderr)
             self.assertFalse((self.root / name).exists())
-        prefix.write_text('different prefix')
+        prefix.write_text('different prefix' + ' word' * 1100)
         failed = self.cli('prepare', 'mismatch', '--spec', self.spec, *base, ok=False)
         self.assertIn('prompt_cache_prefix', failed.stderr)
         self.assertFalse((self.root / 'mismatch').exists())

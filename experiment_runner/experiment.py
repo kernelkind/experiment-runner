@@ -224,11 +224,20 @@ def prepare(args, *, preparation_context=None, include_request_preview=True):
     # Preserve explicit legacy key/manual-warmup experiments. New prefix-only
     # preparation is the public interface; inherited automatic plans retain it.
     if prefix and not args.import_config:
+        policy = (prefix_policy(prefix)
+                  if prefix_path is not None or not args.from_experiment
+                  else setup.get('cache_warmup'))
+        if policy is not None and not policy['eligible']:
+            raise ValueError(
+                f"prompt_cache_prefix has {policy['estimated_prefix_tokens']:,} estimated "
+                f"{policy['tokenizer']} tokens; minimum is {policy['minimum_prefix_tokens']:,}. "
+                "Use a qualifying fixed prefix or prepare without prefix caching."
+            )
         if getattr(args, 'prompt_cache_key', None) is not None:
             setup.pop('cache_warmup', None)
         elif prefix_path is not None or 'prompt_cache_key' not in setup['runner']:
             setup['runner']['prompt_cache_key'] = 'prefix-' + engine._sha256_bytes(prefix.encode())[:56]
-            setup['cache_warmup'] = prefix_policy(prefix)
+            setup['cache_warmup'] = policy or prefix_policy(prefix)
     warmup = getattr(args, "cache_warmup", False)
     if warmup:
         prefix = setup["runner"].get("prompt_cache_prefix")
@@ -1181,17 +1190,24 @@ def parser():
         prog="experiment-runner", description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Global options: --project-root PATH selects project adapters; --version prints the shared release.\n\n"
-        "SSE prefix caching: experiment-runner prepare --help explains the single prefix option,\n"
-        "instructions-only warmup and comparison batches. experiment-runner run --help\n"
+        "SSE prefix caching: Recommended for large experiments sharing fixed instructions\n"
+        "on openai-codex / gpt-6.1-sol / SSE. Use --prompt-cache-prefix FILE;\n"
+        "experiment-runner prepare --help explains automatic warming and eligibility.\n"
+        "experiment-runner run --help\n"
         "explains attempt budgets and API-equivalent cost statistics.")
     commands = root.add_subparsers(dest="command", required=True)
     p = commands.add_parser(
         "prepare", help="freeze inputs/settings and baseline; no inference",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""SSE prefix caching (openai-codex, gpt-6.1-sol, SSE):
+  Recommended for large experiments sharing fixed instructions to reduce
+  API-equivalent cost. Use --prompt-cache-prefix FILE.
   Put the exact beginning of every rendered prompt in a nonempty UTF-8 file,
   preserving whitespace. Fixed instructions go there; case data follows them.
   The stable key is derived from the exact prefix; no manual key is needed.
+  The prefix must have at least 1,024 estimated o200k_base tokens.
+  Preparation rejects shorter prefixes, reporting the count and minimum before
+  creating the experiment or spending calls. Omit caching to run without it.
 
 Example from your project checkout (replace the spec, prefix and destination):
   experiment-runner prepare target/cached-v1 --spec comparisons.json \\
@@ -1202,7 +1218,7 @@ Example from your project checkout (replace the spec, prefix and destination):
   run automatically warms before the first comparison requiring a new attempt
   when the prefix has at least 1,024 estimated o200k_base tokens and the attempt
   allowance has room for warmup plus a comparison. Reused/completed batches do
-  not warm. Short prefixes keep the instruction/data format without warming.
+  not warm.
   This is a local eligibility check, not a guarantee of backend cache hits.
   Warmup is real inference, uses the same schema/settings and never supplies its
   answer to comparisons. Its usage/cost is included in the batch report.
@@ -1240,7 +1256,7 @@ Example from your project checkout (replace the spec, prefix and destination):
     p.add_argument("--prompt-cache-key",
                    help=argparse.SUPPRESS)
     p.add_argument("--prompt-cache-prefix", type=Path,
-                   help="exact UTF-8 fixed-prefix file; derives key and enables eligible automatic warming")
+                   help="exact UTF-8 fixed-prefix file; requires at least 1,024 estimated tokens; derives key and enables automatic warming")
     p.add_argument("--cache-warmup", action="store_true",
                    help=argparse.SUPPRESS)
     p.add_argument(
