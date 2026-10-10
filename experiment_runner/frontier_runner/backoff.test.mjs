@@ -218,7 +218,7 @@ test('two native experiments share recovery and preserve the persistent attempt 
     { mode: 0o700 });
   const starts = [], statuses = new Map(), firstResponses = [];
   let closedAt = 0, firstRecoveryFinished = 0;
-  let scopesAvailable = true, scopeReads = 0;
+  let scopesAvailable = true, scopeReads = 0, changedScopesAfter = Infinity;
   const frame = event => `data: ${JSON.stringify(event)}\n\n`;
   const server = createServer((request, response) => {
     assert.equal(request.headers.authorization, `Bearer ${key}`);
@@ -227,7 +227,9 @@ test('two native experiments share recovery and preserve the persistent attempt 
     if (request.url.startsWith('/request-status/scopes?')) {
       scopeReads++;
       if (!scopesAvailable) { response.writeHead(503); response.end('{}'); return; }
-      response.end(JSON.stringify({ schema: 1, account_scope: 'account-fixture', transport_scope: 'transport-fixture' }));
+      response.end(JSON.stringify({ schema: 1,
+        account_scope: scopeReads > changedScopesAfter ? 'changed-account-fixture' : 'account-fixture',
+        transport_scope: 'transport-fixture' }));
       return;
     }
     if (request.url.startsWith('/request-status/')) {
@@ -295,7 +297,7 @@ test('two native experiments share recovery and preserve the persistent attempt 
       prompt: { id: 'backoff-fixture-v1', path: 'prompt.txt' },
       dataset: { adapter: 'generic', path: cases }, runner: {
         runner_binary: new URL('../run-model.sh', import.meta.url).pathname, provider: 'openai-codex', auth_file: null,
-        model: 'gpt-6.1-sol', reasoning_effort: 'medium', concurrency: 2, timeout_seconds: 5 } }));
+        model: 'gpt-6.1-sol', reasoning_effort: 'medium', timeout_seconds: 5 } }));
     const experiment = join(home, name);
     await cli(['prepare', experiment, '--spec', spec, '--history-root', home]);
     experiments.push(experiment);
@@ -325,7 +327,6 @@ test('two native experiments share recovery and preserve the persistent attempt 
     id: `unavailable-${i}`, inputs: { VALUE: `unavailable-${i}` } })) }));
   const inherited = JSON.parse(await readFile(join(home, 'spec-one.json'), 'utf8'));
   inherited.dataset.path = unavailableCases;
-  inherited.runner.concurrency = 1;
   await writeFile(unavailableSpec, JSON.stringify(inherited));
   await writeFile(unavailableBudget, JSON.stringify({ schema_version: 1, limit: 2, used: 0 }));
   await cli(['prepare', unavailableExperiment, '--spec', unavailableSpec, '--history-root', home]);
@@ -337,6 +338,17 @@ test('two native experiments share recovery and preserve the persistent attempt 
   const report = JSON.parse(await readFile(join(unavailableExperiment, 'report.json'), 'utf8'));
   assert.equal(report.summary.unrun, 3, 'an unadmitted case was saved as a terminal provider failure');
   assert.equal(report.summary.failed, 0);
-  // Keep the one existing conservative worker reservation; never refund/reset.
-  assert.equal(JSON.parse(await readFile(unavailableBudget, 'utf8')).used, 1);
+  // Scope discovery precedes worker launch and budget reservation.
+  assert.equal(JSON.parse(await readFile(unavailableBudget, 'utf8')).used, 0);
+  // Selection changes after queue admission: the native worker refuses its
+  // mismatched ticket instead of sending under the wrong account's capacity.
+  scopesAvailable = true;
+  changedScopesAfter = scopeReads + 1;
+  await cli(['run', unavailableExperiment, '--max-new-attempts', '2', '--attempt-budget', unavailableBudget], 1);
+  assert.equal(starts.length, 8, 'changed scopes sent a model request');
+  const changed = JSON.parse(await readFile(join(unavailableExperiment, 'report.json'), 'utf8'));
+  assert.equal(changed.summary.unrun, 3);
+  assert.equal(changed.summary.failed, 0);
+  assert.equal(JSON.parse(await readFile(unavailableBudget, 'utf8')).used, 2,
+    'already reserved attempts must remain conservative on a pre-send refusal');
 });

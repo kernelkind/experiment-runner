@@ -27,6 +27,16 @@ if "--identity" in sys.argv:
 request = json.loads(sys.stdin.read())
 prompt = request["prompt"]
 argv = sys.argv[1:]
+if os.environ.get("FAKE_RUNNER_CONTROL"):
+    import time
+    control = Path(os.environ["FAKE_RUNNER_CONTROL"])
+    (control / f"{os.getpid()}.json").write_text(json.dumps({
+        "pid": os.getpid(), "prompt": prompt, "started": time.time()}))
+    deadline = time.monotonic() + 45
+    while not (control / f"{os.getpid()}.release").exists():
+        if time.monotonic() > deadline:
+            raise SystemExit("fixture request was not released")
+        time.sleep(0.01)
 for text, action in json.loads(os.environ.get("FAKE_RUNNER_SEQUENCE", "{}")).items():
     if text in prompt:
         import time

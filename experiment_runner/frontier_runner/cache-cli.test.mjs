@@ -91,7 +91,7 @@ test('shared CLI warms the exact SSE prefix and accounts for real worker receipt
   write('cases.json', { cases: ['Tea', 'Coffee'].map((value, index) => ({ id: String(index), inputs: { SHARED: shared, DATA: value } })) });
   write('spec.json', { schema_version: 1, prompt: { id: 'cache-cli-v1', path: 'prompt.txt' }, dataset: { adapter: 'generic', path: 'cases.json' },
     runner: { provider: 'openai-codex', auth_file: null, model: 'gpt-6.1-sol', reasoning_effort: 'medium',
-      concurrency: 2, runner_binary: launcher, output_schema: schema } });
+      runner_binary: launcher, output_schema: schema } });
   write('budget.json', { schema_version: 1, limit: 5, used: 0 });
   async function command(...args) {
     const child = spawn(cli, ['--project-root', root, ...args], { cwd: root,

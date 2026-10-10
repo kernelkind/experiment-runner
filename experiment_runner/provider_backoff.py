@@ -14,6 +14,8 @@ import sys
 import tempfile
 import time
 
+GLOBAL_REQUEST_LIMIT = 30
+
 try:
     from .extraction_pipeline import provider_cooldown_required, _provider_retry_after_delay
 except ImportError:
@@ -120,33 +122,66 @@ class SharedProviderBackoff:
         if start is None:
             raise ValueError('experiment worker exited before admission')
         with self._state() as (state, now):
-            for key in keys.values():
-                if key not in state['scopes']:
-                    if len(state['scopes']) >= 256:
-                        raise ValueError('experiment backoff scope capacity reached')
-                    state['scopes'][key] = {'seconds': 0, 'until': 0, 'generation': 0,
-                        'limit': 0, 'successes': 0, 'ceiling': concurrency, 'updated': now}
-            waits = []
-            for key in keys.values():
-                value = state['scopes'][key]
-                if value['until'] > now:
-                    waits.append(value['until'] - now)
-                active = sum(key in ticket['generations'] for ticket in state['tickets'].values())
-                if value['limit'] and active >= value['limit']:
-                    waits.append(0.1)
-            if waits:
-                return {'wait_seconds': max(waits)}
-            if len(state['tickets']) >= 1024:
-                raise ValueError('experiment backoff worker capacity reached')
-            identifier = secrets.token_hex(16)
-            state['tickets'][identifier] = {'pid': owner_pid, 'process_start': start,
-                'expires': now + timeout_seconds + 30, 'started': now,
-                'concurrency': concurrency,
-                'generations': {key: state['scopes'][key]['generation'] for key in keys.values()},
-                'limits': {key: state['scopes'][key]['limit'] for key in keys.values()}}
-            for key in keys.values():
-                state['scopes'][key]['ceiling'] = max(state['scopes'][key]['ceiling'], concurrency)
-            return {'ticket': identifier}
+            return self._acquire(state, now, keys, concurrency, timeout_seconds, owner_pid, start)
+
+    def _acquire(self, state, now, keys, concurrency, timeout_seconds, owner_pid, start):
+        if self.occupancy(state, now) >= GLOBAL_REQUEST_LIMIT:
+            return {'wait_seconds': 0.1, 'wait_reason': 'capacity', 'cooldown_seconds': 0}
+        for key in keys.values():
+            if key not in state['scopes']:
+                if len(state['scopes']) >= 256:
+                    raise ValueError('experiment backoff scope capacity reached')
+                state['scopes'][key] = {'seconds': 0, 'until': 0, 'generation': 0,
+                    'limit': 0, 'successes': 0, 'ceiling': concurrency, 'updated': now}
+        waits = []
+        for key in keys.values():
+            value = state['scopes'][key]
+            if value['until'] > now:
+                waits.append(value['until'] - now)
+            active = sum(key in ticket['generations'] for ticket in state['tickets'].values())
+            if value['limit'] and active >= value['limit']:
+                waits.append(0.1)
+        if waits:
+            cooling = [key for key in keys.values() if state['scopes'][key]['until'] > now]
+            return {'wait_seconds': max(waits),
+                    'wait_reason': ('transport_backoff' if any(key.startswith('transport:') for key in cooling)
+                                    else 'account_backoff' if cooling else 'recovery_limit'),
+                    'cooldown_seconds': max([0, *(state['scopes'][key]['until'] - now for key in cooling)])}
+        if len(state['tickets']) >= 1024:
+            raise ValueError('experiment backoff worker capacity reached')
+        identifier = secrets.token_hex(16)
+        state['tickets'][identifier] = {'pid': owner_pid, 'process_start': start,
+            'expires': now + timeout_seconds + 30, 'started': now,
+            'concurrency': concurrency,
+            'generations': {key: state['scopes'][key]['generation'] for key in keys.values()},
+            'limits': {key: state['scopes'][key]['limit'] for key in keys.values()}}
+        for key in keys.values():
+            state['scopes'][key]['ceiling'] = max(state['scopes'][key]['ceiling'], concurrency)
+        return {'ticket': identifier}
+
+    @staticmethod
+    def occupancy(state, now):
+        queue = state.get('queue', {})
+        owners = queue.get('experiments', {})
+        running = [job for job in queue.get('running', {}).values()
+                   if job['owner'] in owners and job['expires'] > now
+                   and (process_start(owners[job['owner']]['pid']) == owners[job['owner']]['process_start']
+                        or job.get('worker_pid') and job.get('worker_start')
+                        and process_start(job['worker_pid']) == job['worker_start'])]
+        tracked = {job['provider_ticket'] for job in running}
+        return len(running) + sum(ticket not in tracked for ticket in state['tickets'])
+
+    def validate(self, identifier, scopes, owner_pid):
+        keys = self._keys(scopes)
+        with self._state() as (state, _):
+            ticket = state['tickets'].get(identifier)
+            valid = bool(ticket and set(ticket['generations']) == set(keys.values()) and process_start(owner_pid))
+            if valid:
+                ticket.update(pid=owner_pid, process_start=process_start(owner_pid))
+                for job in state.get('queue', {}).get('running', {}).values():
+                    if job['provider_ticket'] == identifier:
+                        job.update(worker_pid=owner_pid, worker_start=ticket['process_start'])
+            return {'valid': valid}
 
     def acquire(self, scopes, *, concurrency, timeout_seconds, owner_pid):
         while True:
@@ -218,6 +253,8 @@ def main():
             timeout_seconds=request['timeout_seconds'], owner_pid=request['owner_pid'])
     elif request.get('action') == 'report':
         response = gate.report(request['ticket'], request['record'])
+    elif request.get('action') == 'validate':
+        response = gate.validate(request['ticket'], request['scopes'], request['owner_pid'])
     else:
         raise ValueError('invalid experiment backoff operation')
     print(json.dumps(response))

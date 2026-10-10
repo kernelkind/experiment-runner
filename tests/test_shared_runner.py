@@ -7,12 +7,20 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 CLI = ROOT / 'bin/experiment-runner'
 
 
 class SharedRunnerTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        environment = patch.dict(os.environ, {
+            'ORACLE_EXPERIMENT_BACKOFF_DIRECTORY': str(Path(temporary.name) / 'backoff')})
+        environment.start()
+        self.addCleanup(environment.stop)
     def test_local_worker_runs_exact_inputs_and_preserves_its_receipt_metadata(self):
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary)
@@ -23,7 +31,7 @@ class SharedRunnerTests(unittest.TestCase):
                 'schema_version': 1, 'prompt': {'id': 'P1', 'path': 'prompt.txt'},
                 'dataset': {'adapter': 'generic', 'path': 'cases.json'},
                 'runner': {'provider': 'openai-codex', 'model': 'fixture/model',
-                           'reasoning_effort': 'off', 'concurrency': 1,
+                           'reasoning_effort': 'off',
                            'runner_binary': str(ROOT / 'tests/fixtures/fake-runner.py'),
                            'output_schema': {'type': 'object'}}}))
             environment = {**os.environ, 'FAKE_RUNNER_LOG': str(project / 'calls.json'),
@@ -100,8 +108,7 @@ class SharedRunnerTests(unittest.TestCase):
                 'schema_version': 1, 'prompt': {'id': 'P1', 'path': 'prompt.txt'},
                 'dataset': {'adapter': 'generic', 'path': 'cases.json'},
                 'runner': {'provider': 'openai-codex', 'auth_file': None,
-                           'model': 'fixture/model', 'reasoning_effort': 'low',
-                           'concurrency': 2, 'runner_binary': str(previous_worker)}}))
+                           'model': 'fixture/model', 'reasoning_effort': 'low', 'runner_binary': str(previous_worker)}}))
             def cli(*arguments):
                 return subprocess.run([str(CLI), *arguments], cwd=project,
                                       text=True, capture_output=True, timeout=30)
@@ -137,8 +144,7 @@ class SharedRunnerTests(unittest.TestCase):
                 'schema_version': 1, 'prompt': {'id': 'P1', 'path': 'prompt.txt'},
                 'dataset': {'adapter': 'generic', 'path': 'cases.json'},
                 'runner': {'provider': 'openai-codex', 'auth_file': None,
-                           'model': 'fixture/model', 'reasoning_effort': 'low',
-                           'concurrency': 2, 'runner_binary': str(ROOT / 'tests/fixtures/fake-runner.py'),
+                           'model': 'fixture/model', 'reasoning_effort': 'low', 'runner_binary': str(ROOT / 'tests/fixtures/fake-runner.py'),
                            'output_schema': {'type': 'object'}}}))
             budget = project / 'budget.json'
             budget.write_text(json.dumps({'schema_version': 1, 'limit': 2, 'used': 0}))
@@ -185,8 +191,7 @@ class SharedRunnerTests(unittest.TestCase):
                     'schema_version': 1, 'prompt': {'id': 'P1', 'path': 'prompt.txt'},
                     'dataset': {'adapter': 'generic', 'path': 'cases.json'},
                     'runner': {'provider': 'openai-codex', 'auth_file': None,
-                               'model': 'gpt-6.1-sol', 'reasoning_effort': 'medium',
-                               'concurrency': 4}}))
+                               'model': 'gpt-6.1-sol', 'reasoning_effort': 'medium'}}))
                 result = subprocess.run([str(CLI), 'prepare', 'E1', '--spec', 'spec.json'],
                                         cwd=project, capture_output=True, text=True, timeout=30)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -343,8 +348,9 @@ class NativePrefixTests(unittest.TestCase):
             self.assertIn('prefix before ' + marker, prepared.stdout)
         self.assertEqual(self.calls(), [])
         self.cli('run', 'cli', '--max-new-attempts', '3')
-        self.assertEqual([c['prompt'] for c in self.calls()],
-                         [prefix, *[c['prompt'] for c in ordinary['cases']]])
+        self.assertEqual(self.calls()[0]['prompt'], prefix)
+        self.assertCountEqual([c['prompt'] for c in self.calls()[1:]],
+                              [c['prompt'] for c in ordinary['cases']])
 
     def test_declared_cache_prefix_rejects_different_shared_inputs_and_duplicate_markers(self):
         marker = '<!-- prompt-cache-end -->'
@@ -614,8 +620,7 @@ class NativePrefixTests(unittest.TestCase):
         from unittest.mock import patch
         from experiment_runner import experiment, extraction_pipeline as engine, project
         prefix = self.automatic_prefix()
-        self.prepare('limited', '--model', 'gpt-6.1-sol', '--prompt-cache-prefix', prefix,
-                     '--concurrency', '2')
+        self.prepare('limited', '--model', 'gpt-6.1-sol', '--prompt-cache-prefix', prefix)
         stage = self.write('stage.json', dict(schema_version=1, limit=3, used=0))
         shared = self.write('shared.json', dict(schema_version=1, limit=3, used=0))
         project.configure(self.root)
@@ -641,8 +646,7 @@ class NativePrefixTests(unittest.TestCase):
 
     def test_failed_warmup_blocks_concurrent_comparisons_and_keeps_unknown_cost(self):
         prefix = self.automatic_prefix()
-        self.prepare('failed', '--model', 'gpt-6.1-sol', '--prompt-cache-prefix', prefix,
-                     '--concurrency', '2')
+        self.prepare('failed', '--model', 'gpt-6.1-sol', '--prompt-cache-prefix', prefix)
         budget = self.write('budget.json', dict(schema_version=1, limit=3, used=0))
         self.cli('run', 'failed', '--attempt-budget', budget, ok=False,
                  env={'FAKE_RUNNER_FAIL_STAGE': 'prompt'})
@@ -680,8 +684,7 @@ class NativePrefixTests(unittest.TestCase):
         text = 'GENERIC PROMPT' + ' word' * 1100 + '\n'
         prefix.write_text(text)
         self.prompt.write_text(text + '{POST}')
-        self.prepare('auto', '--model', 'gpt-6.1-sol', '--prompt-cache-prefix', prefix,
-                     '--concurrency', '2')
+        self.prepare('auto', '--model', 'gpt-6.1-sol', '--prompt-cache-prefix', prefix)
         settings = self.show('auto')['settings']
         self.assertEqual(settings['prompt_cache_key'],
                          'prefix-' + hashlib.sha256(prefix.read_bytes()).hexdigest()[:56])
@@ -713,7 +716,6 @@ class NativePrefixTests(unittest.TestCase):
             ('--prompt-cache-key', 'different-key'),
             ('--prompt-cache-prefix', prefix),
             ('--reasoning-effort', 'medium'),
-            ('--concurrency', '2'),
         )):
             name = f'changed-warmup-{index}'
             failed = self.cli('prepare', name, '--from', 'native', '--cache-warmup',
@@ -759,7 +761,8 @@ class NativePrefixTests(unittest.TestCase):
         self.cli('run', 'warm', '--max-new-attempts', '1')
         self.cli('run', 'native', '--max-new-attempts', '2')
         calls = self.calls()
-        self.assertEqual([c['prompt'] for c in calls], [prefix.read_text(), *(p.text for p in cfg.prompts)])
+        self.assertEqual(calls[0]['prompt'], prefix.read_text())
+        self.assertCountEqual([c['prompt'] for c in calls[1:]], [p.text for p in cfg.prompts])
         self.assertTrue(all(c['request']['prompt_cache_prefix'] == prefix.read_text() for c in calls))
         self.cli('prepare', 'copy', '--from', 'native')
         self.assertEqual(self.show('copy')['requests']['reusable'], 2)
@@ -862,6 +865,10 @@ class NativePrefixTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
+        environment = patch.dict(os.environ, {
+            'ORACLE_EXPERIMENT_BACKOFF_DIRECTORY': str(self.root / 'backoff')})
+        environment.start()
+        self.addCleanup(environment.stop)
         self.runner = self.root / "runner"
         shutil.copy2(ROOT / 'tests/fixtures/fake-runner.py', self.runner)
         self.runner.chmod(0o755)
@@ -893,7 +900,6 @@ class NativePrefixTests(unittest.TestCase):
                     "provider": "openai-codex",
                     "model": "fixture/model",
                     "reasoning_effort": "low",
-                    "concurrency": 1,
                 },
             },
         )

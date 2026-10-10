@@ -134,10 +134,7 @@ function policyFacts(result) {
     response_metadata: facts };
 }
 
-export async function experimentAdmission(request, { apiKey, fetch, signal, concurrency }) {
-  if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 1024) {
-    throw new Error('Invalid experiment concurrency');
-  }
+export async function experimentScopes(request, { apiKey, fetch = globalThis.fetch, signal }) {
   const route = serviceRoute(request);
   const url = new URL('/request-status/scopes', route.origin);
   url.searchParams.set('account', route.account);
@@ -151,13 +148,28 @@ export async function experimentAdmission(request, { apiKey, fetch, signal, conc
   }
   const scopes = { account: hash(`${route.origin}\0${prepared.account_scope}`),
     transport: hash(`${route.origin}\0${prepared.transport_scope}`) };
+  return { scopes, route };
+}
+
+export async function experimentAdmission(request, { apiKey, fetch, signal, concurrency }) {
+  if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 1024) {
+    throw new Error('Invalid experiment concurrency');
+  }
+  const { scopes, route } = await experimentScopes(request, { apiKey, fetch, signal });
   const marker = process.env.ORACLE_EXPERIMENT_ADMISSION_MARKER;
   if (marker) process.stderr.write(`${marker}:waiting\n`);
   const started = performance.now();
   let admitted;
   try {
-    admitted = await transact({ action: 'acquire', scopes, concurrency,
-      timeout_seconds: request.timeout_seconds, owner_pid: process.pid }, signal);
+    const ticket = process.env.ORACLE_EXPERIMENT_PROVIDER_TICKET;
+    if (ticket) {
+      const validation = await transact({ action: 'validate', scopes, ticket, owner_pid: process.pid }, signal);
+      if (!validation.valid) throw new Error('Experiment admission scopes changed before dispatch');
+      admitted = { ticket };
+    } else {
+      admitted = await transact({ action: 'acquire', scopes, concurrency,
+        timeout_seconds: request.timeout_seconds, owner_pid: process.pid }, signal);
+    }
   } catch (error) {
     if (signal?.aborted) throw error;
     throw unavailable('Experiment admission state unavailable');

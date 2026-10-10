@@ -611,6 +611,8 @@ def _runner_environment() -> dict[str, str]:
         key: value
         for key, value in os.environ.items()
         if not key.upper().startswith(("CODEX_", "OPENAI_", "CHATGPT_"))
+        and key not in {"ORACLE_EXPERIMENT_PROVIDER_TICKET", "ORACLE_EXPERIMENT_ADMISSION_MARKER",
+                        "ORACLE_EXPERIMENT_CONCURRENCY"}
     }
 
 
@@ -902,7 +904,7 @@ class PromptRunnerConfig:
     reasoning_effort: str
     prompts: tuple[PromptJob, ...]
     output_schema: dict[str, object] | None = None
-    concurrency: int = 16
+    concurrency: int = 30
     transport: str = "sse"
     prompt_cache_key: str | None = None
     prompt_cache_prefix: str | None = None
@@ -1963,6 +1965,28 @@ def _build_exec_argv(
     return arguments
 
 
+def _experiment_scope_loader(config, stage):
+    """Discover native account/transport scopes before admitting a worker."""
+    if config.provider not in {'openai-codex', 'openrouter'} or _runner_identity(config).get('experiment_scopes') is not True:
+        return None
+    def load_scopes():
+        from experiment_runner.provider_backoff import SharedProviderBackoff
+        request = dict(provider=config.provider, model=stage.model,
+                       reasoning=stage.reasoning_effort, prompt='', timeout_seconds=config.timeout_seconds)
+        completed = subprocess.run([str(config.runner_binary), 'scopes'],
+            input=json.dumps(request), text=True, capture_output=True,
+            env=_runner_environment(), timeout=30)
+        if completed.returncode != 0:
+            raise ExperimentAdmissionUnavailable('Experiment scopes unavailable before dispatch; no worker started')
+        try:
+            scopes = json.loads(completed.stdout)
+            SharedProviderBackoff._keys(scopes)
+        except (ValueError, TypeError) as error:
+            raise ExperimentAdmissionUnavailable('Invalid experiment scopes; no worker started') from error
+        return scopes
+    return load_scopes
+
+
 def _same_json(left: Any, right: Any) -> bool:
     if isinstance(left, dict) and isinstance(right, dict):
         return left.keys() == right.keys() and all(
@@ -2138,9 +2162,14 @@ def _validate_model_result(
 def _invoke_prompt_worker(config, argv, request, directory):
     """Bound the active request, while allowing shared admission to wait first."""
     marker = 'oracle-admission-' + os.urandom(16).hex()
-    environment = {**_runner_environment(), 'ORACLE_EXPERIMENT_CONCURRENCY': str(config.concurrency),
+    from experiment_runner.scheduling import LIMIT, current_slot
+    slot = current_slot()
+    environment = {**_runner_environment(),
                    'ORACLE_EXPERIMENT_PYTHON': sys.executable,
                    'ORACLE_EXPERIMENT_ADMISSION_MARKER': marker}
+    if slot and slot['provider_ticket']:
+        environment['ORACLE_EXPERIMENT_CONCURRENCY'] = str(LIMIT)
+        environment['ORACLE_EXPERIMENT_PROVIDER_TICKET'] = slot['provider_ticket']
     waiting_line, admitted_line = (marker + ':waiting\n').encode(), (marker + ':admitted\n').encode()
     unavailable_line = marker + ':unavailable\n'
     deadline = time.monotonic() + config.timeout_seconds + 30
@@ -2149,6 +2178,8 @@ def _invoke_prompt_worker(config, argv, request, directory):
     with subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                           text=True, cwd=directory, env=environment) as child:
         try:
+            if slot:
+                slot['queue'].worker_started(slot['identifier'], child.pid)
             while True:
                 try:
                     stdout, stderr = child.communicate(input=data, timeout=0.25)
@@ -2219,14 +2250,7 @@ def _invoke_model(
         ] != manifest.get("runner_version"):
             raise RunnerError("model runner changed since the run manifest was created")
         with tempfile.TemporaryDirectory(prefix="model-call-") as temporary:
-            if isinstance(config, PromptRunnerConfig):
-                completed = _invoke_prompt_worker(config, argv, request, temporary)
-            else:
-                completed = subprocess.run(
-                    argv, input=_ordered_json_bytes(request).decode("utf-8"), check=False,
-                    capture_output=True, text=True, cwd=temporary, env=_runner_environment(),
-                    timeout=config.timeout_seconds + 30,
-                )
+            completed = _invoke_prompt_worker(config, argv, request, temporary)
         stdout, stderr, exit_code = (
             completed.stdout,
             completed.stderr,
@@ -2811,15 +2835,27 @@ def _run_job(
                 latest=latest,
             )
             return response
-    if new_job_budget is not None:
-        new_job_budget.claim(job_key)
-    attempt = 1 if previous is None else previous["attempt"] + 1
-    try:
-        attempt_result = _invoke_model(config, stage, prompt, schema)
-    except BaseException:
-        if new_job_budget is not None and new_job_budget.spend is not None:
-            new_job_budget.spend.settle(None)
-        raise
+    from experiment_runner import scheduling
+    with ExitStack() as admission:
+        # Native batches already hold a queue slot. Sequential compatibility
+        # stages use that same host queue, never a separate concurrency pool.
+        queue = None
+        if scheduling.current_slot() is None:
+            queue = scheduling.ExperimentQueue(config.run_directory, 1,
+                scope_loader=_experiment_scope_loader(config, stage))
+            admission.callback(queue.close)
+            admission.enter_context(queue.slot(job_key, config.timeout_seconds))
+        if new_job_budget is not None:
+            new_job_budget.claim(job_key)
+        attempt = 1 if previous is None else previous["attempt"] + 1
+        try:
+            attempt_result = _invoke_model(config, stage, prompt, schema)
+        except BaseException:
+            if new_job_budget is not None and new_job_budget.spend is not None:
+                new_job_budget.spend.settle(None)
+            raise
+        if queue is not None:
+            queue.completed(failed=attempt_result['error'] is not None)
     error_message = attempt_result["error"]
     output_raw = attempt_result["final_output_raw"]
     response: list[str] | int | str | None = None
@@ -3647,7 +3683,11 @@ def _execute_prompt_batch(
     additional_attempt_budget_paths: Sequence[Path] = (),
     new_job_budget: NewJobBudget | None = None,
     before_new_attempt: Callable[[NewJobBudget], None] | None = None,
+    request_queue=None,
 ) -> dict[str, object]:
+    from experiment_runner import scheduling
+    # Historical concurrency stays in frozen plans; dispatch capacity is internal.
+    concurrency = scheduling.LIMIT
     if additional_attempt_budget_paths and attempt_budget_path is None:
         raise RunnerError('additional attempt budgets require a primary attempt_budget_path')
     runner_version = manifest["runner_version"]
@@ -3692,6 +3732,11 @@ def _execute_prompt_batch(
                          persistent=PersistentAttemptBudget(
                              attempt_budget_path, tuple(additional_attempt_budget_paths))
                          if attempt_budget_path is not None else None)
+    owned_queue = request_queue is None
+    queue = request_queue or scheduling.ExperimentQueue(config.run_directory, len(config.prompts),
+        scope_loader=_experiment_scope_loader(config, config))
+    if not owned_queue:
+        queue.extend(len(config.prompts))
     (config.run_directory / "output.json").unlink(missing_ok=True)
     options = manifest["request_reuse"]
     history = RequestHistory(Path(options["history_root"]), exclude_run=config.run_directory)
@@ -3737,10 +3782,13 @@ def _execute_prompt_batch(
             receipt_files=history.files,
         )
         def dispatch():
-            if (before_new_attempt is not None
-                    and (previous is None or arguments['retry_failed'])):
-                before_new_attempt(budget)
-            return _run_job(**arguments)
+            if previous is not None and not arguments['retry_failed']:
+                return _run_job(**arguments)
+            with queue.activate():
+                if before_new_attempt is not None:
+                    before_new_attempt(budget)
+                with queue.slot(('warmup:' if not owned_queue else '') + prompt.prompt_id, config.timeout_seconds):
+                    return _run_job(**arguments)
         if previous is not None:
             response = dispatch()
         else:
@@ -3786,6 +3834,7 @@ def _execute_prompt_batch(
             backoff_seconds = min(60.0, max(2.0, backoff_seconds * 2))
         backoff_until = max(backoff_until, now + max(
             backoff_seconds, _provider_retry_after_delay(record) or 0.0))
+        queue.cooldown(backoff_until)
 
     for index, prompt in enumerate(config.prompts):
         previous = latest.get("prompt:" + prompt.prompt_id)
@@ -3802,64 +3851,80 @@ def _execute_prompt_batch(
             else:
                 failures.append(f"{prompt.prompt_id}: {previous.get('error')}")
                 fatal |= kind == "provider_fatal"
+                queue.completed(failed=True, warmup=not owned_queue)
         else:
             heapq.heappush(ready, (float("inf"), index, prompt))
     # Keep at most concurrency futures. Provider backoff gates retries and fresh
     # cases together; slow calls and local failures remain independent. Due
     # retries precede untouched cases. Each case still has two lifetime attempts.
-    with ThreadPoolExecutor(max_workers=concurrency) as pool:
-        active = {}
-        while active or (not fatal and ready):
-            while (ready and len(active) < concurrency and not fatal
-                   and time.monotonic() >= backoff_until):
-                _, index, prompt = heapq.heappop(ready)
-                previous = latest.get("prompt:" + prompt.prompt_id)
-                submitted_at = time.monotonic()
-                active[pool.submit(execute, prompt)] = (index, prompt, previous, submitted_at)
-            now = time.monotonic()
-            launch_at = None
-            if not fatal and len(active) < concurrency:
-                if ready:
-                    launch_at = max(now, backoff_until)
-            if not active:
-                if launch_at is not None:
-                    time.sleep(max(0, launch_at - now))
-                continue
-            delay = max(0, launch_at - now) if launch_at is not None else None
-            completed, _ = wait(active, timeout=delay, return_when=FIRST_COMPLETED)
-            # Observe failures before successes completed in the same wait, so
-            # a concurrent success cannot erase a newly required backoff.
-            for future in sorted(completed, key=lambda item: item.exception() is None):
-                index, prompt, previous, submitted_at = active.pop(future)
-                try:
-                    responses[index] = future.result()
-                    record = latest.get("prompt:" + prompt.prompt_id)
-                    # Saved/reused answers and calls sent before backoff cannot
-                    # establish recovery. Only a new successful request can.
-                    if (submitted_at >= backoff_until and record is not previous
-                            and record.get("execution") != "cross_run_reuse"):
-                        backoff_seconds = 0.0
-                except NewJobLimitReached as limit:
-                    failures.append(str(limit) or "new-attempt allowance exhausted")
-                    fatal = True
-                except RunnerError:
-                    record = latest.get("prompt:" + prompt.prompt_id)
-                    # No new receipt means a preflight/provenance/local invariant
-                    # failed, not a provider request eligible for retry.
-                    if record is previous or record is None:
-                        raise
-                    kind = prompt_failure_kind(record)
+    try:
+        with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            try:
+                active = {}
+                while active or (not fatal and ready):
+                    while (ready and len(active) < concurrency and not fatal
+                           and time.monotonic() >= backoff_until):
+                        _, index, prompt = heapq.heappop(ready)
+                        previous = latest.get("prompt:" + prompt.prompt_id)
+                        submitted_at = time.monotonic()
+                        active[pool.submit(execute, prompt)] = (index, prompt, previous, submitted_at)
                     now = time.monotonic()
-                    if provider_cooldown_required(record) and not fatal:
-                        backoff(record, now)
-                    delay = provider_retry_delay(record)
-                    if delay is not None and not fatal:
-                        retry_at = now + delay
-                        backoff_until = max(backoff_until, retry_at)
-                        heapq.heappush(ready, (retry_at, index, prompt))
-                    else:
-                        failures.append(f"{prompt.prompt_id}: {record.get('error')}")
-                        fatal |= kind == "provider_fatal"
+                    launch_at = None
+                    if not fatal and len(active) < concurrency:
+                        if ready:
+                            launch_at = max(now, backoff_until)
+                    if not active:
+                        if launch_at is not None:
+                            queue.progress()
+                            time.sleep(min(0.25, max(0, launch_at - now)))
+                        continue
+                    delay = min(0.25, max(0, launch_at - now)) if launch_at is not None else 0.25
+                    completed, _ = wait(active, timeout=delay, return_when=FIRST_COMPLETED)
+                    # Observe failures before successes completed in the same wait, so
+                    # a concurrent success cannot erase a newly required backoff.
+                    for future in sorted(completed, key=lambda item: item.exception() is None):
+                        index, prompt, previous, submitted_at = active.pop(future)
+                        try:
+                            responses[index] = future.result()
+                            record = latest.get("prompt:" + prompt.prompt_id)
+                            queue.completed(reused=record.get('execution') == 'cross_run_reuse', warmup=not owned_queue)
+                            # Saved/reused answers and calls sent before backoff cannot
+                            # establish recovery. Only a new successful request can.
+                            if (submitted_at >= backoff_until and record is not previous
+                                    and record.get("execution") != "cross_run_reuse"):
+                                backoff_seconds = 0.0
+                        except NewJobLimitReached as limit:
+                            failures.append(str(limit) or "new-attempt allowance exhausted")
+                            fatal = True
+                            queue.stopped.set()
+                        except RunnerError:
+                            record = latest.get("prompt:" + prompt.prompt_id)
+                            # No new receipt means a preflight/provenance/local invariant
+                            # failed, not a provider request eligible for retry.
+                            if record is previous or record is None:
+                                raise
+                            kind = prompt_failure_kind(record)
+                            now = time.monotonic()
+                            if provider_cooldown_required(record) and not fatal:
+                                backoff(record, now)
+                            delay = provider_retry_delay(record)
+                            if delay is not None and not fatal:
+                                retry_at = now + delay
+                                backoff_until = max(backoff_until, retry_at)
+                                heapq.heappush(ready, (retry_at, index, prompt))
+                            else:
+                                failures.append(f"{prompt.prompt_id}: {record.get('error')}")
+                                fatal |= kind == "provider_fatal"
+                                queue.completed(failed=True, warmup=not owned_queue)
+                                if fatal:
+                                    queue.stopped.set()
+                    queue.progress()
+            except BaseException:
+                queue.stopped.set()
+                raise
+    finally:
+        if owned_queue:
+            queue.close()
     if spend is not None and spend.halted:
         failures.append('per-request bound exceeded')
     if failures:

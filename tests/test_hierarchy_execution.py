@@ -30,10 +30,10 @@ class HierarchyExecutionTests(unittest.TestCase):
             'schema_version': 1, 'prompt': {'id': 'P1', 'path': 'prompt.txt'},
             'dataset': {'adapter': 'generic', 'path': 'cases.json'},
             'runner': {'provider': 'openai-codex', 'auth_file': None,
-                       'model': 'fixture/model', 'reasoning_effort': 'low',
-                       'concurrency': 3, 'runner_binary': str(ROOT / 'tests/fixtures/fake-runner.py'),
+                       'model': 'fixture/model', 'reasoning_effort': 'low', 'runner_binary': str(ROOT / 'tests/fixtures/fake-runner.py'),
                        'output_schema': {'type': 'object'}}}))
         self.environment = patch.dict(os.environ, {
+            'ORACLE_EXPERIMENT_BACKOFF_DIRECTORY': str(self.root / 'backoff'),
             'FAKE_RUNNER_LOG': str(self.root / 'calls.json'),
             'FAKE_RUNNER_PROMPT_RESPONSE': '{"answer":"local fixture"}'})
         self.environment.start()
@@ -207,19 +207,19 @@ class HierarchyExecutionTests(unittest.TestCase):
             self.assertEqual((self.root / 'E1/run/results.jsonl').read_bytes(), saved)
         self.assertEqual(len(json.loads((self.root / 'calls.json').read_text())), 4)
 
-    def test_selected_run_keeps_native_parallel_dispatch_and_concurrency_cap(self):
+    def test_selected_run_keeps_native_parallel_dispatch_with_internal_capacity(self):
         self.prepare()
         barrier = self.root / 'barrier'
         barrier.mkdir()
         with patch.dict(os.environ, {'FAKE_RUNNER_BARRIER': str(barrier)}):
-            result = experiment.run(self.root / 'E1', only=['one', 'two'], max_concurrency=2,
+            result = experiment.run(self.root / 'E1', only=['one', 'two'],
                                     include_request_preview=False)
         self.assertEqual(result['summary']['valid'], 2)
         self.assertEqual(result['summary']['unrun'], 1)
         self.assertEqual(len(json.loads((self.root / 'calls.json').read_text())), 2)
         execution = json.loads((self.root / 'E1/execution-settings.jsonl').read_text())
-        self.assertEqual(execution['concurrency'], 2)
-        self.assertEqual(execution['prepared_concurrency'], 3)
+        self.assertEqual(execution['concurrency'], 30)
+        self.assertEqual(execution['prepared_concurrency'], 30)
         self.assertEqual(execution['only'], ['one', 'two'])
 
     def test_preparation_context_reaches_the_selected_project_adapter(self):

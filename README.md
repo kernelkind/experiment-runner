@@ -57,6 +57,64 @@ loaded from the selected project, never copied into this package.
 previews. `--case` selects one object; `--only` selects a cases list. Evidence,
 cost and prompt-only filters cannot be combined with this input-only view.
 
+## Internal request queue
+
+`run` shares one private host-local queue across experiments started by this
+user. At most **30 requests** are admitted across all accounts and transports;
+warmups and retries use those same slots. There is no concurrency CLI option.
+Remove `runner.concurrency` from new specs. Historical plans/configs remain
+readable and keep that field unchanged; it does not control dispatch.
+
+When several experiments have requests ready, the next freed slot goes to the
+experiment with fewer running requests, rotating equal contenders. One run can
+use all 30; two sustained runs balance near 15 each, three near 10. A newcomer
+gets freed slots until it catches up; running requests are never preempted.
+Unused shares can be borrowed. Fairness is between experiments, rather than
+between agents or token budgets.
+
+Waiting cases stay in the runner process; model workers start only after
+admission. Native workers advertise `experiment_scopes: true` in `--identity`
+and implement `scopes`: read the selected account's local configuration, query
+the local credential service and return only hashed account/transport scopes,
+without inference. The runner discovers scopes once per batch and the worker
+checks its admission against the selected scopes again before sending. Scope
+failure stops dispatch; changed scopes refuse the request. Custom workers
+without this capability still share the 30 slots. They do not gain native
+account/transport discovery by declaring a provider name.
+
+Existing account/transport cooldowns and gradual recovery can reduce the
+effective capacity below 30. Queued work consumes no attempt reservation;
+once admitted, existing conservative accounting remains in force. Failed or
+interrupted reservations are never refunded. Exact-answer reuse consumes no
+slot, warmup or new attempt. A prefix warmup competes within its experiment's
+share, finishes before comparisons, and counts against their attempt budget.
+Scheduling adds no prompt, schema, cache-key or request-body changes.
+
+`run` prints live progress on stderr. For machine-readable status, use:
+
+```bash
+experiment-runner show target/example-v1 --json
+```
+
+The `scheduling` object includes queued/running/valid/failed/reused counts,
+`global_running` out of `global_limit: 30`, per-admission case status and a
+`wait_reason`: `capacity`, `fair_share`, `account_backoff`, `transport_backoff`,
+`provider_backoff` (a batch's retry delay), `recovery_limit`, `prefix_warmup` or
+`ready`. `queue_wait_seconds` is the longest
+observed/current admission wait; it excludes worker execution and preparation
+before entering admission. `running_elapsed_seconds` is the oldest current
+admission's elapsed time, including worker startup. `cooldown_until_utc` records
+a known cooldown deadline, not a predicted provider completion time.
+
+The queue uses the existing private provider-backoff state under
+`$XDG_CACHE_HOME/oracle-mvp/provider-backoff` (normally `~/.cache/...`). Process
+identity and request deadlines release stale admissions after cancellation or
+exit. A live orphaned model worker retains its slot even after its runner exits.
+A resumed run validates saved receipts and budgets normally. Live state
+is operational evidence, separate from immutable model receipts. The limit
+covers this user's cooperating runner executions on this host; it is not the
+provider's concurrency contract or a reservation guaranteeing chat capacity.
+
 ## Versions and saved experiments
 
 Preparation freezes the exact runner code hashes, model-worker identity,
@@ -168,7 +226,7 @@ cd ~/src/notedeck_worktrees/algos/oracle-mvp
   --from target/comparisons-v1 \
   --runner-binary ../experiment-runner/experiment_runner/run-model.sh \
   --provider openai-codex --model gpt-6.1-sol --reasoning-effort medium \
-  --transport sse --concurrency 8 \
+  --transport sse \
   --prompt-cache
 ../experiment-runner/bin/experiment-runner run target/compare-cached-v1 \
   --max-new-attempts 129

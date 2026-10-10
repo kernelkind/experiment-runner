@@ -104,6 +104,8 @@ def spec_setup(path, *, preparation_context=None, include_request_preview=True):
         lambda directory: report(directory, include_request_preview=include_request_preview),
         **context)
     runner = dict(spec["runner"])
+    if 'concurrency' in runner:
+        raise ValueError('runner.concurrency is no longer configurable; the internal queue shares 30 requests across experiments')
     if "output_schema_path" in runner:
         if "output_schema" in runner:
             raise ValueError("choose output_schema or output_schema_path, not both")
@@ -237,7 +239,6 @@ def prepare(args, *, preparation_context=None, include_request_preview=True):
             "model",
             "reasoning_effort",
             "provider",
-            "concurrency",
             "max_output_tokens",
             "transport",
             "runner_binary",
@@ -934,6 +935,9 @@ def report(directory, only=None, note_ids=None, *, generation_costs=False, inclu
         "cases": cases,
         "baseline_only": sorted(set(baseline) - {c["id"] for c in cases}),
     }
+    from .scheduling import snapshot
+    result['scheduling'] = snapshot(config.run_directory)
+    result['scheduling'].update(valid=summary['valid'], failed=summary['failed'], reused=summary['reused'])
     if plan.get('cache_warmup') or warmup_calls:
         result['cache_warmup'] = {**plan.get('cache_warmup', {}),
                                   'attempts': len(warmup_calls),
@@ -1051,10 +1055,10 @@ def reconcile_costs(directory):
 def run(directory, max_new_attempts=None, runner_upgrade_reason=None, *,
         max_cost_usd=None, max_request_cost_usd=None, attempt_budget_path=None,
         additional_attempt_budget_paths=(), include_request_preview=True,
-        max_concurrency=None, only=None, warm_cache=True):
+        only=None, warm_cache=True):
     directory = directory.resolve()
     if (directory / 'bounded-build.json').exists():
-        if (any(x is not None for x in (max_cost_usd, max_request_cost_usd, attempt_budget_path, max_concurrency, only))
+        if (any(x is not None for x in (max_cost_usd, max_request_cost_usd, attempt_budget_path, only))
                 or additional_attempt_budget_paths or not warm_cache):
             raise ValueError('bounded builds use their frozen shared attempt budget and subscription route')
         run_build = project.import_module('bounded_hierarchy_build').run_build
@@ -1065,9 +1069,7 @@ def run(directory, max_new_attempts=None, runner_upgrade_reason=None, *,
             raise ValueError(
                 "imported experiments are read-only; prepare --from this experiment to run a candidate"
             )
-        if max_concurrency is not None and not 1 <= max_concurrency <= config.concurrency:
-            raise ValueError('execution concurrency cap must be positive and at most the prepared concurrency')
-        concurrency = config.concurrency if max_concurrency is None else max_concurrency
+        from . import scheduling
         cases = {c["id"]: c for c in plan["cases"]}
         selected = None if only is None else set(only)
         if selected is not None and (len(only) != len(selected) or selected - cases.keys()):
@@ -1086,7 +1088,8 @@ def run(directory, max_new_attempts=None, runner_upgrade_reason=None, *,
         engine._validate_auth_file(config.auth_file)
         execution_upgrade(directory, plan, runner_upgrade_reason)
         engine._append_json_line(directory / 'execution-settings.jsonl', dict(
-            manifest_sha256=inputs.digest(manifest), concurrency=concurrency,
+            manifest_sha256=inputs.digest(manifest), concurrency=scheduling.LIMIT,
+            scheduling='shared-fair-queue-v1',
             prepared_concurrency=config.concurrency, only=only, warm_cache=warm_cache,
             started_at_utc=datetime.now(timezone.utc).isoformat()))
         provenance = engine._load_runner_upgrades(
@@ -1139,12 +1142,18 @@ def run(directory, max_new_attempts=None, runner_upgrade_reason=None, *,
                     try:
                         engine._execute_prompt_batch(warm_config, warm_manifest, retry_failed=False,
                             new_job_budget=budget,
+                            request_queue=queue,
                             validate_output=lambda job, raw: inputs.validate(
                                 {'adapter': 'generic'}, warm_plan['cases'][0], raw, config.output_schema))
                     finally:
                         write(child / 'report.json', report(child, include_request_preview=False))
                 try:
-                    context.run(warm)
+                    queue = scheduling.active_queue()
+                    queue.warming(True)
+                    try:
+                        context.run(warm)
+                    finally:
+                        queue.warming(False)
                 except (engine.RunnerError, ValueError) as caught:
                     warmup_error = caught
                     raise
@@ -1155,7 +1164,6 @@ def run(directory, max_new_attempts=None, runner_upgrade_reason=None, *,
                 replace(config, prompts=jobs),
                 manifest,
                 retry_failed=False,
-                concurrency=concurrency,
                 validate_output=validate_output,
                 max_new_attempts=max_new_attempts,
                 max_cost_usd=max_cost_usd,
@@ -1219,6 +1227,11 @@ def compact(result, *, prepared=False):
     if result["adapter"] == "masks":
         print(f"Posts: {result['posts']}; subjects/calls: {result['summary']['cases']}")
     print("Cases: " + ", ".join(f"{k}={v}" for k, v in result["summary"].items()))
+    schedule = result.get('scheduling')
+    if schedule:
+        print(f"Queue: {schedule['state']}; queued={schedule['queued']} running={schedule['running']}; "
+              f"global={schedule.get('global_running', 0)}/{schedule['global_limit']}; "
+              f"wait={schedule.get('wait_reason') or '-'}")
     if "prepared_inputs" in result:
         print("Offline input sizing (rendered prompt proxy, not provider billing): "
               + json.dumps(result["prepared_inputs"]))
@@ -1282,12 +1295,40 @@ def score_review(args):
 
 
 def parser():
+    queue_help = """Internal request queue:
+  All experiments by this user on this host share at most 30 active requests.
+  Capacity is automatic: no concurrency flag or runner.concurrency in new specs.
+  Historical concurrency fields stay frozen but do not control dispatch.
+  Ready experiments share freed slots fairly; unused shares can be borrowed.
+  One run can use 30, two sustained runs balance near 15 each, three near 10.
+  Running requests finish normally; a newcomer receives the next freed slots.
+  Account/transport backoff and gradual recovery can reduce capacity below 30.
+  Workers launch only after admission; queued cases consume no attempt budget.
+  Warmups and retries share the same slots/budget. Reused answers need neither.
+  Eligible prefixes warm before comparisons, within the run's fair share.
+  Frozen prompts, schemas and native cache identity remain unchanged.
+
+  run prints live counts and wait reasons on stderr. Inspect another terminal:
+    experiment-runner show EXPERIMENT --json
+  scheduling reports queued/running/valid/failed/reused, global_running out of
+  global_limit: 30, and wait_reason (capacity, fair_share, account_backoff,
+  transport_backoff, provider_backoff, recovery_limit, prefix_warmup or ready).
+  provider_backoff is a batch's retry delay, without inventing an account cause.
+  queue_wait_seconds is the longest admission wait, excluding worker execution
+  and earlier preparation. running_elapsed_seconds is the oldest current
+  admission's elapsed time. cooldown_until_utc is a known cooldown deadline,
+  not a provider ETA. Interrupted admissions are cleaned by process identity;
+  saved receipts and conservative attempt reservations remain authoritative.
+  This controls runner traffic, not the provider's cap or guaranteed chat capacity.
+"""
     root = argparse.ArgumentParser(
         prog="experiment-runner", description=__doc__ + "\n"
         "SSE prefix caching: Recommended for large experiments sharing fixed instructions\n"
         "or context on openai-codex / gpt-6.1-sol / SSE. Use --prompt-cache during prepare.\n"
         "A template's <!-- prompt-cache-end --> marker can include shared input data;\n"
-        "the runner validates the prefix and warms it automatically.\n",
+        "the runner validates the prefix and warms it automatically.\n\n"
+        "Internal scheduling: a shared fair queue admits at most 30 requests across experiments.\n"
+        "No external concurrency setting. run --help explains live queue status.\n",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Global options: --project-root PATH selects project adapters; --version prints the shared release.\n\n"
         "experiment-runner prepare --help explains automatic warming and eligibility.\n"
@@ -1333,7 +1374,7 @@ def parser():
 Example from your project checkout (replace the spec and destination):
   experiment-runner prepare target/cached-v1 --spec comparisons.json \\
     --provider openai-codex --model gpt-6.1-sol --reasoning-effort medium \\
-    --transport sse --concurrency 8 --prompt-cache
+    --transport sse --prompt-cache
   experiment-runner run target/cached-v1 --max-new-attempts 129
 
   run automatically warms before the first comparison requiring a new attempt
@@ -1375,7 +1416,6 @@ Example from your project checkout (replace the spec and destination):
     p.add_argument("--model")
     p.add_argument("--reasoning-effort")
     p.add_argument("--provider", choices=("openai-codex", "openrouter", "local"))
-    p.add_argument("--concurrency", type=int)
     p.add_argument("--runner-binary", type=Path,
                    help="explicitly select a worker for this new experiment, including when inheriting an older run")
     p.add_argument("--max-output-tokens", type=int)
@@ -1398,7 +1438,7 @@ Example from your project checkout (replace the spec and destination):
         "run",
         help="execute a prepared experiment; retry only temporary provider errors",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""SSE prefix caching:
+        epilog=queue_help + "\nSSE prefix caching:\n" + """
   Enable with prepare --prompt-cache; see prepare --help.
   Mechanical results skip dispatch, warming and attempt budgets; mixed batches
   execute only residual jobs. Explicit prepare --repeat disables that routing.
@@ -1435,8 +1475,6 @@ Example from your project checkout (replace the spec and destination):
                    help="cap newly sent attempts, including provider retries; reserve spending for this allowance")
     p.add_argument("--attempt-budget", type=Path,
                    help="persistent cross-experiment launch counter; failed/interrupted attempts are not refunded")
-    p.add_argument('--max-concurrency', type=int,
-                   help='lower execution concurrency without changing frozen requests/settings; saved in execution receipts')
     p.add_argument("--max-cost-usd", type=float,
                    help="cumulative experiment spending allowance; includes prior attempts, never truncates responses")
     p.add_argument("--max-request-cost-usd", type=float,
@@ -1447,7 +1485,7 @@ Example from your project checkout (replace the spec and destination):
     p = commands.add_parser(
         "show", help="inspect all cases, or exact case evidence; no inference",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""Cost statistics:
+        epilog=queue_help + "\nCost statistics:\n" + """
   The batch view prints API-equivalent total/mean/median/p95 request cost,
   comparison cache-hit rate and estimated net dollars/percent saved including
   warmup overhead. --json exposes usage.cost_statistics. Estimates use saved
@@ -1524,7 +1562,7 @@ def main(argv=None):
                 raise ValueError('--max-new-attempts must be positive')
             if args.runner_upgrade_reason is not None and (not args.runner_upgrade_reason.strip()):
                 raise ValueError('--runner-upgrade-reason must not be blank')
-            result = run(args.experiment, args.max_new_attempts, args.runner_upgrade_reason, max_cost_usd=args.max_cost_usd, max_request_cost_usd=args.max_request_cost_usd, attempt_budget_path=args.attempt_budget, max_concurrency=args.max_concurrency, only=args.only)
+            result = run(args.experiment, args.max_new_attempts, args.runner_upgrade_reason, max_cost_usd=args.max_cost_usd, max_request_cost_usd=args.max_request_cost_usd, attempt_budget_path=args.attempt_budget, only=args.only)
             if (args.experiment / 'bounded-build.json').exists():
                 print(json.dumps(result, indent=2))
                 return int(result.get('status') != 'finished')

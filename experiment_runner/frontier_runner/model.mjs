@@ -19,7 +19,7 @@ import { OPENROUTER_MODELS } from '@earendil-works/pi-ai/providers/openrouter.mo
 import { stream as codexStream } from '@earendil-works/pi-ai/api/openai-codex-responses';
 import { stream as openrouterStream } from '@earendil-works/pi-ai/api/openai-completions';
 import { websocketRequest, websocketResponse } from './websocket.mjs';
-import { experimentAdmission } from './backoff.mjs';
+import { experimentAdmission, experimentScopes } from './backoff.mjs';
 
 export const VERSION = 'oracle-model-runner/1';
 const PI_AI_VERSION = '0.85.1';
@@ -149,11 +149,12 @@ const mimoFlash = {
 async function identity() {
   const hash = createHash('sha256');
   for (const path of ['model.mjs', 'websocket.mjs', 'backoff.mjs', '../provider_backoff.py',
-    '../extraction_pipeline.py', 'package-lock.json', '../run-model.sh']) {
+    '../extraction_pipeline.py', '../scheduling.py', 'package-lock.json', '../run-model.sh']) {
     const bytes = await readFile(new URL(path, import.meta.url));
     hash.update(`${path}\0${bytes.length}\0`).update(bytes);
   }
-  return { runner_version: VERSION, pi_ai_version: PI_AI_VERSION, runner_sha256: hash.digest('hex') };
+  return { runner_version: VERSION, pi_ai_version: PI_AI_VERSION, runner_sha256: hash.digest('hex'),
+    experiment_scopes: true };
 }
 
 function compileSchema(schema) {
@@ -695,11 +696,11 @@ export async function preview(request) {
   };
 }
 
-export async function launchWithSelectedPi(input) {
+export async function launchWithSelectedPi(input, command = 'run') {
   // Keep the complete request inside the account launcher's selected view.
   // The child reads this exact input, not a second copy of a mutable config file.
   const child = spawn('agent-account', ['exec', 'pi', '--', process.execPath,
-    process.argv[1], 'run', '--send', '--pi-config'], { stdio: ['pipe', 'inherit', 'inherit'] });
+    process.argv[1], command, '--send', '--pi-config'], { stdio: ['pipe', 'inherit', 'inherit'] });
   const interrupt = () => child.kill('SIGINT');
   const terminate = () => child.kill('SIGTERM');
   process.on('SIGINT', interrupt);
@@ -776,6 +777,8 @@ No upstream credential export, auth files, or paid OpenAI API fallback.
 OpenRouter auth: the same local credential service, with one shared provider key.
 Never reads OPENROUTER_API_KEY or OPENAI_API_KEY; no direct upstream fallback.
 --version prints versions; --identity prints versions and source/dependency SHA-256.
+Internal scopes command reads the selected local account's hashed account/transport
+scopes without inference. --identity advertises experiment_scopes for queued admission.
 Before paid execution, obtain approved maximum spend and record the commitment in
 budget-ledger.json. Provider-enforced spending caps are not required.
 Timeouts/output limits are not spending approval or monetary hard caps.
@@ -791,15 +794,20 @@ export async function main() {
   if (values.identity) { process.stdout.write(JSON.stringify(await identity()) + '\n'); return; }
   if (values['auth-file']) throw new Error('--auth-file is no longer supported; subscription credentials are service-owned. Remove the option or set batch auth_file to null.');
   const [command, path] = positionals;
-  if (!['preview', 'run'].includes(command) || positionals.length > 2) throw new Error(help);
+  if (!['preview', 'run', 'scopes'].includes(command) || positionals.length > 2) throw new Error(help);
   if (command === 'run' && !values.send) throw new Error('Sending requires the explicit --send flag');
   if (command === 'preview' && values.send) throw new Error('preview does not accept --send');
   const input = path ? await readFile(path, 'utf8') : await new Response(process.stdin).text();
   const request = await prepare(JSON.parse(input));
   if (command === 'preview') { process.stdout.write(JSON.stringify(await preview(request), null, 2) + '\n'); return; }
-  if (!values['pi-config']) return launchWithSelectedPi(input);
+  if (!values['pi-config']) return launchWithSelectedPi(input, command);
   const connection = await localPiConnection(request.model.provider);
   request.model = { ...request.model, baseUrl: connection.baseUrl };
+  if (command === 'scopes') {
+    const { scopes } = await experimentScopes(request, { apiKey: connection.apiKey });
+    process.stdout.write(JSON.stringify(scopes) + '\n');
+    return;
+  }
   const result = await execute(request, { apiKey: connection.apiKey,
     ...(process.env.ORACLE_EXPERIMENT_CONCURRENCY === undefined ? {} : {
       experimentConcurrency: Number(process.env.ORACLE_EXPERIMENT_CONCURRENCY) }) });

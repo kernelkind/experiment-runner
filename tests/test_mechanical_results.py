@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -17,6 +18,10 @@ class MechanicalResultsTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name)
+        environment = patch.dict(os.environ, {
+            'ORACLE_EXPERIMENT_BACKOFF_DIRECTORY': str(self.root / 'backoff')})
+        environment.start()
+        self.addCleanup(environment.stop)
         self.launcher = CLI
         self.log = self.root / 'calls.json'
         self.output = json.dumps({'valid': True, 'reason': 'Exact trusted wording.'})
@@ -34,7 +39,6 @@ class MechanicalResultsTests(unittest.TestCase):
             'dataset': {'adapter': 'generic', 'path': 'cases.json'},
             'runner': {'provider': 'openai-codex', 'auth_file': None,
                        'model': 'fixture/model', 'reasoning_effort': 'low',
-                       'concurrency': 2,
                        'runner_binary': str(ROOT / 'tests/fixtures/fake-runner.py'),
                        'output_schema': {'type': 'object'}},
         })
