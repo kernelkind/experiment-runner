@@ -174,6 +174,19 @@ This uses the tested developer-prefix/user-data format and native subscription
 key/routing headers. Each request remains independent; no previous answer is
 included.
 
+`run EXPERIMENT --only CASE_ID` dispatches selected frozen cases; repeat `--only`
+for several cases. The saved and returned report still contains every case.
+Unselected failed or unrun cases do not make the selected execution fail. The
+programmatic equivalent is `run(..., only=[...])`; an empty list dispatches
+nothing. Selection preserves prompts, settings, receipt validation, retries,
+answer reuse and attempt budgets.
+
+Programmatic `run(..., warm_cache=True)` retains automatic warming by default.
+A caller running several selected slices for one logical invocation can use
+`warm_cache=False` after that group's initial slice, so later slices share its
+warmup. This changes neither the frozen cache identity nor comparison requests.
+Dispatched slices record `only` and `warm_cache` in `execution-settings.jsonl`.
+
 Preparation requires a prefix with at least **1,024 locally estimated
 `o200k_base` tokens** when prefix caching is requested. A shorter prefix is
 rejected with its estimated count and minimum before creating the experiment or

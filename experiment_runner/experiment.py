@@ -1041,10 +1041,11 @@ def reconcile_costs(directory):
 def run(directory, max_new_attempts=None, runner_upgrade_reason=None, *,
         max_cost_usd=None, max_request_cost_usd=None, attempt_budget_path=None,
         additional_attempt_budget_paths=(), include_request_preview=True,
-        max_concurrency=None):
+        max_concurrency=None, only=None, warm_cache=True):
     directory = directory.resolve()
     if (directory / 'bounded-build.json').exists():
-        if any(x is not None for x in (max_cost_usd, max_request_cost_usd, attempt_budget_path, max_concurrency)) or additional_attempt_budget_paths:
+        if (any(x is not None for x in (max_cost_usd, max_request_cost_usd, attempt_budget_path, max_concurrency, only))
+                or additional_attempt_budget_paths or not warm_cache):
             raise ValueError('bounded builds use their frozen shared attempt budget and subscription route')
         run_build = project.import_module('bounded_hierarchy_build').run_build
         return run_build(directory, max_new_attempts, runner_upgrade_reason)
@@ -1058,8 +1059,12 @@ def run(directory, max_new_attempts=None, runner_upgrade_reason=None, *,
             raise ValueError('execution concurrency cap must be positive and at most the prepared concurrency')
         concurrency = config.concurrency if max_concurrency is None else max_concurrency
         cases = {c["id"]: c for c in plan["cases"]}
+        selected = None if only is None else set(only)
+        if selected is not None and (len(only) != len(selected) or selected - cases.keys()):
+            raise ValueError('unknown or duplicate selected case ID')
         jobs = tuple(job for job in config.prompts
-                     if not uses_mechanical(manifest, cases[job.prompt_id]))
+                     if (selected is None or job.prompt_id in selected)
+                     and not uses_mechanical(manifest, cases[job.prompt_id]))
         if not jobs:
             execution_upgrade(directory, plan, runner_upgrade_reason)
             result = report(directory, include_request_preview=include_request_preview)
@@ -1072,7 +1077,7 @@ def run(directory, max_new_attempts=None, runner_upgrade_reason=None, *,
         execution_upgrade(directory, plan, runner_upgrade_reason)
         engine._append_json_line(directory / 'execution-settings.jsonl', dict(
             manifest_sha256=inputs.digest(manifest), concurrency=concurrency,
-            prepared_concurrency=config.concurrency,
+            prepared_concurrency=config.concurrency, only=only, warm_cache=warm_cache,
             started_at_utc=datetime.now(timezone.utc).isoformat()))
         provenance = engine._load_runner_upgrades(
             config.run_directory, manifest_sha256=inputs.digest(manifest),
@@ -1148,7 +1153,7 @@ def run(directory, max_new_attempts=None, runner_upgrade_reason=None, *,
                 attempt_budget_path=attempt_budget_path,
                 additional_attempt_budget_paths=additional_attempt_budget_paths,
                 runner_upgrade_reason=runner_upgrade_reason if wrapper_changed else None,
-                before_new_attempt=(warm_before_dispatch if plan.get('cache_warmup', {}).get('eligible') else None),
+                before_new_attempt=(warm_before_dispatch if warm_cache and plan.get('cache_warmup', {}).get('eligible') else None),
             )
         except engine.RunnerError as caught:
             error = caught
@@ -1414,6 +1419,8 @@ Example from your project checkout (replace the spec and destination):
   requests once, so answer reuse is not counted as a cache hit or new savings.""",
     )
     p.add_argument("experiment", type=Path)
+    p.add_argument('--only', action='append', metavar='CASE_ID',
+                   help='dispatch only these frozen cases; the full report retains unselected cases')
     p.add_argument("--max-new-attempts", type=int,
                    help="cap newly sent attempts, including provider retries; reserve spending for this allowance")
     p.add_argument("--attempt-budget", type=Path,
@@ -1507,12 +1514,13 @@ def main(argv=None):
                 raise ValueError('--max-new-attempts must be positive')
             if args.runner_upgrade_reason is not None and (not args.runner_upgrade_reason.strip()):
                 raise ValueError('--runner-upgrade-reason must not be blank')
-            result = run(args.experiment, args.max_new_attempts, args.runner_upgrade_reason, max_cost_usd=args.max_cost_usd, max_request_cost_usd=args.max_request_cost_usd, attempt_budget_path=args.attempt_budget, max_concurrency=args.max_concurrency)
+            result = run(args.experiment, args.max_new_attempts, args.runner_upgrade_reason, max_cost_usd=args.max_cost_usd, max_request_cost_usd=args.max_request_cost_usd, attempt_budget_path=args.attempt_budget, max_concurrency=args.max_concurrency, only=args.only)
             if (args.experiment / 'bounded-build.json').exists():
                 print(json.dumps(result, indent=2))
                 return int(result.get('status') != 'finished')
             compact(result)
-            return int(any((result['summary'][s] for s in ('malformed', 'invalid_receipt', 'failed', 'unrun'))))
+            return int(any(case['status'] in ('malformed', 'invalid_receipt', 'failed', 'unrun')
+                           for case in result['cases'] if args.only is None or case['id'] in args.only))
         elif args.command == 'reconcile-costs':
             compact(reconcile_costs(args.experiment))
         elif args.command == 'show':

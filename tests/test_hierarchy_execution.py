@@ -62,6 +62,127 @@ class HierarchyExecutionTests(unittest.TestCase):
             self.assertEqual(candidate['summary']['cases'], 3)
             self.assertIsNone(candidate['requests'])
 
+    def test_selected_run_keeps_lifetime_budgets_and_reuses_without_new_allowance(self):
+        self.prepare()
+        stage = PersistentAttemptBudget(self.root / 'stage.json')
+        shared = PersistentAttemptBudget(self.root / 'shared.json')
+        stage.initialize(3)
+        shared.initialize(1)
+        result = experiment.run(self.root / 'E1', only=['one'], max_new_attempts=1,
+            attempt_budget_path=stage.path, additional_attempt_budget_paths=(shared.path,),
+            include_request_preview=False)
+        self.assertEqual(result['summary']['valid'], 1)
+        self.assertEqual(result['summary']['unrun'], 2)
+        before = (stage.path.read_bytes(), shared.path.read_bytes())
+        result = experiment.run(self.root / 'E1', only=['one'], max_new_attempts=0,
+            attempt_budget_path=stage.path, additional_attempt_budget_paths=(shared.path,),
+            include_request_preview=False)
+        self.assertEqual(result['summary']['attempts'], 1)
+        self.assertEqual(before, (stage.path.read_bytes(), shared.path.read_bytes()))
+        with self.assertRaisesRegex(RunnerError, 'allowance exhausted'):
+            experiment.run(self.root / 'E1', only=['two'], max_new_attempts=1,
+                attempt_budget_path=stage.path, additional_attempt_budget_paths=(shared.path,),
+                include_request_preview=False)
+        self.assertEqual(before, (stage.path.read_bytes(), shared.path.read_bytes()))
+        self.assertEqual(len(json.loads((self.root / 'calls.json').read_text())), 1)
+
+    def test_selected_run_ignores_unselected_failure_and_retains_its_receipt(self):
+        self.prepare()
+        with patch.dict(os.environ, {'FAKE_RUNNER_FAIL_STAGE': 'prompt'}):
+            with self.assertRaises(RunnerError):
+                experiment.run(self.root / 'E1', only=['two'], include_request_preview=False)
+        results = self.root / 'E1/run/results.jsonl'
+        failed = results.read_bytes()
+        completed = experiment.run(self.root / 'E1', only=['one'], include_request_preview=False)
+        self.assertEqual([(row['id'], row['status']) for row in completed['cases']],
+                         [('one', 'valid'), ('two', 'failed'), ('three', 'unrun')])
+        self.assertTrue(results.read_bytes().startswith(failed))
+        self.assertEqual(len(json.loads((self.root / 'calls.json').read_text())), 2)
+
+    def test_selected_run_rejects_unknown_and_duplicate_ids_before_dispatch(self):
+        self.prepare()
+        for only in (['missing'], ['one', 'one']):
+            with self.subTest(only=only), self.assertRaisesRegex(ValueError, 'selected case ID'):
+                experiment.run(self.root / 'E1', only=only, include_request_preview=False)
+        self.assertFalse((self.root / 'calls.json').exists())
+        self.assertFalse((self.root / 'E1/execution-settings.jsonl').exists())
+
+    def test_empty_selected_run_is_a_noop_with_the_full_report(self):
+        self.prepare()
+        result = experiment.run(self.root / 'E1', only=[], include_request_preview=False)
+        self.assertEqual(result['summary']['unrun'], 3)
+        self.assertEqual(result['summary']['attempts'], 0)
+        self.assertFalse((self.root / 'calls.json').exists())
+
+    def test_selected_slices_can_share_one_native_cache_warmup(self):
+        (self.root / 'prompt.txt').write_text('GENERIC PROMPT' + ' word' * 1100 + '{TASK}')
+        args = experiment.parser().parse_args([
+            'prepare', str(self.root / 'E1'), '--spec', str(self.root / 'spec.json'),
+            '--model', 'gpt-6.1-sol', '--prompt-cache'])
+        experiment.prepare(args, include_request_preview=False)
+        frozen = (self.root / 'E1/run/manifest.json').read_bytes()
+        budget = PersistentAttemptBudget(self.root / 'shared.json')
+        budget.initialize(3)
+        first = experiment.run(self.root / 'E1', only=['one'], warm_cache=True,
+            max_new_attempts=2, attempt_budget_path=budget.path, include_request_preview=False)
+        self.assertEqual(first['cache_warmup']['attempts'], 1)
+        self.assertEqual(first['summary']['valid'], 1)
+        second = experiment.run(self.root / 'E1', only=['two'], warm_cache=False,
+            max_new_attempts=1, attempt_budget_path=budget.path, include_request_preview=False)
+        self.assertEqual(second['cache_warmup']['attempts'], 1)
+        self.assertEqual(second['summary']['valid'], 2)
+        self.assertEqual(second['summary']['unrun'], 1)
+        self.assertEqual(json.loads(budget.path.read_text())['used'], 3)
+        self.assertEqual(len(json.loads((self.root / 'calls.json').read_text())), 3)
+        self.assertEqual((self.root / 'E1/run/manifest.json').read_bytes(), frozen)
+
+    def test_programmatic_warm_cache_false_suppresses_only_the_warmup(self):
+        (self.root / 'prompt.txt').write_text('GENERIC PROMPT' + ' word' * 1100 + '{TASK}')
+        args = experiment.parser().parse_args([
+            'prepare', str(self.root / 'E1'), '--spec', str(self.root / 'spec.json'),
+            '--model', 'gpt-6.1-sol', '--prompt-cache'])
+        experiment.prepare(args, include_request_preview=False)
+        result = experiment.run(self.root / 'E1', warm_cache=False,
+                                max_new_attempts=3, include_request_preview=False)
+        self.assertEqual(result['cache_warmup']['attempts'], 0)
+        self.assertEqual(result['summary']['valid'], 3)
+        self.assertEqual(len(json.loads((self.root / 'calls.json').read_text())), 3)
+
+    def test_selected_run_preserves_provider_retries_and_two_lifetime_attempts(self):
+        self.prepare()
+        failures = {name: {'attempts': attempts, 'metadata': {'http_status': 503}}
+                    for name, attempts in (('one', 1), ('two', 100))}
+        with patch.dict(os.environ, {'FAKE_RUNNER_FAILURES': json.dumps(failures)}):
+            first = experiment.run(self.root / 'E1', only=['one'], max_new_attempts=2,
+                                   include_request_preview=False)
+            self.assertEqual(first['summary']['valid'], 1)
+            self.assertEqual(first['summary']['unrun'], 2)
+            self.assertEqual(first['summary']['attempts'], 2)
+            with self.assertRaises(RunnerError):
+                experiment.run(self.root / 'E1', only=['two'], max_new_attempts=2,
+                               include_request_preview=False)
+            saved = (self.root / 'E1/run/results.jsonl').read_bytes()
+            with self.assertRaises(RunnerError):
+                experiment.run(self.root / 'E1', only=['two'], max_new_attempts=2,
+                               include_request_preview=False)
+            self.assertEqual((self.root / 'E1/run/results.jsonl').read_bytes(), saved)
+        self.assertEqual(len(json.loads((self.root / 'calls.json').read_text())), 4)
+
+    def test_selected_run_keeps_native_parallel_dispatch_and_concurrency_cap(self):
+        self.prepare()
+        barrier = self.root / 'barrier'
+        barrier.mkdir()
+        with patch.dict(os.environ, {'FAKE_RUNNER_BARRIER': str(barrier)}):
+            result = experiment.run(self.root / 'E1', only=['one', 'two'], max_concurrency=2,
+                                    include_request_preview=False)
+        self.assertEqual(result['summary']['valid'], 2)
+        self.assertEqual(result['summary']['unrun'], 1)
+        self.assertEqual(len(json.loads((self.root / 'calls.json').read_text())), 2)
+        execution = json.loads((self.root / 'E1/execution-settings.jsonl').read_text())
+        self.assertEqual(execution['concurrency'], 2)
+        self.assertEqual(execution['prepared_concurrency'], 3)
+        self.assertEqual(execution['only'], ['one', 'two'])
+
     def test_preparation_context_reaches_the_selected_project_adapter(self):
         import sys
         module_name = 'hierarchy_fixture_adapter'

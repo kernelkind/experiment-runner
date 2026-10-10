@@ -167,6 +167,52 @@ class SharedRunnerTests(unittest.TestCase):
 
 
 class NativePrefixTests(unittest.TestCase):
+    def test_run_only_dispatches_selected_cases_and_keeps_the_full_frozen_report(self):
+        self.prepare()
+        directory = self.root / 'E1'
+        frozen = {name: (directory / name).read_bytes()
+                  for name in ('experiment.json', 'runner-config.json', 'run/manifest.json')}
+        self.cli('run', 'E1', '--only', 'one', '--max-new-attempts', '1')
+        report = self.show()
+        self.assertEqual([(case['id'], case['status']) for case in report['cases']],
+                         [('one', 'valid'), ('two', 'unrun')])
+        self.assertEqual(report['summary']['attempts'], 1)
+        self.assertEqual(len(self.calls()), 1)
+        self.assertEqual(self.calls()[0]['prompt'], report['cases'][0]['prompt'])
+        self.assertEqual({name: (directory / name).read_bytes() for name in frozen}, frozen)
+        saved = json.loads((directory / 'report.json').read_text())
+        self.assertEqual([case['id'] for case in saved['cases']], ['one', 'two'])
+
+    def test_run_only_reuses_selected_alias_without_spending_or_warming(self):
+        self.cases.write_text(json.dumps({'cases': [
+            {'id': name, 'inputs': {'POST': text}}
+            for name, text in (('one', 'Tea'), ('alias', 'Tea'), ('two', 'Coffee'))]}))
+        self.automatic_prefix()
+        self.prepare('selected-cache', '--model', 'gpt-6.1-sol', '--prompt-cache')
+        self.cli('run', 'selected-cache', '--only', 'one', '--max-new-attempts', '2')
+        first = self.show('selected-cache')
+        self.assertEqual(first['summary']['valid'], 1)
+        self.assertEqual(first['summary']['unrun'], 2)
+        self.assertEqual(first['cache_warmup']['attempts'], 1)
+        self.assertEqual(len(self.calls()), 2)
+        budget = self.write('exhausted.json', {'schema_version': 1, 'limit': 2, 'used': 2})
+        self.cli('run', 'selected-cache', '--only', 'alias', '--attempt-budget', budget)
+        second = self.show('selected-cache')
+        self.assertEqual(second['summary']['valid'], 2)
+        self.assertEqual(second['summary']['reused'], 1)
+        self.assertEqual(second['cache_warmup']['attempts'], 1)
+        self.assertEqual(len(self.calls()), 2)
+        self.assertEqual(second['cases'][1]['output'], first['cases'][0]['output'])
+        self.assertEqual(json.loads(budget.read_text())['used'], 2)
+
+    def test_run_only_cli_failure_status_ignores_unselected_failed_cases(self):
+        self.prepare()
+        self.cli('run', 'E1', '--only', 'two', ok=False,
+                 env={'FAKE_RUNNER_FAIL_STAGE': 'prompt'})
+        self.cli('run', 'E1', '--only', 'one')
+        self.assertEqual(self.show()['summary']['failed'], 1)
+        self.assertEqual(len(self.calls()), 2)
+
     def test_cost_statistics_use_saved_components_without_repricing_old_receipts(self):
         self.prepare('costs')
         usage = dict(input=20, cacheRead=60, cacheWrite=20, output=10, reasoning=3,
