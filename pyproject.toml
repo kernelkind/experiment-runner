@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "experiment-runner"
-version = "1.6.0"
+version = "1.6.1"
 description = "Shared execution and audited receipts for prompt experiments"
 requires-python = ">=3.11"
 dependencies = ["tiktoken>=0.12"]

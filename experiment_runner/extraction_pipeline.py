@@ -2900,9 +2900,9 @@ def _run_job(
                 scope_loader=_experiment_scope_loader(config, stage), worker_identity=_runner_identity(config))
             admission.callback(queue.close)
             admission.enter_context(queue.slot(job_key, config.timeout_seconds))
-        queue = scheduling.active_queue() or queue
-        if queue is not None:
-            queue.check_worker(_runner_identity(config))
+        admitted_queue = scheduling.active_queue() or queue
+        if admitted_queue is not None:
+            admitted_queue.check_worker(_runner_identity(config))
         if new_job_budget is not None:
             new_job_budget.claim(job_key)
         attempt = 1 if previous is None else previous["attempt"] + 1

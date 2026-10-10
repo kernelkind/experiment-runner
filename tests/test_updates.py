@@ -133,6 +133,14 @@ class UpdateTests(unittest.TestCase):
         self.assertIn('invalid worker upgrade history', result.stderr)
         self.assertEqual(len(self.calls()), 2)
 
+    def test_batch_scheduling_counts_each_completed_case_once(self):
+        self.prepare(count=1)
+        result = self.cli('run', 'E1', '--attempt-budget', str(self.budget))
+        self.assertIn('valid=1 failed=0', result.stderr)
+        self.assertNotIn('valid=2 ', result.stderr)
+        report = json.loads(self.cli('show', 'E1', '--json').stdout)
+        self.assertEqual(report['scheduling']['valid'], 1)
+
     def test_pause_drains_only_this_experiment_then_resumes_unfinished_cases(self):
         self.prepare(count=32)
         control = self.root / 'control'
@@ -274,3 +282,21 @@ class UpdateTests(unittest.TestCase):
         self.assertEqual(len(self.calls()), 2)
         self.assertEqual(json.loads(self.budget.read_text())['used'], 2)
         self.assertTrue((self.root / 'E1/code-upgrades.jsonl').exists())
+
+    def test_project_file_named_like_a_runner_file_still_requires_review(self):
+        (self.root / 'experiment-runner.json').write_text(json.dumps({
+            'schema_version': 1, 'inputs': 'project_inputs', 'extension': 'project_extension'}))
+        (self.root / 'project_inputs.py').write_text(
+            'from experiment_runner import inputs as shared\n'
+            'def __getattr__(name): return getattr(shared, name)\n')
+        extension = self.root / 'project_extension.py'
+        extension.write_text('from pathlib import Path\n'
+            'def add_commands(commands): pass\n'
+            'def handle_command(args): return NotImplemented\n'
+            'def enrich_report(result, plan, cases): pass\n'
+            "def code_files(dataset): return {'experiment.py': Path(__file__)}\n")
+        self.prepare(count=1)
+        extension.write_text(extension.read_text() + '\n# Project evaluator changed.\n')
+        result = self.cli('run', 'E1', '--attempt-budget', str(self.budget), succeeds=False)
+        self.assertIn('--runner-upgrade-reason', result.stderr)
+        self.assertEqual(len(self.calls()), 0)

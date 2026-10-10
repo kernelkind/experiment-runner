@@ -1001,7 +1001,8 @@ def execution_upgrade(directory, plan, reason):
         if not reason or not reason.strip():
             from .compatibility import OPERATIONAL_FILES
             changed = {name for name in active if current[name] != active[name]}
-            if not changed <= OPERATIONAL_FILES:
+            if not all(name in OPERATIONAL_FILES and available[name].resolve() ==
+                       Path(engine.__file__).parent / name for name in changed):
                 raise ValueError("experiment code changed; inspect it and supply --runner-upgrade-reason, or prepare a new experiment")
             reason = 'compatible runner workflow update; frozen inputs and request identity preserved'
         engine._append_json_line(path, {
