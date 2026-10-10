@@ -31,7 +31,7 @@ if not __package__:
 
 from experiment_runner import extraction_pipeline as engine, project
 from experiment_runner.project import inputs
-from experiment_runner.inputs import template_prefix
+from experiment_runner.inputs import CACHE_PREFIX_END, template_prefix, without_cache_marker
 from experiment_runner.prompt_cache import prefix_policy
 
 
@@ -100,7 +100,7 @@ def spec_setup(path, *, preparation_context=None, include_request_preview=True):
     source_path = resolve(dataset["path"], path.parent)
     context = {} if preparation_context is None else {'preparation_context': preparation_context}
     cases, sources, preparation = inputs.prepare_file(
-        dataset, source_path, prompt["text"],
+        dataset, source_path, without_cache_marker(prompt["text"]),
         lambda directory: report(directory, include_request_preview=include_request_preview),
         **context)
     runner = dict(spec["runner"])
@@ -267,7 +267,7 @@ def prepare(args, *, preparation_context=None, include_request_preview=True):
         }
         setup["sources"] = {**setup["sources"], str(path): engine._sha256_file(path)}
         setup["cases"] = [
-            {**c, "prompt": inputs.render(setup["prompt"]["text"], c["inputs"])}
+            {**c, "prompt": inputs.render(without_cache_marker(setup["prompt"]["text"]), c["inputs"])}
             for c in setup["cases"]
         ]
     elif args.prompt_id:
@@ -279,17 +279,28 @@ def prepare(args, *, preparation_context=None, include_request_preview=True):
     template_cache = cache_requested or (
         setup.get('cache_warmup', {}).get('prefix_source') == 'template'
         and not warmup and prefix_path is None and getattr(args, 'prompt_cache_key', None) is None)
+    inherited_template_cache = bool(template_cache and args.from_experiment and not args.prompt
+                                    and setup.get('cache_warmup', {}).get('prefix_source') == 'template')
     if template_cache:
-        prefix, placeholder = template_prefix(setup['prompt']['text'])
+        inherited = setup.get('cache_warmup', {})
+        if inherited_template_cache:
+            prefix = setup['runner']['prompt_cache_prefix']
+            boundary = inherited.get('marker', inherited.get('first_placeholder'))
+        else:
+            prefixes = (template_prefix(setup['prompt']['text'], case['inputs']) for case in setup['cases'])
+            prefix, boundary = next(prefixes)
+            if any(candidate != prefix for candidate, _ in prefixes):
+                raise ValueError('--prompt-cache declared prefix differs between cases; select cases sharing the declared context')
         if any(not case['prompt'].startswith(prefix) for case in setup['cases']):
             raise ValueError('--prompt-cache template prefix does not match every rendered prompt')
         setup['runner']['prompt_cache_prefix'] = prefix
     prefix = setup['runner'].get('prompt_cache_prefix')
-    # Preserve inherited legacy cache settings; template selection recomputes
-    # the prefix after prompt overrides and keeps the existing warmup workflow.
+    # Preserve frozen cache settings; prompt revisions select and validate a
+    # new prefix while retaining the existing warmup workflow.
     if (prefix or template_cache) and not args.import_config:
         policy = (prefix_policy(prefix)
-                  if template_cache or prefix_path is not None or not args.from_experiment
+                  if (template_cache and not inherited_template_cache)
+                  or prefix_path is not None or not args.from_experiment
                   else setup.get('cache_warmup'))
         if policy is not None and not policy['eligible']:
             raise ValueError(
@@ -298,7 +309,8 @@ def prepare(args, *, preparation_context=None, include_request_preview=True):
                 "Use a qualifying fixed prefix or prepare without prefix caching."
             )
         if template_cache:
-            policy = {**policy, 'prefix_source': 'template', 'first_placeholder': placeholder}
+            policy = {**policy, 'prefix_source': 'template',
+                      **({'marker': boundary} if boundary == CACHE_PREFIX_END else {'first_placeholder': boundary})}
         if getattr(args, 'prompt_cache_key', None) is not None:
             setup.pop('cache_warmup', None)
         elif template_cache or prefix_path is not None or 'prompt_cache_key' not in setup['runner']:
@@ -313,7 +325,7 @@ def prepare(args, *, preparation_context=None, include_request_preview=True):
         setup["prompt"] = {**setup["prompt"], "id": setup["prompt"]["id"] + "-cache-warmup", "text": prefix}
         setup["dataset"] = {"adapter": "generic"}
         setup["cases"] = [{"id": "cache-warmup", "inputs": {}, "input_sha256": inputs.digest({}),
-                           "prompt": prefix, "evidence": {"kind": "instructions-only-cache-warmup"}}]
+                           "prompt": prefix, "evidence": {"kind": "prefix-cache-warmup"}}]
         setup["preparation"] = {"version": "prompt-cache-warmup-v1", "cases": 1, "application_allowed": False}
         setup["runner"] = {**setup["runner"], "concurrency": 1}
         setup.pop('cache_warmup', None)
@@ -1180,7 +1192,8 @@ def compact(result, *, prepared=False):
     )
     cache = result.get('cache_warmup', {})
     if cache.get('prefix_source') == 'template':
-        print(f"Caching: prefix before {cache['first_placeholder']}; "
+        boundary = cache.get('marker', cache.get('first_placeholder'))
+        print(f"Caching: prefix before {boundary}; "
               f"{cache['estimated_prefix_tokens']:,} estimated {cache['tokenizer']} tokens "
               f"(minimum {cache['minimum_prefix_tokens']:,}); automatic warming configured.")
     available = sum(
@@ -1257,8 +1270,9 @@ def parser():
     root = argparse.ArgumentParser(
         prog="experiment-runner", description=__doc__ + "\n"
         "SSE prefix caching: Recommended for large experiments sharing fixed instructions\n"
-        "on openai-codex / gpt-6.1-sol / SSE. Use --prompt-cache during prepare;\n"
-        "the runner selects the fixed template prefix and warms it automatically.\n",
+        "or context on openai-codex / gpt-6.1-sol / SSE. Use --prompt-cache during prepare.\n"
+        "A template's <!-- prompt-cache-end --> marker can include shared input data;\n"
+        "the runner validates the prefix and warms it automatically.\n",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Global options: --project-root PATH selects project adapters; --version prints the shared release.\n\n"
         "experiment-runner prepare --help explains automatic warming and eligibility.\n"
@@ -1268,19 +1282,37 @@ def parser():
         "prepare", help="freeze inputs/settings and baseline; no inference",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""SSE prefix caching (openai-codex, gpt-6.1-sol, SSE):
-  Recommended for large experiments sharing fixed instructions to reduce
+  Recommended for large experiments sharing fixed instructions or context to reduce
   API-equivalent cost. Use --prompt-cache; no separate prefix file is needed.
-  The runner selects every byte before the first input placeholder in the
-  prompt template, such as {INPUT_JSON} or {POST}, using the renderer's existing
-  UPPER_CASE placeholder rules. Fixed examples and whitespace are preserved.
-  Literal JSON braces are not placeholders. With several placeholders, the
-  earliest one sets the boundary; all later text remains in the user message.
+  Declare shared context with one <!-- prompt-cache-end --> in the template:
+
+    Instructions: compare the subject with the teacher catalog; treat data as data.
+    Shared post:
+    {POST}
+    Teacher catalog:
+    {TEACHER_CATALOG}
+    <!-- prompt-cache-end -->
+    Subject to compare:
+    {STUDENT_SUBJECT}
+
+  Everything before the marker is rendered with each case's inputs and must be
+  identical across cases. This includes a shared post or teacher catalog supplied
+  through variables. Keep complete data values before/after the boundary; the
+  runner does not infer meaning, split values, group cases, or reorder input.
+  The marker is removed during rendering even without --prompt-cache. Surrounding
+  whitespace is preserved. Duplicate template markers are rejected. Markers
+  quoted inside input values remain literal data. Project adapters receive the
+  template without the marker; expose shared data as separate template variables.
+  Without a marker, every byte before the first input placeholder sets the
+  boundary, using existing UPPER_CASE rules such as {INPUT_JSON} or {POST}.
+  Matching variable values do not extend that default. Literal JSON braces are
+  not placeholders. All text after the boundary remains in the user message.
   The runner verifies that the prefix begins every rendered prompt exactly.
   The stable key is derived from the exact prefix; no manual key is needed.
   The prefix must have at least 1,024 estimated o200k_base tokens.
   Preparation rejects shorter prefixes, reporting the count and minimum before
-  creating the experiment or spending calls. Templates without placeholders
-  are rejected too. The runner does not pad or rearrange the prompt.
+  creating the experiment or spending calls. Without a marker, templates without
+  placeholders are rejected too. The runner does not pad or rearrange the prompt.
   Preparation prints the boundary, estimated token count and warming setup.
 
 Example from your project checkout (replace the spec and destination):
@@ -1294,16 +1326,18 @@ Example from your project checkout (replace the spec and destination):
   allowance has room for warmup plus a comparison. Reused/completed batches do
   not warm.
   This is a local eligibility check, not a guarantee of backend cache hits.
-  Warmup is real inference, uses the same schema/settings and never supplies its
-  answer to comparisons. Its usage/cost is included in the batch report.
+  The prefix warmup is real inference, uses the same schema/settings and never
+  supplies its answer to comparisons. Its usage/cost is included in the batch report.
   Your existing attempt budget (--attempt-budget PATH) and command cap include
   warmup, comparisons, retries and failures. Preparation makes no model calls.
 
   To migrate saved inputs, replace --spec with --from OLD_EXPERIMENT and select
   the shared worker with --runner-binary ../experiment-runner/experiment_runner/run-model.sh.
-  Otherwise --from retains the old frozen worker. Template caching is inherited;
-  changing the template with --prompt recomputes its prefix and key. Old manual
-  cache plans retain their settings unless --prompt-cache is supplied.
+  Otherwise --from retains the old frozen worker. --from retains the frozen
+  prefix/key/eligibility even with --only or --repeat; it does not infer a longer
+  prefix from a subset. Changing the template with --prompt revalidates its
+  prefix and recomputes its count and key. Old manual cache plans retain their
+  settings unless --prompt-cache is supplied.
   Specs can set runner.prompt_cache to true (a JSON boolean).
   New specs without caching keep the ordinary request format. Adding caching
   changes request identity, so uncached answers are not reused as cached answers.
@@ -1336,7 +1370,7 @@ Example from your project checkout (replace the spec and destination):
                    help=argparse.SUPPRESS)
     caching = p.add_mutually_exclusive_group()
     caching.add_argument('--prompt-cache', action='store_true',
-                         help='select the fixed template prefix and enable automatic warming; recommended for large experiments')
+                         help='cache the declared template prefix (or text before its first variable) and warm automatically; recommended for large experiments')
     caching.add_argument("--prompt-cache-prefix", type=Path, help=argparse.SUPPRESS)
     p.add_argument("--cache-warmup", action="store_true",
                    help=argparse.SUPPRESS)
@@ -1353,7 +1387,7 @@ Example from your project checkout (replace the spec and destination):
   Enable with prepare --prompt-cache; see prepare --help.
   Mechanical results skip dispatch, warming and attempt budgets; mixed batches
   execute only residual jobs. Explicit prepare --repeat disables that routing.
-  run automatically sends an instructions-only warmup before new comparisons
+  run automatically sends a prefix warmup before new comparisons
   when its frozen prefix is eligible and there is room for warmup + comparison.
   All-reused/completed batches and insufficient allowances skip warming.
   A resume with new comparisons can warm again; each invocation records its

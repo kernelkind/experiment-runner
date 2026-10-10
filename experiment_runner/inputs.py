@@ -6,13 +6,21 @@ from pathlib import Path
 from . import extraction_pipeline as engine
 
 _PLACEHOLDER = re.compile(r'\{([A-Z][A-Z0-9_]*)\}')
+CACHE_PREFIX_END = '<!-- prompt-cache-end -->'
 
 
 def digest(value):
     return hashlib.sha256(engine._canonical_json_bytes(value)).hexdigest()
 
 
+def without_cache_marker(template):
+    if template.count(CACHE_PREFIX_END) > 1:
+        raise ValueError(f'prompt template must contain at most one {CACHE_PREFIX_END}')
+    return template.replace(CACHE_PREFIX_END, '')
+
+
 def render(template, inputs):
+    template = without_cache_marker(template)
     if not isinstance(inputs, dict) or not inputs:
         raise ValueError('case inputs must be a nonempty object of template variables')
     for key, value in inputs.items():
@@ -27,7 +35,16 @@ def render(template, inputs):
     return _PLACEHOLDER.sub(substitute, template)
 
 
-def template_prefix(template):
+def template_prefix(template, inputs=None):
+    without_cache_marker(template)  # Validate the template before choosing a boundary.
+    if CACHE_PREFIX_END in template:
+        prefix = template.split(CACHE_PREFIX_END, 1)[0]
+        names = {match[1] for match in _PLACEHOLDER.finditer(prefix)}
+        if names:
+            if inputs is None or names - inputs.keys():
+                raise ValueError('declared cache prefix requires its template variable inputs')
+            prefix = render(prefix, {name: inputs[name] for name in names})
+        return prefix, CACHE_PREFIX_END
     first = _PLACEHOLDER.search(template)
     if first is None:
         raise ValueError('--prompt-cache requires a template input placeholder such as {INPUT_JSON}')

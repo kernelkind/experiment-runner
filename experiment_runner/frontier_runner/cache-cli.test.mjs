@@ -13,7 +13,9 @@ test('shared CLI warms the exact SSE prefix and accounts for real worker receipt
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'experiment-cache-cli-'));
   const cli = process.env.EXPERIMENT_RUNNER_TEST_CLI || fileURLToPath(new URL('../../bin/experiment-runner', import.meta.url));
   const worker = process.env.EXPERIMENT_RUNNER_TEST_WORKER || fileURLToPath(new URL('../run-model.sh', import.meta.url));
-  const prefix = 'Compare the supplied data. Return the requested JSON.' + ' word'.repeat(1100) + '\r\n';
+  const instructions = 'Compare the supplied data. Return the requested JSON.\r\nShared context:\r\n';
+  const shared = 'Reference catalog' + ' word'.repeat(1100);
+  const prefix = instructions + shared + '\r\n';
   const key = 'prefix-' + createHash('sha256').update(prefix).digest('hex').slice(0, 56);
   const credential = 'fixture.' + Buffer.from(JSON.stringify({ 'https://api.openai.com/auth': {
     chatgpt_account_id: 'offline-account' } })).toString('base64url') + '.invalid';
@@ -85,8 +87,8 @@ test('shared CLI warms the exact SSE prefix and accounts for real worker receipt
   write('pi/auth.json', { 'openai-codex': { type: 'api_key', key: credential } });
   const launcher = path.join(root, 'worker.sh');
   fs.writeFileSync(launcher, '#!/usr/bin/env bash\nset -euo pipefail\nexec "$EXPERIMENT_RUNNER_TEST_WORKER" "$@" --pi-config\n', { mode: 0o755 });
-  fs.writeFileSync(path.join(root, 'prompt.txt'), prefix + '{DATA}');
-  write('cases.json', { cases: ['Tea', 'Coffee'].map((value, index) => ({ id: String(index), inputs: { DATA: value } })) });
+  fs.writeFileSync(path.join(root, 'prompt.txt'), instructions + '{SHARED}\r\n<!-- prompt-cache-end -->{DATA}');
+  write('cases.json', { cases: ['Tea', 'Coffee'].map((value, index) => ({ id: String(index), inputs: { SHARED: shared, DATA: value } })) });
   write('spec.json', { schema_version: 1, prompt: { id: 'cache-cli-v1', path: 'prompt.txt' }, dataset: { adapter: 'generic', path: 'cases.json' },
     runner: { provider: 'openai-codex', auth_file: null, model: 'gpt-6.1-sol', reasoning_effort: 'medium',
       concurrency: 2, runner_binary: launcher, output_schema: schema } });

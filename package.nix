@@ -15,7 +15,7 @@ let
   };
 in stdenvNoCC.mkDerivation {
   pname = "experiment-runner";
-  version = "1.3.1";
+  version = "1.4.0";
   src = lib.cleanSource ./.;
   nativeBuildInputs = [ makeWrapper ];
   dontBuild = true;
