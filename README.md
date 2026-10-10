@@ -9,6 +9,14 @@ Only `run` sends model requests, and it requires the caller's existing inference
 and spending authorization. Moving or installing this tool does not authorize
 inference. Tests use local fixtures.
 
+Prepared prompt experiments also support `provider: local` with `transport:
+http`, an explicitly selected model worker, and an optional positive
+`max_output_tokens`. Local requests reject `auth_file`; HTTP transport is
+reserved for this provider. The project supplies the worker and model server.
+The shared runner retains the same input, schema, worker-identity, receipt,
+reuse and retry checks. Saved case reports expose the worker's
+`response_metadata`, `usage` and `stop_reason` without inventing missing values.
+
 ## Use
 
 Use the shared launcher at

@@ -823,6 +823,10 @@ def report(directory, only=None, note_ids=None, *, generation_costs=False, inclu
         row = {**case, "status": "unrun", "output": None, "baseline": None}
         if record:
             row["elapsed_seconds"] = record.get("elapsed_seconds")
+            model_result = record.get('model_result') or {}
+            for field in ('response_metadata', 'usage', 'stop_reason'):
+                if field in model_result:
+                    row[field] = model_result[field]
             row["receipt"] = {
                 "results_path": str(ledger),
                 "record_sha256": inputs.digest(record),
@@ -1370,12 +1374,12 @@ Example from your project checkout (replace the spec and destination):
     p.add_argument("--history-root", type=Path)
     p.add_argument("--model")
     p.add_argument("--reasoning-effort")
-    p.add_argument("--provider", choices=("openai-codex", "openrouter"))
+    p.add_argument("--provider", choices=("openai-codex", "openrouter", "local"))
     p.add_argument("--concurrency", type=int)
     p.add_argument("--runner-binary", type=Path,
                    help="explicitly select a worker for this new experiment, including when inheriting an older run")
     p.add_argument("--max-output-tokens", type=int)
-    p.add_argument("--transport", choices=("sse", "websocket"),
+    p.add_argument("--transport", choices=("sse", "websocket", "http"),
                    help="explicit transport; websocket is subscription-only, without fallback")
     p.add_argument("--prompt-cache-key",
                    help=argparse.SUPPRESS)

@@ -616,10 +616,12 @@ def _runner_environment() -> dict[str, str]:
 
 def _runtime_options(value: dict[str, Any], base: Path) -> dict[str, Any]:
     provider = _expect_identifier(value.get("provider"), "config.provider")
-    if provider not in {"openai-codex", "openrouter"}:
-        raise RunnerError("provider must be openai-codex or openrouter")
+    if provider not in {"openai-codex", "openrouter", "local"}:
+        raise RunnerError("provider must be openai-codex, openrouter or local")
     auth = value.get("auth_file")
     auth_file = None if auth is None else _resolve_path(auth, "auth_file", base)
+    if provider == "local" and auth_file is not None:
+        raise RunnerError("local model requests do not use credentials")
     if provider == "openrouter" and auth_file is not None:
         raise RunnerError("OpenRouter uses OPENROUTER_API_KEY, not auth_file")
     timeout = value.get("timeout_seconds", 600)
@@ -630,9 +632,9 @@ def _runtime_options(value: dict[str, Any], base: Path) -> dict[str, Any]:
     ):
         raise RunnerError("timeout_seconds must be an integer from 1 to 3600")
     cap = value.get("max_output_tokens")
-    if provider == "openrouter":
+    if provider in {"openrouter", "local"}:
         if cap is not None and (isinstance(cap, bool) or not isinstance(cap, int) or cap < 1):
-            raise RunnerError("OpenRouter max_output_tokens must be positive when supplied")
+            raise RunnerError("max_output_tokens must be positive when supplied")
     elif cap is not None:
         raise RunnerError("subscription transport does not enforce max_output_tokens")
     return {
@@ -929,9 +931,11 @@ class PromptRunnerConfig:
         concurrency = value.get("concurrency", cls.concurrency)
         if type(concurrency) is not int or concurrency < 1:
             raise RunnerError("concurrency must be a positive integer")
-        transport = value.get("transport", "sse")
-        if transport not in ("sse", "websocket"):
-            raise RunnerError("transport must be sse or websocket")
+        transport = value.get("transport", "http" if value.get("provider") == "local" else "sse")
+        if transport not in ("sse", "websocket", "http"):
+            raise RunnerError("transport must be sse, websocket or http")
+        if (transport == "http") != (value.get("provider") == "local"):
+            raise RunnerError("local model requests require http transport")
         if transport == "websocket" and value.get("provider") != "openai-codex":
             raise RunnerError("WebSocket is supported only for subscription Responses")
         output_schema = None

@@ -13,6 +13,44 @@ CLI = ROOT / 'bin/experiment-runner'
 
 
 class SharedRunnerTests(unittest.TestCase):
+    def test_local_worker_runs_exact_inputs_and_preserves_its_receipt_metadata(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            project = Path(temporary)
+            (project / 'prompt.txt').write_text('GENERIC PROMPT\n{TASK}')
+            (project / 'cases.json').write_text(json.dumps({'cases': [
+                {'id': 'one', 'inputs': {'TASK': 'Steel 🌿 {TASK}'}}]}))
+            (project / 'spec.json').write_text(json.dumps({
+                'schema_version': 1, 'prompt': {'id': 'P1', 'path': 'prompt.txt'},
+                'dataset': {'adapter': 'generic', 'path': 'cases.json'},
+                'runner': {'provider': 'openai-codex', 'model': 'fixture/model',
+                           'reasoning_effort': 'off', 'concurrency': 1,
+                           'runner_binary': str(ROOT / 'tests/fixtures/fake-runner.py'),
+                           'output_schema': {'type': 'object'}}}))
+            environment = {**os.environ, 'FAKE_RUNNER_LOG': str(project / 'calls.json'),
+                'FAKE_RUNNER_PROMPT_RESPONSE': '{"answer":"local fixture"}',
+                'FAKE_RUNNER_RESULT_OVERRIDE': json.dumps({
+                    'transport': 'http', 'response_metadata': {'config_sha256': 'a' * 64}})}
+            def cli(*arguments):
+                return subprocess.run([str(CLI), *arguments], cwd=project, env=environment,
+                                      text=True, capture_output=True, timeout=30)
+            prepared = cli('prepare', 'E1', '--spec', 'spec.json', '--provider', 'local',
+                           '--transport', 'http', '--max-output-tokens', '32')
+            self.assertEqual(prepared.returncode, 0, prepared.stdout + prepared.stderr)
+            self.assertFalse((project / 'calls.json').exists())
+            ran = cli('run', 'E1')
+            self.assertEqual(ran.returncode, 0, ran.stdout + ran.stderr)
+            call, = json.loads((project / 'calls.json').read_text())
+            self.assertEqual(call['request']['prompt'], 'GENERIC PROMPT\nSteel 🌿 {TASK}')
+            self.assertEqual(call['request']['max_output_tokens'], 32)
+            self.assertEqual(call['request']['transport'], 'http')
+            shown = cli('show', 'E1', '--json')
+            self.assertEqual(shown.returncode, 0, shown.stdout + shown.stderr)
+            report = json.loads(shown.stdout)
+            self.assertEqual(report['summary']['valid'], 1)
+            self.assertEqual(report['cases'][0]['response_metadata']['config_sha256'], 'a' * 64)
+            self.assertEqual(report['cases'][0]['usage']['input_tokens'], 100)
+            self.assertEqual(report['cases'][0]['stop_reason'], 'stop')
+
     def test_help_explains_the_cache_workflow_without_creating_an_experiment(self):
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary)
