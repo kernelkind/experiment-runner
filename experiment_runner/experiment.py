@@ -163,10 +163,11 @@ def mechanical_result(dataset, case, schema):
             "mechanical_sha256": inputs.digest(decision), "attempts": 0, "reused": False}
 
 
-def request_preview(plan, manifest, cases):
+def request_preview(plan, manifest, cases, *, include_reusable_case_ids=False):
     pending = [case for case in cases if case.get("status", "unrun") == "unrun"
                and not uses_mechanical(manifest, case)]
     reusable = 0
+    reusable_case_ids = []
     if pending and not manifest["request_reuse"]["intentional_repeat"]:
         history = engine.RequestHistory(
             Path(manifest["request_reuse"]["history_root"]),
@@ -186,14 +187,19 @@ def request_preview(plan, manifest, cases):
                 except (ValueError, engine.RunnerError):
                     continue
                 reusable += 1
+                if include_reusable_case_ids:
+                    reusable_case_ids.append(case['id'])
                 break
     unrun = len(pending)
-    return {
+    result = {
         "unrun": unrun,
         "reusable": reusable,
         "new": unrun - reusable,
         "note": "lookup at inspection time; run rechecks verified receipts",
     }
+    if include_reusable_case_ids:
+        result['reusable_case_ids'] = reusable_case_ids
+    return result
 
 
 def prepare(args, *, preparation_context=None, include_request_preview=True):

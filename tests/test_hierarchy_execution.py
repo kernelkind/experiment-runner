@@ -114,6 +114,45 @@ class HierarchyExecutionTests(unittest.TestCase):
         self.assertEqual(result['summary']['attempts'], 0)
         self.assertFalse((self.root / 'calls.json').exists())
 
+    def test_request_preview_can_select_verified_reuse_after_an_unknown_input(self):
+        (self.root / 'cases.json').write_text(json.dumps({'cases': [
+            {'id': name, 'inputs': {'TASK': task}}
+            for name, task in (('one', 'unknown'), ('two', 'cached'), ('three', 'cached'))]}))
+        self.prepare('known')
+        experiment.run(self.root / 'known', only=['two'], include_request_preview=False)
+        self.prepare('mixed')
+        directory = self.root / 'mixed'
+        plan, _, manifest = experiment.load(directory)
+        pending = experiment.report(directory, include_request_preview=False)['cases']
+        default = experiment.request_preview(plan, manifest, pending)
+        self.assertEqual(set(default), {'unrun', 'reusable', 'new', 'note'})
+        self.assertEqual(default['new'], 1)
+        preview = experiment.request_preview(plan, manifest, pending,
+                                             include_reusable_case_ids=True)
+        self.assertEqual(preview['reusable_case_ids'], ['two', 'three'])
+        self.assertEqual({key: preview[key] for key in default}, default)
+        frozen = (directory / 'experiment.json').read_bytes()
+        result = experiment.run(directory, only=preview['reusable_case_ids'],
+                                max_new_attempts=0, include_request_preview=False)
+        self.assertEqual([(row['id'], row['status']) for row in result['cases']],
+                         [('one', 'unrun'), ('two', 'valid'), ('three', 'valid')])
+        self.assertEqual(result['summary']['reused'], 2)
+        self.assertEqual(result['summary']['attempts'], 0)
+        self.assertEqual(len(json.loads((self.root / 'calls.json').read_text())), 1)
+        self.assertEqual((directory / 'experiment.json').read_bytes(), frozen)
+        after = experiment.request_preview(plan, manifest, result['cases'],
+                                           include_reusable_case_ids=True)
+        self.assertEqual(after['reusable_case_ids'], [])
+        self.assertEqual(after['new'], 1)
+        args = experiment.parser().parse_args([
+            'prepare', str(self.root / 'repeat'), '--from', str(directory), '--repeat'])
+        experiment.prepare(args, include_request_preview=False)
+        repeat_plan, _, repeat_manifest = experiment.load(self.root / 'repeat')
+        repeat = experiment.request_preview(repeat_plan, repeat_manifest, repeat_plan['cases'],
+                                            include_reusable_case_ids=True)
+        self.assertEqual(repeat['reusable_case_ids'], [])
+        self.assertEqual(repeat['new'], 3)
+
     def test_selected_slices_can_share_one_native_cache_warmup(self):
         (self.root / 'prompt.txt').write_text('GENERIC PROMPT' + ' word' * 1100 + '{TASK}')
         args = experiment.parser().parse_args([

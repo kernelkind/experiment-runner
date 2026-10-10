@@ -181,6 +181,12 @@ programmatic equivalent is `run(..., only=[...])`; an empty list dispatches
 nothing. Selection preserves prompts, settings, receipt validation, retries,
 answer reuse and attempt budgets.
 
+Programmatic `request_preview(..., include_reusable_case_ids=True)` adds
+`reusable_case_ids` for unrun cases whose saved receipts and outputs pass the
+existing reuse checks. The default preview still returns counts only. Passing
+those IDs to `run(..., only=ids, max_new_attempts=0)` resolves saved answers even
+when an earlier case needs a new call. Execution rechecks the receipts.
+
 Programmatic `run(..., warm_cache=True)` retains automatic warming by default.
 A caller running several selected slices for one logical invocation can use
 `warm_cache=False` after that group's initial slice, so later slices share its
