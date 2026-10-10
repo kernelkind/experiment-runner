@@ -117,16 +117,54 @@ provider's concurrency contract or a reservation guaranteeing chat capacity.
 
 ## Versions and saved experiments
 
-Preparation freezes the exact runner code hashes, model-worker identity,
-settings and inputs. The release identifier is available with `--version`.
-Preparation records hashes; it does not preserve a separate copy of the runner
-code. Later source changes can cause execution checks to refuse a resume.
+Preparation freezes inputs, model settings and request identity, and records
+runner code hashes as provenance. Version 1.6.0 separates the native worker's
+`request_code_sha256` (request-producing code and pinned dependencies) from its
+full `runner_sha256` (including scheduling and backoff). Scheduling-only changes
+can resume in the same experiment directory and preserve exact answer reuse.
+Worker and workflow transitions are recorded in append-only audit ledgers;
+original manifests, inputs and receipts are never rewritten. The release
+identifier is available with `--version`.
 
-Saved receipts remain readable. A prepared experiment cannot silently switch
-code or transport. Existing `--runner-upgrade-reason` checks and audit ledgers
-remain enforced; a different model-worker identity requires a newly prepared
-experiment, normally `prepare --from` the old one. No old receipts or inputs are
-rewritten. Failed token usage remains unknown.
+Normal `run` automatically audits compatible runner updates. Changes to project
+adapters or evaluators still require inspection and `--runner-upgrade-reason`.
+Changed request-producing code or transport requires a new experiment. An
+explicit reason cannot override incompatible model requests. Unknown historical
+or custom workers without a request-code fingerprint retain strict worker-hash
+checks. The checked-in compatibility registry identifies two verified previous
+native workers; it does not declare every historical runner compatible.
+Only add a historical mapping after verifying identical native serialization
+and receipt/budget behavior; preserve existing mappings when adding new ones.
+
+For a controlled handover, pause one experiment, wait until its status is
+`paused`, then resume it with the same budget and execution limits:
+
+```bash
+bin/experiment-runner pause target/trial-v1
+bin/experiment-runner show target/trial-v1 --json
+bin/experiment-runner run target/trial-v1 --attempt-budget target/attempt-budget.json
+```
+
+`pause` stops admission without killing requests. Active requests finish and
+save receipts; queued cases consume no attempt reservations. Other experiments
+continue running. `show --json` reports `pausing` while draining and `paused`
+afterward. Compatible live worker updates are audited and continue without
+pausing other runs. Incompatible worker-source changes automatically request a
+handover before further dispatch. This is a checkpoint, not an automatic
+process restart;
+invoke `run` again to continue unfinished cases. Reapply any per-invocation
+selection or spending limits. A native worker also rechecks its expected source
+identity before sending; a change in the final launch window is refused, and any
+already-made attempt reservation stays conservative.
+
+Processes started with older runners have no handover support. Their source
+bindings must remain unchanged until they finish or are separately restarted;
+installing this release cannot upgrade already-loaded Python code. Other
+coordinators can retain their loaded scheduling code while compatible workers
+update; pause and restart each coordinator separately to adopt new workflow
+code. No global idle period is required for subsequent compatible updates.
+Preparation records hashes without preserving a separate copy of runner code. Failed token usage
+remains unknown.
 
 `prepare --from` retains the old worker by default, including custom workers.
 To move an older experiment's frozen inputs to the shared source worker, prepare
@@ -160,9 +198,11 @@ Verify the shared launcher's relevant behavior and report its stable path and
 release version. This workflow uses the checkout launcher, not a command
 installed on `PATH`.
 
-Use the updated binary and its worker for newly prepared experiments. Existing
-experiments retain their frozen worker and receipts; prepare a new directory
-with `--from` and `--runner-binary` to migrate, as described above.
+Use the updated launcher for new and resumed experiments. Compatible updates
+resume existing directories automatically; incompatible request changes use
+`--from` and `--runner-binary`, as described above. Account for older active
+processes before changing their bound source. Newer processes support a
+per-experiment pause and resume; never edit an actively bound task checkout.
 
 ## SSE prefix caching
 
@@ -311,8 +351,9 @@ Old manual-prefix/key/warmup experiments retain their frozen behavior. The legac
 `--prompt-cache-prefix FILE`, `--prompt-cache-key KEY` and `--cache-warmup`
 options remain accepted but hidden from normal help. Supply `--prompt-cache`
 to opt an older experiment into template selection. It cannot be combined with
-manual cache overrides or historical import. Existing worker identity checks
-still require selecting the shared worker for a newly prepared experiment.
+manual cache overrides or historical import. Select the shared worker explicitly
+when migrating from an incompatible historical worker. Compatible runner updates
+preserve the experiment and its fixed request identity.
 
 Adding caching changes the request's message format and identity, so uncached
 answers are not reused as cached answers, even if their combined text is the

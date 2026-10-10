@@ -148,13 +148,29 @@ const mimoFlash = {
 
 async function identity() {
   const hash = createHash('sha256');
+  const requestHash = createHash('sha256');
   for (const path of ['model.mjs', 'websocket.mjs', 'backoff.mjs', '../provider_backoff.py',
-    '../extraction_pipeline.py', '../scheduling.py', 'package-lock.json', '../run-model.sh']) {
+    '../extraction_pipeline.py', '../scheduling.py', '../compatibility.py',
+    '../experiment.py', '../cli.py', '../inputs.py', '../project.py', '../__init__.py',
+    'request-compatibility.json', 'package-lock.json', '../run-model.sh']) {
     const bytes = await readFile(new URL(path, import.meta.url));
     hash.update(`${path}\0${bytes.length}\0`).update(bytes);
+    if (['model.mjs', 'websocket.mjs', 'package-lock.json', '../run-model.sh'].includes(path)) {
+      requestHash.update(`${path}\0${bytes.length}\0`).update(bytes);
+    }
   }
   return { runner_version: VERSION, pi_ai_version: PI_AI_VERSION, runner_sha256: hash.digest('hex'),
+    request_code_sha256: requestHash.digest('hex'),
     experiment_scopes: true };
+}
+
+async function executionIdentity() {
+  const provenance = await identity();
+  const expected = process.env.ORACLE_EXPERIMENT_EXPECTED_RUNNER_SHA256;
+  if (expected && expected !== provenance.runner_sha256) {
+    throw new Error('Model runner changed before request dispatch; resume after handover');
+  }
+  return provenance;
 }
 
 function compileSchema(schema) {
@@ -510,7 +526,7 @@ function redactor(apiKey) {
 }
 
 async function executeDecisions(request, { apiKey, fetch, signal }) {
-  const provenance = await identity();
+  const provenance = await executionIdentity();
   const redact = redactor(apiKey);
   const abort = AbortSignal.any([AbortSignal.timeout(request.timeout_seconds * 1000), ...(signal ? [signal] : [])]);
   const started = performance.now();
@@ -572,7 +588,7 @@ async function executeDecisions(request, { apiKey, fetch, signal }) {
 async function executeModel(request, { apiKey, fetch = globalThis.fetch, signal, offline = false } = {}) {
   if (!nonempty(apiKey)) throw new Error('Explicit credentials are required for execution');
   if (request.model.api === 'systemone') return executeDecisions(request, { apiKey, fetch, signal });
-  const provenance = await identity();
+  const provenance = await executionIdentity();
   const redact = redactor(apiKey);
   const abort = AbortSignal.any([AbortSignal.timeout(request.timeout_seconds * 1000), ...(signal ? [signal] : [])]);
   let wire;

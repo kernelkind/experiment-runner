@@ -100,7 +100,8 @@ def snapshot(run_directory):
             reason = 'capacity' if occupied >= LIMIT else 'ready'
         cooldown = max([0, *(j.get('cooldown_until', 0) - now for j in waiting), until - now])
         orphaned = process_start(run['pid']) != run['process_start']
-        return {**saved, 'state': 'interrupted' if orphaned else 'running', 'queued': max(0, run['pending'] - len(running)),
+        return {**saved, 'state': 'interrupted' if orphaned else 'pausing' if run.get('pause_reason') else 'running',
+                'pause_reason': run.get('pause_reason'), 'queued': max(0, run['pending'] - len(running)),
                 'running': len(running), 'global_running': occupied, 'global_limit': LIMIT,
                 'wait_reason': reason, 'queue_wait_seconds': max([saved.get('queue_wait_seconds', 0), *waits]),
                 'running_elapsed_seconds': max([0, *elapsed]),
@@ -111,8 +112,24 @@ def snapshot(run_directory):
                                                          'wait_seconds': now - j['queued_at']} for j in waiting}}
 
 
+def pause(run_directory, reason='requested'):
+    saved = snapshot(run_directory)
+    if saved['state'] in ('paused', 'finished'):
+        return saved
+    if saved['state'] not in ('running', 'pausing'):
+        raise ValueError('no running experiment supports handover here; older runners must finish or be restarted separately')
+    gate = SharedProviderBackoff(directory())
+    with gate._state() as (state, now):
+        queue = _clean(state, now)
+        run = queue['experiments'].get(saved['owner'])
+        if run is None:
+            raise ValueError('experiment exited before pause was requested')
+        run['pause_reason'] = reason
+    return snapshot(run_directory)
+
+
 class ExperimentQueue:
-    def __init__(self, run_directory, count, *, scopes=None, scope_loader=None):
+    def __init__(self, run_directory, count, *, scopes=None, scope_loader=None, worker_identity=None):
         self.path = Path(run_directory) / 'scheduling.json'
         self.gate = SharedProviderBackoff(directory())
         self.owner = secrets.token_hex(16)
@@ -120,6 +137,10 @@ class ExperimentQueue:
         self.scope_lock = threading.Lock()
         self.admission_lock = threading.Lock()
         self.scope_error = None
+        self.worker_identity = worker_identity
+        self.last_worker_identity = worker_identity
+        self.worker_lock = threading.Lock()
+        self.pause_reason = None
         self.stopped = threading.Event()
         self.lock = threading.Lock()
         self.saved = {'owner': self.owner, 'state': 'running', 'queued': count, 'running': 0,
@@ -169,6 +190,28 @@ class ExperimentQueue:
             queue = _clean(state, now)
             queue['experiments'][self.owner]['wait_reason'] = 'prefix_warmup' if active else None
 
+    def check_pause(self):
+        with self.gate._state() as (state, now):
+            queue = _clean(state, now)
+            self.pause_reason = queue['experiments'][self.owner].get('pause_reason')
+        if self.pause_reason:
+            self.stopped.set()
+            from .extraction_pipeline import ExperimentPaused
+            raise ExperimentPaused('experiment paused: ' + self.pause_reason)
+
+    def check_worker(self, identity):
+        self.check_pause()
+        if self.worker_identity is not None:
+            from . import compatibility
+            with self.worker_lock:
+                if not compatibility.compatible(self.worker_identity, identity):
+                    pause(self.path.parent, 'runner_updated')
+                    self.check_pause()
+                elif identity['runner_sha256'] != self.last_worker_identity['runner_sha256']:
+                    manifest = json.loads((self.path.parent / 'manifest.json').read_text())
+                    compatibility.upgrade_worker(self.path.parent, manifest, identity)
+                    self.last_worker_identity = identity
+
     def worker_started(self, identifier, pid):
         start = process_start(pid)
         with self.gate._state() as (state, now):
@@ -197,6 +240,7 @@ class ExperimentQueue:
 
     @contextmanager
     def slot(self, case, timeout_seconds):
+        self.check_pause()
         # Scope discovery is one metadata-only call per batch, never inference.
         with self.scope_lock:
             if self.scope_error is not None:
@@ -228,6 +272,7 @@ class ExperimentQueue:
                     queue['waiting'][identifier] = {'owner': self.owner, 'case': case, 'queued_at': queued_at,
                                                     'scopes': self.scopes, 'wait_reason': 'capacity'}
                 while True:
+                    self.check_pause()
                     if self.stopped.is_set():
                         from .extraction_pipeline import NewJobLimitReached
                         raise NewJobLimitReached('experiment stopped before queued request dispatch')
@@ -240,7 +285,7 @@ class ExperimentQueue:
                         eligible = {}
                         heads = {candidate['owner']: key for key, candidate in queue['waiting'].items()}
                         for owner, run in queue['experiments'].items():
-                            if not run.get('ready'):
+                            if not run.get('ready') or run.get('pause_reason'):
                                 continue
                             key = heads.get(owner)
                             candidate = queue['waiting'].get(key)
@@ -282,6 +327,7 @@ class ExperimentQueue:
             with self.lock:
                 self.saved['queue_wait_seconds'] = max(self.saved['queue_wait_seconds'], time.monotonic() - queued_at)
                 self._save()
+            self.check_pause()
             token = _slot.set({'provider_ticket': provider_ticket, 'identifier': identifier, 'queue': self})
             yield
         finally:
@@ -305,7 +351,7 @@ class ExperimentQueue:
             queue['experiments'].pop(self.owner, None)
             _clean(state, now)
         with self.lock:
-            self.saved.update(value, state='finished', unresolved=value['queued'], queued=0,
+            self.saved.update(value, state='paused' if value.get('pause_reason') else 'finished', unresolved=value['queued'], queued=0,
                               running=0, wait_reason=None, cooldown_until_utc=None, cases={})
             self._save()
         self.progress(force=True)

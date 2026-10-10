@@ -999,12 +999,17 @@ def execution_upgrade(directory, plan, reason):
         active = entry["to"]
     if current != active:
         if not reason or not reason.strip():
-            raise ValueError("experiment code changed; inspect it and supply --runner-upgrade-reason, or prepare a new experiment")
+            from .compatibility import OPERATIONAL_FILES
+            changed = {name for name in active if current[name] != active[name]}
+            if not changed <= OPERATIONAL_FILES:
+                raise ValueError("experiment code changed; inspect it and supply --runner-upgrade-reason, or prepare a new experiment")
+            reason = 'compatible runner workflow update; frozen inputs and request identity preserved'
         engine._append_json_line(path, {
             "from": active, "to": current, "reason": reason,
             "results_prefix_bytes": len(results),
             "results_prefix_sha256": engine._sha256_bytes(results),
         })
+    return reason
 
 
 def reconcile_costs(directory):
@@ -1083,10 +1088,11 @@ def run(directory, max_new_attempts=None, runner_upgrade_reason=None, *,
             write(directory / "report.json", result)
             return result
         identity = engine._runner_identity(config)
-        if any(identity[k] != manifest[k] for k in ("runner_version", "runner_sha256")):
+        if not engine.compatibility.compatible(manifest, identity):
             raise ValueError("model runner changed since preparation")
         engine._validate_auth_file(config.auth_file)
-        execution_upgrade(directory, plan, runner_upgrade_reason)
+        runner_upgrade_reason = execution_upgrade(directory, plan, runner_upgrade_reason)
+        engine.compatibility.upgrade_worker(config.run_directory, manifest, identity)
         engine._append_json_line(directory / 'execution-settings.jsonl', dict(
             manifest_sha256=inputs.digest(manifest), concurrency=scheduling.LIMIT,
             scheduling='shared-fair-queue-v1',
@@ -1320,6 +1326,22 @@ def parser():
   not a provider ETA. Interrupted admissions are cleaned by process identity;
   saved receipts and conservative attempt reservations remain authoritative.
   This controls runner traffic, not the provider's cap or guaranteed chat capacity.
+
+  Updates and resume:
+    experiment-runner pause EXPERIMENT
+    experiment-runner show EXPERIMENT --json
+    experiment-runner run EXPERIMENT --attempt-budget SAME_BUDGET
+  pause stops new admission and drains active requests; other experiments run.
+  Wait for scheduling.state=paused, then run again with the same limits/budget.
+  Compatible scheduling/backoff changes resume the same directory automatically;
+  completed receipts and exact reuse survive. Compatible live workers continue;
+  incompatible changes request a handover before new dispatch. Coordinators
+  retain loaded workflow code until individually paused and restarted.
+  Changed request-producing code still
+  requires a newly prepared experiment; --runner-upgrade-reason cannot bypass it.
+  Project adapter/evaluator changes still require --runner-upgrade-reason.
+  Processes started with older runners lack handover support and need a one-time
+  finish/restart before updating their bound source; no global idle is required.
 """
     root = argparse.ArgumentParser(
         prog="experiment-runner", description=__doc__ + "\n"
@@ -1479,7 +1501,10 @@ Example from your project checkout (replace the spec and destination):
                    help="cumulative experiment spending allowance; includes prior attempts, never truncates responses")
     p.add_argument("--max-request-cost-usd", type=float,
                    help="caller-verified maximum cost reserved for each in-flight call; required with --max-cost-usd")
-    p.add_argument("--runner-upgrade-reason", help="explicitly approve and audit a workflow-code upgrade; frozen inputs/settings remain immutable")
+    p.add_argument("--runner-upgrade-reason", help="approve project adapter/evaluator upgrades; compatible runner updates are automatic, incompatible requests remain refused")
+    p = commands.add_parser('pause', help='stop new admissions for one run; active requests finish normally',
+        formatter_class=argparse.RawDescriptionHelpFormatter, epilog=queue_help)
+    p.add_argument('experiment', type=Path)
     p = commands.add_parser('reconcile-costs', help='lookup missing OpenRouter charges; no inference')
     p.add_argument('experiment', type=Path)
     p = commands.add_parser(
@@ -1567,8 +1592,14 @@ def main(argv=None):
                 print(json.dumps(result, indent=2))
                 return int(result.get('status') != 'finished')
             compact(result)
+            if result.get('scheduling', {}).get('state') == 'paused':
+                return 0
             return int(any(case['status'] in ('malformed', 'invalid_receipt', 'failed', 'unrun')
                            for case in result['cases'] if args.only is None or case['id'] in args.only))
+        elif args.command == 'pause':
+            from .scheduling import pause
+            _, config, _ = load(args.experiment.resolve())
+            print(json.dumps(pause(config.run_directory), indent=2))
         elif args.command == 'reconcile-costs':
             compact(reconcile_costs(args.experiment))
         elif args.command == 'show':

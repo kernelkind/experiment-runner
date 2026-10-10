@@ -34,6 +34,7 @@ from typing import Any, Callable, Sequence
 if not __package__:
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from experiment_runner import project
+from experiment_runner import compatibility
 
 SCHEMA_VERSION = 1
 PIPELINE_SCHEMA_VERSION = 2
@@ -102,6 +103,10 @@ class RunnerError(Exception):
 
 class ExperimentAdmissionUnavailable(RunnerError):
     """Admission failed locally before a model request could be sent."""
+
+
+class ExperimentPaused(RunnerError):
+    """Stop admission, preserve unfinished cases and drain active requests."""
 
 
 class NewJobLimitReached(Exception):
@@ -612,7 +617,7 @@ def _runner_environment() -> dict[str, str]:
         for key, value in os.environ.items()
         if not key.upper().startswith(("CODEX_", "OPENAI_", "CHATGPT_"))
         and key not in {"ORACLE_EXPERIMENT_PROVIDER_TICKET", "ORACLE_EXPERIMENT_ADMISSION_MARKER",
-                        "ORACLE_EXPERIMENT_CONCURRENCY"}
+                        "ORACLE_EXPERIMENT_CONCURRENCY", "ORACLE_EXPERIMENT_EXPECTED_RUNNER_SHA256"}
     }
 
 
@@ -1049,6 +1054,8 @@ def _runner_identity(
         raise RunnerError("model runner returned invalid identity JSON") from error
     _expect_string(identity.get("runner_version"), "runner_version")
     _expect_sha256(identity.get("runner_sha256"), "runner_sha256")
+    if 'request_code_sha256' in identity:
+        _expect_sha256(identity['request_code_sha256'], 'request_code_sha256')
     return identity
 
 
@@ -1057,9 +1064,12 @@ def _runner_version(config: Any) -> str:
 
 
 def _runtime_manifest(config: Any) -> dict[str, Any]:
+    identity = _runner_identity(config)
     return {
         "provider": config.provider,
-        "runner_sha256": _runner_identity(config)["runner_sha256"],
+        "runner_sha256": identity["runner_sha256"],
+        **({'request_code_sha256': identity['request_code_sha256']}
+           if 'request_code_sha256' in identity else {}),
         "timeout_seconds": config.timeout_seconds,
         "max_output_tokens": config.max_output_tokens,
     }
@@ -1327,6 +1337,10 @@ def _prepare_manifest_directory(
             proposed_without_wrapper.pop("wrapper_sha256", None),
             "proposed run manifest.wrapper_sha256",
         )
+        if compatibility.compatible(existing, manifest):
+            for key in ('runner_sha256', 'request_code_sha256'):
+                proposed_without_wrapper.pop(key, None)
+                existing_without_wrapper.pop(key, None)
         if existing_without_wrapper != proposed_without_wrapper:
             raise RunnerError(
                 "run manifest does not match this configuration; use a new "
@@ -1341,11 +1355,14 @@ def _prepare_manifest_directory(
         pending_reason: str | None = None
         if provenance.active_wrapper_sha256 != proposed_wrapper:
             if runner_upgrade_reason is None:
-                raise RunnerError(
-                    "run was created by another wrapper version; inspect the code "
-                    "change and use --runner-upgrade-reason to append an audited "
-                    "runner transition"
-                )
+                if compatibility.request_code(existing) is not None and compatibility.compatible(existing, manifest):
+                    runner_upgrade_reason = 'compatible runner workflow update; request identity preserved'
+                else:
+                    raise RunnerError(
+                        "run was created by another wrapper version; inspect the code "
+                        "change and use --runner-upgrade-reason to append an audited "
+                        "runner transition"
+                    )
             pending_wrapper = proposed_wrapper
             pending_reason = runner_upgrade_reason
         elif runner_upgrade_reason is not None:
@@ -1390,6 +1407,8 @@ def _prepare_run_directory(
         config.run_directory / "takeaway-output-schema.json",
         _canonical_json_bytes(TAKEAWAY_SCHEMA),
     )
+    compatibility.upgrade_worker(config.run_directory,
+        _load_json(config.run_directory / 'manifest.json', 'run manifest'), _runner_identity(config))
     _atomic_write(
         config.run_directory / "mask-output-schema.json",
         _canonical_json_bytes(MASK_SCHEMA),
@@ -1407,6 +1426,8 @@ def _prepare_subject_run_directory(
     manifest: dict[str, object],
 ) -> PreparedManifest:
     prepared = _prepare_manifest_directory(config.run_directory, manifest)
+    compatibility.upgrade_worker(config.run_directory,
+        _load_json(config.run_directory / 'manifest.json', 'run manifest'), _runner_identity(config))
     _atomic_write(
         config.run_directory / "subject-output-schema.json",
         _canonical_json_bytes(SUBJECT_SCHEMA),
@@ -2081,6 +2102,8 @@ def _validate_model_result(
         "http_attempts": 1,
         "error": None,
     }
+    if identity.get('request_code_sha256') is not None:
+        expected['request_code_sha256'] = identity['request_code_sha256']
     if any(not _same_json(result.get(key), value) for key, value in expected.items()):
         raise RunnerError(
             "model runner did not return a valid completed response bound to the request"
@@ -2159,7 +2182,7 @@ def _validate_model_result(
         raise RunnerError("model result output differs from its raw response")
 
 
-def _invoke_prompt_worker(config, argv, request, directory):
+def _invoke_prompt_worker(config, argv, request, directory, *, worker_identity):
     """Bound the active request, while allowing shared admission to wait first."""
     marker = 'oracle-admission-' + os.urandom(16).hex()
     from experiment_runner.scheduling import LIMIT, current_slot
@@ -2170,6 +2193,7 @@ def _invoke_prompt_worker(config, argv, request, directory):
     if slot and slot['provider_ticket']:
         environment['ORACLE_EXPERIMENT_CONCURRENCY'] = str(LIMIT)
         environment['ORACLE_EXPERIMENT_PROVIDER_TICKET'] = slot['provider_ticket']
+    environment['ORACLE_EXPERIMENT_EXPECTED_RUNNER_SHA256'] = worker_identity['runner_sha256']
     waiting_line, admitted_line = (marker + ':waiting\n').encode(), (marker + ':admitted\n').encode()
     unavailable_line = marker + ':unavailable\n'
     deadline = time.monotonic() + config.timeout_seconds + 30
@@ -2217,6 +2241,10 @@ def _invoke_model(
 ) -> dict[str, Any]:
     _validate_auth_file(config.auth_file)
     identity = _runner_identity(config)
+    from experiment_runner.scheduling import current_slot
+    slot = current_slot()
+    if slot is not None:
+        slot['queue'].check_worker(identity)
     request = {
         "provider": config.provider,
         "model": stage.model,
@@ -2245,12 +2273,12 @@ def _invoke_model(
             _load_json(config.run_directory / "manifest.json", "run manifest"),
             "run manifest",
         )
-        if identity["runner_sha256"] != manifest.get("runner_sha256") or identity[
-            "runner_version"
-        ] != manifest.get("runner_version"):
+        if not compatibility.compatible(manifest, identity):
             raise RunnerError("model runner changed since the run manifest was created")
+        if slot is not None and config.run_directory != slot['queue'].path.parent:
+            compatibility.upgrade_worker(config.run_directory, manifest, identity)
         with tempfile.TemporaryDirectory(prefix="model-call-") as temporary:
-            completed = _invoke_prompt_worker(config, argv, request, temporary)
+            completed = _invoke_prompt_worker(config, argv, request, temporary, worker_identity=identity)
         stdout, stderr, exit_code = (
             completed.stdout,
             completed.stderr,
@@ -2263,7 +2291,7 @@ def _invoke_model(
         if result is None:
             raise RunnerError("model runner returned no result")
         _validate_model_result(config, stage, prompt, schema, identity, result)
-    except ExperimentAdmissionUnavailable:
+    except (ExperimentAdmissionUnavailable, ExperimentPaused):
         # Stop scheduling without saving an unadmitted case as a provider failure.
         # Its existing worker reservation remains conservatively consumed.
         raise
@@ -2289,6 +2317,8 @@ def _invoke_model(
         "elapsed_seconds": time.monotonic() - started,
         "provider": config.provider,
         "runner_sha256": identity["runner_sha256"],
+        **({'request_code_sha256': identity['request_code_sha256']}
+           if 'request_code_sha256' in identity else {}),
         "model_result": result,
         "usage": None if result is None else result.get("usage"),
         "stdout_json": stdout,
@@ -2315,6 +2345,7 @@ class ReceiptFiles:
         self._json = {}
         self._offsets = {}
         self._upgrades = {}
+        self._worker_upgrades = {}
         self._lock = threading.RLock()
 
     @staticmethod
@@ -2403,6 +2434,18 @@ class ReceiptFiles:
                     self._upgrades[key] = saved
             return saved[1]
 
+    def worker_provenance(self, directory, manifest):
+        with self._lock:
+            directory = Path(directory)
+            paths = [directory / name for name in ('manifest.json', 'worker-upgrades.jsonl', 'results.jsonl')]
+            stamps = tuple(self._stamp(p) if p.exists() else None for p in paths)
+            saved = self._worker_upgrades.get(directory)
+            if saved is None or saved[0] != stamps:
+                saved = (stamps, compatibility.worker_history(directory, manifest))
+                if stamps == tuple(self._stamp(p) if p.exists() else None for p in paths):
+                    self._worker_upgrades[directory] = saved
+            return saved[1]
+
 
 def validate_model_receipt(
     config: Any,
@@ -2414,6 +2457,11 @@ def validate_model_receipt(
     *, files: ReceiptFiles | None = None,
 ) -> None:
     """Verify a saved native receipt without credentials or model requests."""
+    try:
+        worker = compatibility.receipt_identity(config.run_directory, manifest, record,
+            identities=files.worker_provenance(config.run_directory, manifest) if files else None)
+    except ValueError as error:
+        raise RunnerError(str(error)) from error
     expected = {
         "model": stage.model,
         "reasoning_effort": stage.reasoning_effort,
@@ -2426,8 +2474,8 @@ def validate_model_receipt(
             else _canonical_json_bytes(schema)
         ),
         "provider": config.provider,
-        "runner_version": manifest["runner_version"],
-        "runner_sha256": manifest["runner_sha256"],
+        "runner_version": worker["runner_version"],
+        "runner_sha256": worker["runner_sha256"],
         "error": None,
         "prompt_sha256": _sha256_bytes(prompt.encode("utf-8")),
         "exit_code": 0,
@@ -2457,7 +2505,7 @@ def validate_model_receipt(
             raise RunnerError(
                 "saved receipt model result, usage, or raw output differs"
             )
-        _validate_model_result(config, stage, prompt, schema, manifest, result)
+        _validate_model_result(config, stage, prompt, schema, worker, result)
     except (ValueError, TypeError, AttributeError, IndexError) as error:
         raise RunnerError("saved receipt model result is malformed") from error
 
@@ -2484,6 +2532,8 @@ def validate_prompt_receipt(
         if record.get("wrapper_sha256") not in allowed_wrappers:
             raise RunnerError("saved reused response has unverified runner provenance")
         expected["wrapper_sha256"] = record["wrapper_sha256"]
+        if record.get('request_sha256') == _prompt_request_key(manifest, prompt.text, legacy=True):
+            expected['request_sha256'] = record['request_sha256']
         if not _same_json(record, expected):
             raise RunnerError("saved reused response differs from its source receipt")
         return
@@ -2505,11 +2555,15 @@ def validate_prompt_receipt(
         raise RunnerError("saved receipt differs from expected prompt response")
 
 
-def _prompt_request_key(manifest: dict[str, Any], prompt: str) -> str:
+def _prompt_request_key(manifest: dict[str, Any], prompt: str, *, legacy=False) -> str:
     """Content identity, independent of run paths, job IDs and prompt version labels."""
     request = {name: manifest[name] for name in (
         "provider", "model", "reasoning_effort", "runner_version", "runner_sha256",
     )}
+    request_code = compatibility.request_code(manifest)
+    if request_code is not None and not legacy:
+        del request['runner_sha256']
+        request['request_code_sha256'] = request_code
     request.update(prompt=prompt,
                    timeout_seconds=float(manifest["timeout_seconds"]),
                    max_output_tokens=manifest.get("max_output_tokens"),
@@ -2586,7 +2640,8 @@ def _read_request_source(reference: object, request_key: str, *,
         )
         if (record["manifest_sha256"] != reference["manifest_sha256"]
                 or _prompt_request_key(manifest, prompt["text"]) != request_key
-                or record.get("request_sha256", request_key) != request_key
+                or record.get("request_sha256", request_key) not in {
+                    request_key, _prompt_request_key(manifest, prompt['text'], legacy=True)}
                 or manifest.get("response_schema_sha256") != record.get("response_schema_sha256")):
             raise RunnerError("request history source settings differ")
         validate_prompt_receipt(config, manifest, record, files=files)
@@ -2842,9 +2897,12 @@ def _run_job(
         queue = None
         if scheduling.current_slot() is None:
             queue = scheduling.ExperimentQueue(config.run_directory, 1,
-                scope_loader=_experiment_scope_loader(config, stage))
+                scope_loader=_experiment_scope_loader(config, stage), worker_identity=_runner_identity(config))
             admission.callback(queue.close)
             admission.enter_context(queue.slot(job_key, config.timeout_seconds))
+        queue = scheduling.active_queue() or queue
+        if queue is not None:
+            queue.check_worker(_runner_identity(config))
         if new_job_budget is not None:
             new_job_budget.claim(job_key)
         attempt = 1 if previous is None else previous["attempt"] + 1
@@ -3695,6 +3753,11 @@ def _execute_prompt_batch(
     prepared_manifest = _prepare_manifest_directory(
         config.run_directory, proposed_manifest, runner_upgrade_reason=runner_upgrade_reason
     )
+    worker_identity = _runner_identity(config)
+    if request_queue is not None:
+        request_queue.check_worker(worker_identity)
+    compatibility.upgrade_worker(config.run_directory,
+        _load_json(config.run_directory / 'manifest.json', 'run manifest'), worker_identity)
     manifest_sha256 = prepared_manifest.manifest_sha256
     schema_path = None
     if config.output_schema is not None:
@@ -3734,7 +3797,7 @@ def _execute_prompt_batch(
                          if attempt_budget_path is not None else None)
     owned_queue = request_queue is None
     queue = request_queue or scheduling.ExperimentQueue(config.run_directory, len(config.prompts),
-        scope_loader=_experiment_scope_loader(config, config))
+        scope_loader=_experiment_scope_loader(config, config), worker_identity=worker_identity)
     if not owned_queue:
         queue.extend(len(config.prompts))
     (config.run_directory / "output.json").unlink(missing_ok=True)
@@ -3823,6 +3886,7 @@ def _execute_prompt_batch(
     responses = {}
     failures = []
     fatal = False
+    paused = False
     backoff_seconds = 0.0
     backoff_until = 0.0
 
@@ -3862,6 +3926,10 @@ def _execute_prompt_batch(
             try:
                 active = {}
                 while active or (not fatal and ready):
+                    try:
+                        queue.check_pause()
+                    except ExperimentPaused:
+                        paused = fatal = True
                     while (ready and len(active) < concurrency and not fatal
                            and time.monotonic() >= backoff_until):
                         _, index, prompt = heapq.heappop(ready)
@@ -3893,6 +3961,8 @@ def _execute_prompt_batch(
                             if (submitted_at >= backoff_until and record is not previous
                                     and record.get("execution") != "cross_run_reuse"):
                                 backoff_seconds = 0.0
+                        except ExperimentPaused:
+                            paused = fatal = True
                         except NewJobLimitReached as limit:
                             failures.append(str(limit) or "new-attempt allowance exhausted")
                             fatal = True
@@ -3929,6 +3999,8 @@ def _execute_prompt_batch(
         failures.append('per-request bound exceeded')
     if failures:
         raise RunnerError("unresolved prompt cases: " + ", ".join(failures))
+    if paused:
+        return {"status": "paused"}
 
     output: dict[str, object] = {
         "schema_version": SCHEMA_VERSION,
