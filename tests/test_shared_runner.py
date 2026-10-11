@@ -773,7 +773,8 @@ class NativePrefixTests(unittest.TestCase):
         ordinary = {k: v for k, v in manifest.items() if k != 'prompt_cache_prefix'}
         self.assertNotEqual(engine._prompt_request_key(manifest, cfg.prompts[0].text),
                             engine._prompt_request_key(ordinary, cfg.prompts[0].text))
-        receipt = json.loads((cfg.run_directory/'results.jsonl').read_text().splitlines()[0])
+        receipt = next(json.loads(line) for line in (cfg.run_directory/'results.jsonl').read_text().splitlines()
+                       if json.loads(line)['note_id'] == cfg.prompts[0].prompt_id)
         cfg = replace(cfg, prompts=(cfg.prompts[0],))
         engine.validate_prompt_receipt(cfg, manifest, receipt)
         for mutation in ('prefix', 'extra', 'id', 'lite'):

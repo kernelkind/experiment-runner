@@ -31,7 +31,21 @@ def current_slot():
     return _slot.get()
 
 
-def _backoff(state, run, now):
+def _ready(run):
+    return run.get('endpoint_ready', run['ready'])
+
+
+def _endpoint_full(state, run):
+    endpoint = run.get('endpoint_admission')
+    if endpoint is None:
+        return False
+    active = [job.get('endpoint_admission') for job in state['queue']['running'].values()]
+    matching = [value for value in active if value is not None and value['scope'] == endpoint['scope']]
+    capacity = min([endpoint['capacity'], *(value['capacity'] for value in matching)])
+    return len(matching) >= capacity
+
+
+def _blocked(state, run, now):
     until = run['until']
     reason = 'provider_backoff' if until > now else None
     if run.get('scopes') is not None:
@@ -42,6 +56,8 @@ def _backoff(state, run, now):
                 reason = 'transport_backoff' if scope.startswith('transport:') else 'account_backoff'
             elif value and value['limit'] and sum(scope in ticket['generations'] for ticket in state['tickets'].values()) >= value['limit']:
                 reason = reason or 'recovery_limit'
+    if _endpoint_full(state, run):
+        reason = reason or 'capacity'
     return reason, until
 
 
@@ -59,6 +75,8 @@ def _clean(state, now):
             if alive:
                 run['pending'] = len(alive)
                 run['ready'] = 0
+                if 'endpoint_ready' in run:
+                    run['endpoint_ready'] = 0
             else:
                 del queue['experiments'][owner]
     for kind in ('waiting', 'running'):
@@ -69,6 +87,12 @@ def _clean(state, now):
                 if kind == 'running' and job.get('provider_ticket'):
                     state['tickets'].pop(job['provider_ticket'], None)
                 del queue[kind][key]
+    for run in queue['experiments'].values():
+        if 'endpoint_ready' in run:
+            # Already-loaded older coordinators also read ready when choosing
+            # a fair contender. Hide busy endpoints from that shared selection;
+            # keep actual waiting counts for current status and observations.
+            run['ready'] = 0 if _endpoint_full(state, run) else run['endpoint_ready']
     return queue
 
 
@@ -81,15 +105,15 @@ def _snapshot(state, now, saved):
     for owner, run in queue['experiments'].items():
         running = [job for job in queue['running'].values() if job['owner'] == owner]
         waiting = [job for job in queue['waiting'].values() if job['owner'] == owner]
-        blocked, until = _backoff(state, run, now)
+        blocked, until = _blocked(state, run, now)
         reason = blocked or next((job.get('wait_reason') for job in waiting
                                  if job.get('wait_reason')), run.get('wait_reason'))
-        if reason == 'capacity' and occupied < LIMIT:
+        if reason == 'capacity' and occupied < LIMIT and not blocked:
             reason = 'ready'
         experiments[owner] = {
             'pid': run['pid'], 'queued': max(0, run['pending'] - len(running)),
-            'running': len(running), 'ready': run['ready'], 'waiting': len(waiting),
-            'eligible_ready': run['ready'] if not blocked and not run.get('pause_reason') else 0,
+            'running': len(running), 'ready': _ready(run), 'waiting': len(waiting),
+            'eligible_ready': _ready(run) if not blocked and not run.get('pause_reason') else 0,
             'wait_reason': reason, 'pause_reason': run.get('pause_reason'),
             'cooldown_until_utc': (datetime.fromtimestamp(epoch + until - now, timezone.utc).isoformat()
                                    if until > now else None),
@@ -113,7 +137,7 @@ def _snapshot(state, now, saved):
     elapsed = [now - j['started'] for j in running]
     waits = [now - j['queued_at'] for j in waiting]
     reason = experiments[saved['owner']]['wait_reason']
-    blocked, until = _backoff(state, run, now)
+    blocked, until = _blocked(state, run, now)
     if not blocked and reason == 'provider_backoff' and not waiting and run['until'] <= now:
         reason = None
     if reason is None and run['pending'] > len(running):
@@ -123,7 +147,7 @@ def _snapshot(state, now, saved):
     return {**saved, **common,
             'state': 'interrupted' if orphaned else 'pausing' if run.get('pause_reason') else 'running',
             'pause_reason': run.get('pause_reason'), 'queued': max(0, run['pending'] - len(running)),
-            'running': len(running), 'ready': run['ready'],
+            'running': len(running), 'ready': _ready(run),
             'eligible_ready': experiments[saved['owner']]['eligible_ready'],
             'wait_reason': reason, 'queue_wait_seconds': max([saved.get('queue_wait_seconds', 0), *waits]),
             'running_elapsed_seconds': max([0, *elapsed]),
@@ -161,11 +185,13 @@ def pause(run_directory, reason='requested'):
 
 
 class ExperimentQueue:
-    def __init__(self, run_directory, count, *, scopes=None, scope_loader=None, worker_identity=None):
+    def __init__(self, run_directory, count, *, scopes=None, scope_loader=None,
+                 endpoint_loader=None, worker_identity=None):
         self.path = Path(run_directory) / 'scheduling.json'
         self.gate = SharedProviderBackoff(directory())
         self.owner = secrets.token_hex(16)
         self.scopes, self.scope_loader = scopes, scope_loader
+        self.endpoint_admission, self.endpoint_loader = None, endpoint_loader
         self.scope_lock = threading.Lock()
         self.admission_lock = threading.Lock()
         self.scope_error = None
@@ -303,18 +329,30 @@ class ExperimentQueue:
                     self.scope_error = error
                     raise
                 self.scope_loader = None
+            if self.endpoint_loader is not None:
+                try:
+                    self.endpoint_admission = self.endpoint_loader()
+                except Exception as error:
+                    self.scope_error = error
+                    raise
+                self.endpoint_loader = None
         identifier = secrets.token_hex(16)
         queued_at = time.monotonic()
         token = None
         provider_ticket = None
         pending = False
         admitted = False
+        ready_key = 'ready'
         try:
             with self.gate._state() as (state, now):
                 queue = _clean(state, now)
                 run = queue['experiments'][self.owner]
-                run['ready'] += 1
                 run['scopes'] = self.scopes
+                if self.endpoint_admission is not None:
+                    run['endpoint_admission'] = self.endpoint_admission
+                    run.setdefault('endpoint_ready', run['ready'])
+                    ready_key = 'endpoint_ready'
+                run[ready_key] += 1
                 pending = True
                 observation = _snapshot(state, now, self.saved)
             self._record(observation, 'ready')
@@ -324,7 +362,9 @@ class ExperimentQueue:
                 with self.gate._state() as (state, now):
                     queue = _clean(state, now)
                     queue['waiting'][identifier] = {'owner': self.owner, 'case': case, 'queued_at': queued_at,
-                                                    'scopes': self.scopes, 'wait_reason': 'capacity'}
+                                                    'scopes': self.scopes, 'wait_reason': 'capacity',
+                                                    **({'endpoint_admission': self.endpoint_admission}
+                                                       if self.endpoint_admission is not None else {})}
                 while True:
                     self.check_pause()
                     if self.stopped.is_set():
@@ -343,7 +383,7 @@ class ExperimentQueue:
                                 continue
                             key = heads.get(owner)
                             candidate = queue['waiting'].get(key)
-                            blocked, until = _backoff(state, run, now)
+                            blocked, until = _blocked(state, run, now)
                             if candidate is not None:
                                 candidate['cooldown_until'] = until
                             if blocked:
@@ -371,7 +411,7 @@ class ExperimentQueue:
                                     'expires': now + timeout_seconds + 30, 'provider_ticket': provider_ticket}
                                 queue['sequence'] += 1
                                 queue['experiments'][self.owner]['last_grant'] = queue['sequence']
-                                queue['experiments'][self.owner]['ready'] -= 1
+                                queue['experiments'][self.owner][ready_key] -= 1
                                 pending = False
                                 admitted = True
                                 observation = _snapshot(state, now, self.saved)
@@ -396,7 +436,7 @@ class ExperimentQueue:
             with self.gate._state() as (state, now):
                 queue = _clean(state, now)
                 if pending:
-                    queue['experiments'][self.owner]['ready'] -= 1
+                    queue['experiments'][self.owner][ready_key] -= 1
                 queue['waiting'].pop(identifier, None)
                 queue['running'].pop(identifier, None)
                 observation = _snapshot(state, now, self.saved)

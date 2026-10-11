@@ -1,10 +1,12 @@
 """Cross-process scheduling exercised through the released CLI and model worker."""
 import json
+import io
 import os
 import signal
 from pathlib import Path
 import subprocess
 import tempfile
+import tarfile
 import threading
 import time
 import unittest
@@ -48,20 +50,21 @@ class SchedulingTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return result
 
-    def prepare(self, name, count):
+    def prepare(self, name, count, *, provider='openai-codex'):
         (self.root / f'{name}.txt').write_text('GENERIC PROMPT\n{TASK}')
         (self.root / f'{name}-cases.json').write_text(json.dumps({'cases': [
             {'id': str(i), 'inputs': {'TASK': f'{name}-{i}'}} for i in range(count)]}))
         (self.root / f'{name}-spec.json').write_text(json.dumps({
             'schema_version': 1, 'prompt': {'id': 'P1', 'path': f'{name}.txt'},
             'dataset': {'adapter': 'generic', 'path': f'{name}-cases.json'},
-            'runner': {'provider': 'openai-codex', 'auth_file': None,
-                       'model': 'fixture/model', 'reasoning_effort': 'low',
+            'runner': {'provider': provider, 'auth_file': None,
+                       'model': 'fixture/model', 'reasoning_effort': 'off' if provider == 'local' else 'low',
                        'runner_binary': str(ROOT / 'tests/fixtures/fake-runner.py')}}))
         self.cli('prepare', name, '--spec', f'{name}-spec.json')
 
-    def launch(self, name, *args):
-        process = subprocess.Popen([str(CLI), 'run', name, *args], cwd=self.root, env=self.env,
+    def launch(self, name, *args, endpoint=None):
+        environment = {**self.env, **({'FAKE_RUNNER_ADMISSION': json.dumps(endpoint)} if endpoint else {})}
+        process = subprocess.Popen([str(CLI), 'run', name, *args], cwd=self.root, env=environment,
                                    text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                    start_new_session=True)
         self.processes.append(process)
@@ -82,6 +85,123 @@ class SchedulingTests(unittest.TestCase):
             name = row['prompt'].splitlines()[-1].split('-')[0]
             groups[name] = groups.get(name, 0) + 1
         self.fail(f'expected scheduling transition did not occur; worker starts={groups}')
+
+    def test_same_local_endpoint_serializes_before_launch_across_experiments(self):
+        endpoint = {'scope': 'a' * 64, 'capacity': 1}
+        self.prepare('older', 3, provider='local')
+        self.prepare('newer', 2, provider='local')
+        budget = self.root / 'local-budget.json'
+        budget.write_text(json.dumps({'schema_version': 1, 'limit': 2, 'used': 0}))
+        older = self.launch('older', endpoint=endpoint)
+        self.until(lambda: len(self.starts()) >= 1)
+        time.sleep(0.2)
+        self.assertEqual(len(self.starts()), 1, 'a serial endpoint must admit one worker')
+        newer = self.launch('newer', '--attempt-budget', str(budget), endpoint=endpoint)
+        self.until(lambda: json.loads(self.cli('show', 'newer', '--json').stdout)
+                   ['scheduling'].get('ready') == 2)
+        queued = json.loads(self.cli('show', 'newer', '--json').stdout)['scheduling']
+        self.assertEqual((queued['running'], queued['global_running'], queued['eligible_ready']), (0, 1, 0))
+        self.assertEqual(queued['wait_reason'], 'capacity')
+        self.assertEqual(json.loads(budget.read_text())['used'], 0)
+        first = self.starts()[0]
+        (self.control / f"{first['pid']}.release").touch()
+        self.until(lambda: len(self.starts()) == 2)
+        self.assertIn('newer-', max(self.starts(), key=lambda row: row['started'])['prompt'])
+        deadline = time.monotonic() + 10
+        while (older.poll() is None or newer.poll() is None) and time.monotonic() < deadline:
+            active = [row for row in self.starts()
+                      if not (self.control / f"{row['pid']}.release").exists()]
+            self.assertLessEqual(len(active), 1)
+            for row in active:
+                (self.control / f"{row['pid']}.release").touch()
+            time.sleep(0.03)
+        for process in (older, newer):
+            stdout, stderr = process.communicate(timeout=3)
+            self.assertEqual(process.returncode, 0, stdout + stderr)
+            self.assertNotIn(endpoint['scope'], stdout + stderr)
+        self.assertEqual(len(self.starts()), 5)
+        self.assertEqual(json.loads(budget.read_text())['used'], 2)
+        for name in ('older', 'newer'):
+            history = (self.root / name / 'run/scheduling.jsonl').read_text()
+            self.assertNotIn(endpoint['scope'], history)
+            self.assertLessEqual(max(json.loads(line)['global_running'] for line in history.splitlines()), 1)
+
+    def test_busy_local_endpoint_does_not_block_distinct_endpoint_or_provider(self):
+        for name, count, provider in [('held', 2, 'local'), ('other', 1, 'local'),
+                                      ('remote', 2, 'openai-codex')]:
+            self.prepare(name, count, provider=provider)
+        held = self.launch('held', endpoint={'scope': 'a' * 64, 'capacity': 1})
+        self.until(lambda: len(self.starts()) >= 1)
+        other = self.launch('other', endpoint={'scope': 'b' * 64, 'capacity': 1})
+        remote = self.launch('remote')
+        self.until(lambda: len(self.starts()) >= 4)
+        time.sleep(0.2)
+        starts = self.starts()
+        self.assertEqual({name: sum(name + '-' in row['prompt'] for row in starts)
+                          for name in ('held', 'other', 'remote')},
+                         {'held': 1, 'other': 1, 'remote': 2})
+        status = json.loads(self.cli('show', 'held', '--json').stdout)['scheduling']
+        self.assertEqual((status['global_running'], status['global_limit']), (4, 30))
+        self.assertEqual((status['wait_reason'], status['eligible_ready']), ('capacity', 0))
+        deadline = time.monotonic() + 10
+        while any(process.poll() is None for process in (held, other, remote)) and time.monotonic() < deadline:
+            for row in self.starts():
+                (self.control / f"{row['pid']}.release").touch()
+            time.sleep(0.03)
+        for process in (held, other, remote):
+            stdout, stderr = process.communicate(timeout=3)
+            self.assertEqual(process.returncode, 0, stdout + stderr)
+
+    def test_invalid_endpoint_metadata_refuses_launch_without_spending(self):
+        self.prepare('invalid', 2, provider='local')
+        budget = self.root / 'budget.json'
+        budget.write_text(json.dumps({'schema_version': 1, 'limit': 2, 'used': 0}))
+        private_url = 'http://127.0.0.1:54321'
+        process = self.launch('invalid', '--attempt-budget', str(budget),
+                              endpoint={'scope': private_url, 'capacity': 1})
+        stdout, stderr = process.communicate(timeout=8)
+        self.assertNotEqual(process.returncode, 0)
+        self.assertIn('endpoint admission metadata unavailable', stderr)
+        self.assertNotIn(private_url, stdout + stderr)
+        self.assertEqual(self.starts(), [])
+        self.assertEqual(json.loads(budget.read_text())['used'], 0)
+        self.assertEqual(json.loads(self.cli('show', 'invalid', '--json').stdout)
+                         ['summary']['unrun'], 2)
+
+    def test_loaded_previous_coordinator_keeps_dispatching_beside_busy_endpoint(self):
+        # Use the released coordinator before endpoint admission support, with
+        # its real shared-state eligibility rules, not a modified test scheduler.
+        archive = subprocess.run(['git', 'archive', 'e3dea03e2b4412465d5de40422ee907054a0e4b5',
+                                  'experiment_runner', 'bin/experiment-runner'],
+                                 cwd=ROOT, capture_output=True, check=True).stdout
+        legacy = self.root / 'previous-release'
+        legacy.mkdir()
+        with tarfile.open(fileobj=io.BytesIO(archive)) as source:
+            source.extractall(legacy, filter='data')
+        self.prepare('remote', 40)
+        self.prepare('local', 2, provider='local')
+        remote = subprocess.Popen([str(legacy / 'bin/experiment-runner'), 'run', 'remote'],
+            cwd=self.root, env=self.env, text=True, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, start_new_session=True)
+        self.processes.append(remote)
+        self.until(lambda: len(self.starts()) == 30)
+        local = self.launch('local', endpoint={'scope': 'a' * 64, 'capacity': 1})
+        self.until(lambda: json.loads(self.cli('show', 'local', '--json').stdout)
+                   ['scheduling'].get('ready') == 2)
+        held = sorted(self.starts(), key=lambda row: row['started'])
+        (self.control / f"{held[0]['pid']}.release").touch()
+        self.until(lambda: any('local-' in row['prompt'] for row in self.starts()))
+        (self.control / f"{held[1]['pid']}.release").touch()
+        self.until(lambda: sum('remote-' in row['prompt'] for row in self.starts()) == 31)
+        self.assertEqual(sum('local-' in row['prompt'] for row in self.starts()), 1)
+        deadline = time.monotonic() + 12
+        while (remote.poll() is None or local.poll() is None) and time.monotonic() < deadline:
+            for row in self.starts():
+                (self.control / f"{row['pid']}.release").touch()
+            time.sleep(0.03)
+        for process in (remote, local):
+            stdout, stderr = process.communicate(timeout=3)
+            self.assertEqual(process.returncode, 0, stdout + stderr)
 
     def test_global_limit_fair_newcomer_and_live_queued_status(self):
         self.prepare('older', 60)

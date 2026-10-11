@@ -21,7 +21,11 @@ if "--version" in sys.argv:
     print("oracle-model-runner/1 pi-ai/fixture")
     raise SystemExit(0)
 if "--identity" in sys.argv:
-    print(json.dumps({"runner_version": "oracle-model-runner/1", "runner_sha256": "e" * 64, "pi_ai_version": "fixture"}))
+    print(json.dumps({"runner_version": "oracle-model-runner/1", "runner_sha256": "e" * 64, "pi_ai_version": "fixture",
+                      **({'endpoint_admission': True} if os.environ.get('FAKE_RUNNER_ADMISSION') else {})}))
+    raise SystemExit(0)
+if sys.argv[1:] == ['admission']:
+    print(os.environ['FAKE_RUNNER_ADMISSION'])
     raise SystemExit(0)
 
 request = json.loads(sys.stdin.read())
@@ -164,6 +168,7 @@ import hashlib
 valid = os.environ.get("FAKE_RUNNER_MISSING_COMPLETION") != "1"
 result = {
     "provider": request["provider"], "model": request["model"],
+    "transport": request.get("transport", "sse"),
     "reasoning": request["reasoning"], "runner_version": "oracle-model-runner/1",
     "runner_sha256": "e" * 64, "pi_ai_version": "fixture",
     "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),

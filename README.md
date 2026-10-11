@@ -66,8 +66,9 @@ Remove `runner.concurrency` from new specs. Historical plans/configs remain
 readable and keep that field unchanged; it does not control dispatch.
 
 When several experiments have requests ready, the next freed slot goes to the
-experiment with fewer running requests, rotating equal contenders. One run can
-use all 30; two sustained runs balance near 15 each, three near 10. A newcomer
+experiment with fewer running requests, rotating equal contenders. When worker
+endpoint capacity permits, one run can use all 30; two sustained runs balance
+near 15 each, three near 10. A newcomer
 gets freed slots until it catches up; running requests are never preempted.
 Unused shares can be borrowed. Fairness is between experiments, rather than
 between agents or token budgets.
@@ -81,6 +82,19 @@ checks its admission against the selected scopes again before sending. Scope
 failure stops dispatch; changed scopes refuse the request. Custom workers
 without this capability still share the 30 slots. They do not gain native
 account/transport discovery by declaring a provider name.
+
+A worker can also advertise `endpoint_admission: true` in `--identity` and
+implement the read-only `admission` command. It returns a hashed endpoint
+`scope` and the endpoint's fixed integer `capacity` (1 through 30), without
+inference. The runner discovers this metadata once per batch and enforces that
+capacity across experiments using the same endpoint in the existing shared
+queue. A serial local worker reports capacity one. Endpoint waiting happens
+before worker launch, attempt reservation and the active-request timeout;
+distinct endpoints and provider requests remain eligible for global slots.
+Malformed or unavailable advertised metadata refuses dispatch. Endpoint hashes
+stay in the private admission state; operational history and status expose only
+counts and the existing `capacity` wait reason. There is no public capacity or
+concurrency override.
 
 Existing account/transport cooldowns and gradual recovery can reduce the
 effective capacity below 30. Queued work consumes no attempt reservation;
@@ -110,8 +124,9 @@ a known cooldown deadline, not a predicted provider completion time.
 waiting for a prefix warmup or still preparing. `ready` counts requests that
 have reached admission; it includes requests held by capacity or backoff.
 `eligible_ready` excludes requests held by account/transport/retry backoff,
-recovery limits or a requested pause. It does not exclude capacity or fairness
-waiting. `global_ready` and `global_eligible_ready` sum those counts across
+recovery limits, occupied endpoint capacity or a requested pause. It includes
+global capacity and fairness waiting. `global_ready` and
+`global_eligible_ready` sum those counts across
 experiments. A ready warmup counts as one request; its waiting comparisons do
 not become ready until warming finishes.
 

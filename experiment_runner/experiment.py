@@ -1307,7 +1307,11 @@ def parser():
   Capacity is automatic: no concurrency flag or runner.concurrency in new specs.
   Historical concurrency fields stay frozen but do not control dispatch.
   Ready experiments share freed slots fairly; unused shares can be borrowed.
-  One run can use 30, two sustained runs balance near 15 each, three near 10.
+  When endpoint capacity permits, one run can use 30, two sustained runs balance
+  near 15 each, three near 10. Fixed native endpoint limits can reduce admission;
+  a serial local endpoint admits one request across experiments using it.
+  Endpoint metadata is discovered without inference before worker launch.
+  Distinct endpoints and provider requests remain eligible for global slots.
   Running requests finish normally; a newcomer receives the next freed slots.
   Account/transport backoff and gradual recovery can reduce capacity below 30.
   Workers launch only after admission; queued cases consume no attempt budget.
@@ -1327,8 +1331,9 @@ def parser():
   not a provider ETA. Interrupted admissions are cleaned by process identity;
   saved receipts and conservative attempt reservations remain authoritative.
   queued includes unfinished cases still preparing or waiting for warming.
-  ready counts requests at admission; eligible_ready excludes pause, backoff
-  and recovery limits, but includes capacity/fairness waiting. global_ready
+  ready counts requests at admission; eligible_ready excludes pause, backoff,
+  recovery limits and occupied endpoint capacity, but includes global capacity
+  and fairness waiting. global_ready
   and global_eligible_ready sum across experiments. Ready warmups count once.
   Timestamped history: EXPERIMENT/run/scheduling.jsonl, beside scheduling.json.
   Each observation retains observed_at_utc, monotonic_seconds, boot_id, counts

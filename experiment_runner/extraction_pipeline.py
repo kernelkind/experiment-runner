@@ -1056,6 +1056,8 @@ def _runner_identity(
     _expect_sha256(identity.get("runner_sha256"), "runner_sha256")
     if 'request_code_sha256' in identity:
         _expect_sha256(identity['request_code_sha256'], 'request_code_sha256')
+    if 'endpoint_admission' in identity and type(identity['endpoint_admission']) is not bool:
+        raise RunnerError('runner endpoint_admission capability must be a boolean')
     return identity
 
 
@@ -2008,6 +2010,29 @@ def _experiment_scope_loader(config, stage):
     return load_scopes
 
 
+def _experiment_endpoint_loader(config, identity):
+    """Read trusted worker endpoint capacity before launch, without inference."""
+    if identity.get('endpoint_admission') is not True:
+        return None
+    def load_endpoint():
+        try:
+            completed = subprocess.run([str(config.runner_binary), 'admission'],
+                text=True, capture_output=True, env=_runner_environment(), timeout=30)
+            if completed.returncode != 0:
+                raise ValueError('endpoint metadata command failed')
+            endpoint = _expect_object(json.loads(completed.stdout), 'endpoint admission')
+            _expect_fields(endpoint, 'endpoint admission', {'scope', 'capacity'})
+            _expect_sha256(endpoint['scope'], 'endpoint scope')
+            if type(endpoint['capacity']) is not int or not 1 <= endpoint['capacity'] <= scheduling.LIMIT:
+                raise ValueError('invalid endpoint capacity')
+        except (ValueError, RunnerError, subprocess.SubprocessError, OSError) as error:
+            raise ExperimentAdmissionUnavailable(
+                'Experiment endpoint admission metadata unavailable; no worker started') from error
+        return endpoint
+    from experiment_runner import scheduling
+    return load_endpoint
+
+
 def _same_json(left: Any, right: Any) -> bool:
     if isinstance(left, dict) and isinstance(right, dict):
         return left.keys() == right.keys() and all(
@@ -2896,8 +2921,10 @@ def _run_job(
         # stages use that same host queue, never a separate concurrency pool.
         queue = None
         if scheduling.current_slot() is None:
+            identity = _runner_identity(config)
             queue = scheduling.ExperimentQueue(config.run_directory, 1,
-                scope_loader=_experiment_scope_loader(config, stage), worker_identity=_runner_identity(config))
+                scope_loader=_experiment_scope_loader(config, stage),
+                endpoint_loader=_experiment_endpoint_loader(config, identity), worker_identity=identity)
             admission.callback(queue.close)
             admission.enter_context(queue.slot(job_key, config.timeout_seconds))
         admitted_queue = scheduling.active_queue() or queue
@@ -3797,7 +3824,8 @@ def _execute_prompt_batch(
                          if attempt_budget_path is not None else None)
     owned_queue = request_queue is None
     queue = request_queue or scheduling.ExperimentQueue(config.run_directory, len(config.prompts),
-        scope_loader=_experiment_scope_loader(config, config), worker_identity=worker_identity)
+        scope_loader=_experiment_scope_loader(config, config),
+        endpoint_loader=_experiment_endpoint_loader(config, worker_identity), worker_identity=worker_identity)
     if not owned_queue:
         queue.extend(len(config.prompts))
     (config.run_directory / "output.json").unlink(missing_ok=True)
