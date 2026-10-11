@@ -304,6 +304,47 @@ class SchedulingTests(unittest.TestCase):
         self.assertIn('observed_at_utc=', stderr)
         self.assertIn('ready=', stderr)
 
+    def test_stream_retry_waits_without_holding_fresh_or_active_cases(self):
+        self.prepare('retry', 31)
+        self.env['FAKE_RUNNER_FAILURES'] = json.dumps({'retry-0': {
+            'attempts': 1, 'metadata': {'http_status': 200, 'proxy_status': {
+                'state': 'unknown', 'request_context': 'active', 'error_phase': 'body',
+                'read_error_kind': 'http2_stream_error', 'read_error_code': 'internal_error'},
+                'transport_error': {'phase': 'body'}}}})
+        stdout_path, stderr_path = self.root / 'retry.stdout', self.root / 'retry.stderr'
+        stdout_file, stderr_file = stdout_path.open('w'), stderr_path.open('w')
+        self.addCleanup(stdout_file.close)
+        self.addCleanup(stderr_file.close)
+        process = subprocess.Popen([str(CLI), 'run', 'retry', '--max-new-attempts', '32'],
+            cwd=self.root, env=self.env, stdout=stdout_file, stderr=stderr_file, start_new_session=True)
+        self.processes.append(process)
+        self.until(lambda: len(self.starts()) == 30)
+        failed = next(row for row in self.starts() if row['prompt'].endswith('retry-0'))
+        (self.control / f"{failed['pid']}.release").touch()
+        # The remaining case must use the freed slot before the two-second
+        # retry deadline. The other 29 requests stay active at their barriers.
+        deadline = time.monotonic() + 1.5
+        while time.monotonic() < deadline:
+            if any(row['prompt'].endswith('retry-30') for row in self.starts()):
+                break
+            time.sleep(.01)
+        self.assertTrue(any(row['prompt'].endswith('retry-30') for row in self.starts()),
+                        'a request-local retry delay held the whole batch')
+        self.assertEqual(sum(row['prompt'].endswith('retry-0') for row in self.starts()), 1,
+                         'the failed request retried before its deadline')
+        self.assertEqual(sum(not (self.control / f"{row['pid']}.release").exists()
+                             for row in self.starts()), 30)
+        deadline = time.monotonic() + 10
+        while process.poll() is None and time.monotonic() < deadline:
+            for row in self.starts():
+                (self.control / f"{row['pid']}.release").touch()
+            time.sleep(.03)
+        process.wait(timeout=3)
+        self.assertEqual(process.returncode, 0, stdout_path.read_text() + stderr_path.read_text())
+        self.assertEqual(len(self.starts()), 32)
+        report = json.loads(self.cli('show', 'retry', '--json').stdout)
+        self.assertEqual(report['summary']['valid'], 31)
+
     def test_history_distinguishes_recovery_block_from_healthy_ready_work(self):
         from experiment_runner import scheduling
         account = {'account': 'a' * 64, 'transport': 'b' * 64}
@@ -316,8 +357,8 @@ class SchedulingTests(unittest.TestCase):
             healthy = scheduling.ExperimentQueue(self.root / 'healthy', 1, scopes=other)
             ticket = recovering.gate.try_acquire(account, concurrency=30, timeout_seconds=30,
                                                   owner_pid=os.getpid())['ticket']
-            recovering.gate.report(ticket, {'status': 'failed', 'exit_code': 1, 'error': 'HTTP 503',
-                'model_result': {'stop_reason': 'error', 'response_metadata': {'http_status': 503}}})
+            recovering.gate.report(ticket, {'status': 'failed', 'exit_code': 1, 'error': 'HTTP 429',
+                'model_result': {'stop_reason': 'error', 'response_metadata': {'http_status': 429}}})
             thread_errors = []
             def second_request():
                 try:

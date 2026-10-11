@@ -1314,6 +1314,14 @@ def parser():
   Distinct endpoints and provider requests remain eligible for global slots.
   Running requests finish normally; a newcomer receives the next freed slots.
   Account/transport backoff and gradual recovery can reduce capacity below 30.
+  Shared backoff needs rate/overload, valid Retry-After or connection evidence.
+  Ordinary stream/server errors delay only that case's retry; fresh work runs.
+  Active requests finish normally. Late in-flight failures share one cooldown
+  generation, except explicit Retry-After deadlines. Recovery starts at one
+  request and doubles after successful completions; new pressure can slow it.
+  Cases keep at most two lifetime attempts, including saved attempts on resume.
+  Old receipts do not recreate an outage. Invalid or >60s Retry-After prevents
+  automatic retry. Measure successful completions/minute, failures and retry cost.
   Workers launch only after admission; queued cases consume no attempt budget.
   Warmups and retries share the same slots/budget. Reused answers need neither.
   Eligible prefixes warm before comparisons, within the run's fair share.
@@ -1324,13 +1332,13 @@ def parser():
   scheduling reports queued/ready/running/valid/failed/reused, global_running out of
   global_limit: 30, and wait_reason (capacity, fair_share, account_backoff,
   transport_backoff, provider_backoff, recovery_limit, prefix_warmup or ready).
-  provider_backoff is a batch's retry delay, without inventing an account cause.
+  provider_backoff is a batch's shared-pressure delay.
   queue_wait_seconds is the longest admission wait, excluding worker execution
   and earlier preparation. running_elapsed_seconds is the oldest current
   admission's elapsed time. cooldown_until_utc is a known cooldown deadline,
   not a provider ETA. Interrupted admissions are cleaned by process identity;
   saved receipts and conservative attempt reservations remain authoritative.
-  queued includes unfinished cases still preparing or waiting for warming.
+  queued includes unfinished cases preparing, waiting for warming or retry time.
   ready counts requests at admission; eligible_ready excludes pause, backoff,
   recovery limits and occupied endpoint capacity, but includes global capacity
   and fairness waiting. global_ready

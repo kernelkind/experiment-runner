@@ -17,9 +17,9 @@ import time
 GLOBAL_REQUEST_LIMIT = 30
 
 try:
-    from .extraction_pipeline import provider_cooldown_required, _provider_retry_after_delay
+    from .extraction_pipeline import provider_cooldown_scope, _provider_retry_after_delay
 except ImportError:
-    from extraction_pipeline import provider_cooldown_required, _provider_retry_after_delay
+    from extraction_pipeline import provider_cooldown_scope, _provider_retry_after_delay
 
 
 def process_start(pid):
@@ -199,10 +199,7 @@ class SharedProviderBackoff:
         result = record.get('model_result') or {}
         metadata = result.get('response_metadata') or {}
         proxy = metadata.get('proxy_status') or {}
-        cooldown = provider_cooldown_required(record)
-        role = 'transport' if isinstance(proxy, dict) and proxy.get('read_error_kind') in {
-            'http2_goaway', 'http2_connection_error', 'unexpected_eof', 'connection_reset',
-            'connection_closed', 'broken_pipe', 'network_error'} else 'account'
+        role = provider_cooldown_scope(record)
         completed = (not metadata.get('abort_reason') and
             (metadata.get('terminal_event') == 'response.completed'
              or isinstance(proxy, dict) and (proxy.get('terminal_event') == 'completed'
@@ -214,17 +211,24 @@ class SharedProviderBackoff:
                 return {'reported': False}
             for key, generation in ticket['generations'].items():
                 value = state['scopes'][key]
-                if cooldown and key.startswith(role + ':'):
-                    if not value['seconds'] or generation == value['generation']:
+                if role and key.startswith(role + ':'):
+                    if generation == value['generation']:
                         value['seconds'] = min(60, max(2, value['seconds'] * 2))
                         value['generation'] += 1
                         # A previous larger run must not set this run's recovery
                         # ceiling after its workers have drained.
                         value['ceiling'] = max([ticket['concurrency'], *(other['concurrency']
                             for other in state['tickets'].values() if key in other['generations'])])
-                    value['until'] = max(value['until'], now + max(
-                        value['seconds'], _provider_retry_after_delay(record) or 0))
-                    value['limit'], value['successes'] = 1, 0
+                        value['until'] = max(value['until'], now + max(
+                            value['seconds'], _provider_retry_after_delay(record) or 0))
+                        value['limit'], value['successes'] = 1, 0
+                    elif metadata.get('retry_after') is not None:
+                        # Older requests belong to an already counted outage.
+                        # Only an explicit server deadline can extend its wait;
+                        # they cannot undo capacity recovered by newer requests.
+                        delay = _provider_retry_after_delay(record)
+                        if delay is not None:
+                            value['until'] = max(value['until'], now + delay)
                     value['updated'] = now
                 elif (completed and generation == value['generation']
                         and ticket['started'] >= value['until']

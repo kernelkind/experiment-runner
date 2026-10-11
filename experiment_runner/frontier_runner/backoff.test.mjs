@@ -129,10 +129,14 @@ test('large transport diagnostics cannot overflow the shared failure report', as
   assert.equal(result.response_metadata.transport_error.phase, 'headers');
   const state = JSON.parse(await readFile(join(directory, 'state.json'), 'utf8'));
   assert.equal(Object.keys(state.tickets).length, 0);
-  assert.equal(Object.values(state.scopes).filter(scope => scope.seconds === 2).length, 1);
+  assert.ok(Object.values(state.scopes).every(scope => scope.seconds === 0),
+    'an unknown request error triggered shared backoff');
 });
 
-test('experiment execution retrieves an upstream GOAWAY and shares admission before the next request', async t => {
+for (const [name, kind, code] of [
+  ['connection pressure pauses shared admission', 'http2_goaway', 'enhance_your_calm'],
+  ['ordinary stream failure leaves shared admission open', 'http2_stream_error', 'internal_error'],
+]) test(`native execution: ${name}`, async t => {
   const directory = await mkdtemp(join(tmpdir(), 'oracle-backoff-native-'));
   const previous = process.env.ORACLE_EXPERIMENT_BACKOFF_DIRECTORY;
   process.env.ORACLE_EXPERIMENT_BACKOFF_DIRECTORY = directory;
@@ -160,7 +164,7 @@ test('experiment execution retrieves an upstream GOAWAY and shares admission bef
       response.setHeader('Content-Type', 'application/json');
       response.end(JSON.stringify({ schema: 1, request_id: reference, state: 'unknown',
         error_phase: 'body', http_status: 200,
-        read_error_kind: 'http2_goaway', read_error_code: 'enhance_your_calm',
+        read_error_kind: kind, read_error_code: code,
         request_context: 'active', PRIVATE_FIELD: 'PRIVATE_SERVER_DATA' }));
       return;
     }
@@ -190,16 +194,23 @@ test('experiment execution retrieves an upstream GOAWAY and shares admission bef
   request.model = { ...request.model, baseUrl: `http://127.0.0.1:${server.address().port}/fixture/pi` };
   const failed = await execute(request, { apiKey: key, experimentConcurrency: 2 });
   assert.equal(failed.valid, false);
-  assert.equal(failed.response_metadata.proxy_status?.read_error_code, 'enhance_your_calm');
+  assert.equal(failed.response_metadata.proxy_status?.read_error_code, code);
   assert.equal(failed.response_metadata.transport_error?.cause?.code, 'UND_ERR_SOCKET');
   assert.equal(failed.http_attempts, 1);
   assert.equal(lookups, 1);
+  if (kind === 'http2_stream_error') {
+    const state = JSON.parse(await readFile(join(directory, 'state.json'), 'utf8'));
+    assert.ok(Object.values(state.scopes).every(scope => !scope.seconds && !scope.limit),
+      'the sanitized stream error imposed account/transport recovery');
+  }
   const recovered = await execute(request, { apiKey: key, experimentConcurrency: 2 });
   assert.equal(recovered.valid, true, JSON.stringify(recovered));
   assert.equal(recovered.response_metadata.terminal_event, 'response.completed');
   assert.equal(recovered.http_attempts, 1);
   assert.equal(lookups, 1, 'successful completion made an unnecessary status lookup');
-  assert.ok(starts[1] - starts[0] >= 1900, 'new request bypassed the shared cooldown');
+  if (kind === 'http2_goaway') {
+    assert.ok(starts[1] - starts[0] >= 1900, 'new request bypassed the shared cooldown');
+  }
   assert.equal(recovered.response_metadata.abort_reason, undefined, 'queue wait consumed the request timeout');
   assert.ok(!JSON.stringify([failed, recovered]).includes('PRIVATE_SERVER_DATA'));
   assert.ok(!JSON.stringify([failed, recovered]).includes(key));

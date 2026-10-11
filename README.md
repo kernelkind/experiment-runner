@@ -97,7 +97,26 @@ counts and the existing `capacity` wait reason. There is no public capacity or
 concurrency override.
 
 Existing account/transport cooldowns and gradual recovery can reduce the
-effective capacity below 30. Queued work consumes no attempt reservation;
+effective capacity below 30 when there is explicit rate-limit/overload evidence,
+a valid `Retry-After`, or a verified connection failure. HTTP/2 stream
+`INTERNAL_ERROR` and generic server errors without those signals delay only
+the failed request's retry. Fresh cases keep using free slots, and active
+requests finish normally. Unknown transport errors do not establish shared
+pressure or automatic retry eligibility.
+
+Shared pressure keeps the bounded 2/4/8/.../60-second backoff and gradual
+recovery: start with one new request, then double the admission limit after
+that many successful completions. Failures from requests already in flight
+share one backoff generation; a late failure does not restart recovery or
+extend the wait unless it carries an explicit `Retry-After`. A new failure
+during recovery can increase backoff. Resume does not recreate a new outage
+from an old receipt. Retry eligibility remains separate: each case gets at
+most two lifetime attempts, with a minimum two-second retry delay honoring
+`Retry-After`; delays over 60 seconds or invalid headers prevent an automatic
+retry. Observe successful completions per minute alongside failure counts,
+retry usage/cost and admission history when assessing actual throughput.
+
+Queued work consumes no attempt reservation;
 once admitted, existing conservative accounting remains in force. Failed or
 interrupted reservations are never refunded. Exact-answer reuse consumes no
 slot, warmup or new attempt. A prefix warmup competes within its experiment's
@@ -113,17 +132,18 @@ experiment-runner show target/example-v1 --json
 The `scheduling` object includes queued/ready/running/valid/failed/reused counts,
 `global_running` out of `global_limit: 30`, per-admission case status and a
 `wait_reason`: `capacity`, `fair_share`, `account_backoff`, `transport_backoff`,
-`provider_backoff` (a batch's retry delay), `recovery_limit`, `prefix_warmup` or
-`ready`. `queue_wait_seconds` is the longest
+`provider_backoff` (a batch's shared-pressure delay), `recovery_limit`,
+`prefix_warmup` or `ready`. `queue_wait_seconds` is the longest
 observed/current admission wait; it excludes worker execution and preparation
 before entering admission. `running_elapsed_seconds` is the oldest current
 admission's elapsed time, including worker startup. `cooldown_until_utc` records
 a known cooldown deadline, not a predicted provider completion time.
 
 `queued` includes all unfinished cases that are not admitted, including cases
-waiting for a prefix warmup or still preparing. `ready` counts requests that
-have reached admission; it includes requests held by capacity or backoff.
-`eligible_ready` excludes requests held by account/transport/retry backoff,
+waiting for a prefix warmup, their own retry deadline, or still preparing.
+`ready` counts requests that have reached admission; it includes requests held
+by capacity or backoff.
+`eligible_ready` excludes requests held by account/transport/batch backoff,
 recovery limits, occupied endpoint capacity or a requested pause. It includes
 global capacity and fairness waiting. `global_ready` and
 `global_eligible_ready` sum those counts across

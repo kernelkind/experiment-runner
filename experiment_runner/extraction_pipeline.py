@@ -20,6 +20,7 @@ import sys
 import tempfile
 import threading
 import time
+from collections import deque
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field, replace
@@ -3710,26 +3711,42 @@ def prompt_failure_kind(record: dict[str, Any]) -> str:
     return "unknown"
 
 
-def provider_cooldown_required(record: dict[str, Any]) -> bool:
-    """Transport breaks pause launches even when their cause cannot justify a retry."""
+def provider_cooldown_scope(record: dict[str, Any]) -> str | None:
+    """Shared pressure requires explicit rate/overload or connection evidence."""
     kind = prompt_failure_kind(record)
-    if kind == "provider_transient":
-        return True
-    if kind != "unknown":
-        return False
+    if kind in ("local", "provider_fatal"):
+        return None
     result = record.get("model_result") or {}
     if not isinstance(result, dict):
-        return False
+        return None
     metadata = result.get("response_metadata") or {}
     if not isinstance(metadata, dict):
-        return False
+        return None
+    error = metadata.get("error") or {}
+    code = error.get("code") if isinstance(error, dict) else None
+    if metadata.get("http_status") in (429, "429") or code in (
+            429, "429", "rate_limit_exceeded", "usage_limit_reached", "server_is_overloaded"):
+        return "account"
     proxy = metadata.get("proxy_status") or {}
-    if (isinstance(proxy, dict) and proxy.get("state") in ("canceled", "deadline_exceeded")
-            and proxy.get("request_context") in ("canceled", "deadline_exceeded")):
-        return False
-    transport = metadata.get("transport_error") or {}
-    return (isinstance(transport, dict) and transport.get("phase") in ("headers", "body")
-            and result.get("stop_reason") in ("error", "aborted"))
+    if (kind == "provider_transient" and isinstance(proxy, dict)
+            and proxy.get("state") == "unknown" and proxy.get("request_context") == "active"
+            and proxy.get("error_phase") in ("headers", "body")
+            and not proxy.get("terminal_event")):
+        if proxy.get("read_error_kind") in (
+                "http2_goaway", "http2_connection_error", "unexpected_eof", "connection_reset",
+                "connection_closed", "broken_pipe", "network_error"):
+            return "transport"
+        if (proxy.get("read_error_kind") == "http2_stream_error"
+                and proxy.get("read_error_code") == "enhance_your_calm"):
+            return "account"
+    if (kind == "provider_transient" and metadata.get("retry_after") is not None
+            and _provider_retry_after_delay(record) is not None):
+        return "account"
+    return None
+
+
+def provider_cooldown_required(record: dict[str, Any]) -> bool:
+    return provider_cooldown_scope(record) is not None
 
 
 def _provider_retry_after_delay(record: dict[str, Any]) -> float | None:
@@ -3910,22 +3927,29 @@ def _execute_prompt_batch(
             raise AssertionError("successful prompt job returned structured output")
         return {"prompt_id": prompt.prompt_id, "response": response}
 
-    ready = []
+    ready = []  # Scheduled retries, ordered by their individual deadlines.
+    fresh = deque()
     responses = {}
     failures = []
     fatal = False
     paused = False
     backoff_seconds = 0.0
     backoff_until = 0.0
+    backoff_started = 0.0
 
-    def backoff(record: dict[str, Any], now: float) -> None:
-        nonlocal backoff_seconds, backoff_until
-        # Failures already in flight share the current wait. A failure after
-        # that wait doubles it, including cases with no retry remaining.
-        if now >= backoff_until:
+    def backoff(record: dict[str, Any], now: float, submitted_at: float) -> None:
+        nonlocal backoff_seconds, backoff_until, backoff_started
+        # Already submitted requests share one outage. Only a newer request
+        # establishes a new failure; an older one may carry a server deadline.
+        if submitted_at >= backoff_started:
             backoff_seconds = min(60.0, max(2.0, backoff_seconds * 2))
-        backoff_until = max(backoff_until, now + max(
-            backoff_seconds, _provider_retry_after_delay(record) or 0.0))
+            backoff_started = now
+            backoff_until = max(backoff_until, now + max(
+                backoff_seconds, _provider_retry_after_delay(record) or 0.0))
+        elif (record.get("model_result") or {}).get("response_metadata", {}).get("retry_after") is not None:
+            delay = _provider_retry_after_delay(record)
+            if delay is not None:
+                backoff_until = max(backoff_until, now + delay)
         queue.cooldown(backoff_until)
 
     for index, prompt in enumerate(config.prompts):
@@ -3933,42 +3957,46 @@ def _execute_prompt_batch(
         if previous is not None and previous["status"] == "failed":
             kind = prompt_failure_kind(previous)
             now = time.monotonic()
-            if provider_cooldown_required(previous):
-                backoff(previous, now)
+            # Resume retains the actual shared cooldown. An old receipt is not
+            # evidence of a new outage starting when this coordinator restarts.
             delay = provider_retry_delay(previous)
             if delay is not None:
                 retry_at = now + delay
-                backoff_until = max(backoff_until, retry_at)
                 heapq.heappush(ready, (retry_at, index, prompt))
             else:
                 failures.append(f"{prompt.prompt_id}: {previous.get('error')}")
                 fatal |= kind == "provider_fatal"
                 queue.completed(failed=True, warmup=not owned_queue)
         else:
-            heapq.heappush(ready, (float("inf"), index, prompt))
-    # Keep at most concurrency futures. Provider backoff gates retries and fresh
-    # cases together; slow calls and local failures remain independent. Due
-    # retries precede untouched cases. Each case still has two lifetime attempts.
+            fresh.append((index, prompt))
+    # A due retry takes priority; while it waits, fresh cases can use free slots.
+    # Only shared-pressure evidence delays the batch. Each case still has two
+    # lifetime attempts, including attempts retained across resume.
     try:
         with ThreadPoolExecutor(max_workers=concurrency) as pool:
             try:
                 active = {}
-                while active or (not fatal and ready):
+                while active or (not fatal and (ready or fresh)):
                     try:
                         queue.check_pause()
                     except ExperimentPaused:
                         paused = fatal = True
-                    while (ready and len(active) < concurrency and not fatal
+                    while ((ready or fresh) and len(active) < concurrency and not fatal
                            and time.monotonic() >= backoff_until):
-                        _, index, prompt = heapq.heappop(ready)
+                        if ready and ready[0][0] <= time.monotonic():
+                            _, index, prompt = heapq.heappop(ready)
+                        elif fresh:
+                            index, prompt = fresh.popleft()
+                        else:
+                            break
                         previous = latest.get("prompt:" + prompt.prompt_id)
                         submitted_at = time.monotonic()
                         active[pool.submit(execute, prompt)] = (index, prompt, previous, submitted_at)
                     now = time.monotonic()
                     launch_at = None
                     if not fatal and len(active) < concurrency:
-                        if ready:
-                            launch_at = max(now, backoff_until)
+                        if fresh or ready:
+                            launch_at = max(backoff_until, now if fresh else ready[0][0])
                     if not active:
                         if launch_at is not None:
                             queue.progress()
@@ -4004,11 +4032,10 @@ def _execute_prompt_batch(
                             kind = prompt_failure_kind(record)
                             now = time.monotonic()
                             if provider_cooldown_required(record) and not fatal:
-                                backoff(record, now)
+                                backoff(record, now, submitted_at)
                             delay = provider_retry_delay(record)
                             if delay is not None and not fatal:
                                 retry_at = now + delay
-                                backoff_until = max(backoff_until, retry_at)
                                 heapq.heappush(ready, (retry_at, index, prompt))
                             else:
                                 failures.append(f"{prompt.prompt_id}: {record.get('error')}")
