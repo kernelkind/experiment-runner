@@ -96,7 +96,7 @@ Scheduling adds no prompt, schema, cache-key or request-body changes.
 experiment-runner show target/example-v1 --json
 ```
 
-The `scheduling` object includes queued/running/valid/failed/reused counts,
+The `scheduling` object includes queued/ready/running/valid/failed/reused counts,
 `global_running` out of `global_limit: 30`, per-admission case status and a
 `wait_reason`: `capacity`, `fair_share`, `account_backoff`, `transport_backoff`,
 `provider_backoff` (a batch's retry delay), `recovery_limit`, `prefix_warmup` or
@@ -105,6 +105,39 @@ observed/current admission wait; it excludes worker execution and preparation
 before entering admission. `running_elapsed_seconds` is the oldest current
 admission's elapsed time, including worker startup. `cooldown_until_utc` records
 a known cooldown deadline, not a predicted provider completion time.
+
+`queued` includes all unfinished cases that are not admitted, including cases
+waiting for a prefix warmup or still preparing. `ready` counts requests that
+have reached admission; it includes requests held by capacity or backoff.
+`eligible_ready` excludes requests held by account/transport/retry backoff,
+recovery limits or a requested pause. It does not exclude capacity or fairness
+waiting. `global_ready` and `global_eligible_ready` sum those counts across
+experiments. A ready warmup counts as one request; its waiting comparisons do
+not become ready until warming finishes.
+
+Each run retains append-only operational history at
+`EXPERIMENT/run/scheduling.jsonl` (next to `scheduling.json`). Observations cover
+startup, readiness, admission, release/cancellation, prefix-warmup boundaries,
+batch backoff, periodic progress and completion. Each row captures
+`observed_at_utc`, `monotonic_seconds`, `boot_id`, occupancy, ready counts and
+blocking reasons from the same locked queue state. `experiments` gives each
+active owner's PID, queued/ready/eligible-ready/running/waiting counts,
+`wait_reason`, `pause_reason` and cooldown deadline. `waiting` counts shared
+admission entries; additional ready threads wait locally.
+
+To investigate empty slots, find observations where `global_running < 30`
+and `global_eligible_ready > 0`, then measure the interval until admission or
+a change in eligibility. Startup observations can meet this condition briefly;
+it is not itself proof of a stall. Sort observations by `monotonic_seconds`
+within one `boot_id`: concurrent threads can append captured observations in
+a different order, and monotonic times cannot be compared across host reboots.
+Progress samples are at most once per second; transition observations provide
+finer timing without a new polling service. History writes occur outside the
+host-wide admission lock. It contains counts and opaque owner IDs, not prompts,
+answers, credentials or account/transport scope IDs. Resume appends to the
+history and preserves existing observations and model receipts. Already-loaded
+coordinators begin retaining this history after their next individual restart;
+past readiness cannot be reconstructed from older logs.
 
 The queue uses the existing private provider-backoff state under
 `$XDG_CACHE_HOME/oracle-mvp/provider-backoff` (normally `~/.cache/...`). Process

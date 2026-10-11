@@ -1317,7 +1317,7 @@ def parser():
 
   run prints live counts and wait reasons on stderr. Inspect another terminal:
     experiment-runner show EXPERIMENT --json
-  scheduling reports queued/running/valid/failed/reused, global_running out of
+  scheduling reports queued/ready/running/valid/failed/reused, global_running out of
   global_limit: 30, and wait_reason (capacity, fair_share, account_backoff,
   transport_backoff, provider_backoff, recovery_limit, prefix_warmup or ready).
   provider_backoff is a batch's retry delay, without inventing an account cause.
@@ -1326,6 +1326,20 @@ def parser():
   admission's elapsed time. cooldown_until_utc is a known cooldown deadline,
   not a provider ETA. Interrupted admissions are cleaned by process identity;
   saved receipts and conservative attempt reservations remain authoritative.
+  queued includes unfinished cases still preparing or waiting for warming.
+  ready counts requests at admission; eligible_ready excludes pause, backoff
+  and recovery limits, but includes capacity/fairness waiting. global_ready
+  and global_eligible_ready sum across experiments. Ready warmups count once.
+  Timestamped history: EXPERIMENT/run/scheduling.jsonl, beside scheduling.json.
+  Each observation retains observed_at_utc, monotonic_seconds, boot_id, counts
+  and all active experiments' wait/pause reasons from one locked queue state.
+  Startup/ready/admitted/released/cancelled/warmup/backoff/finished transitions
+  and periodic progress are retained; resume appends without rewriting history.
+  For empty slots, inspect global_running < 30 with global_eligible_ready > 0
+  and measure time until admission or eligibility changes. Brief startup is
+  not proof of a stall. Sort by monotonic_seconds within one boot_id; concurrent
+  appends can arrive out of order. No prompt, output, credential or scope IDs
+  are stored. Loaded coordinators gain history on their next individual restart.
   This controls runner traffic, not the provider's cap or guaranteed chat capacity.
 
   Updates and resume:

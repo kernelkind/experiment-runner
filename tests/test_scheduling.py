@@ -5,6 +5,7 @@ import signal
 from pathlib import Path
 import subprocess
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
@@ -97,6 +98,12 @@ class SchedulingTests(unittest.TestCase):
         self.assertEqual((live['running'], live['queued'], live['global_running'], live['global_limit']),
                          (30, 30, 30, 30))
         self.assertEqual(live['wait_reason'], 'capacity')
+        self.until(lambda: json.loads(self.cli('show', 'newer', '--json').stdout)['scheduling']['ready'] == 30)
+        new_status = json.loads(self.cli('show', 'newer', '--json').stdout)['scheduling']
+        self.assertEqual(new_status['ready'], 30)
+        self.assertEqual(new_status['global_ready'], 30)
+        self.assertEqual(new_status['global_eligible_ready'], 30)
+        self.assertEqual(new_status['experiments'][new_status['owner']]['wait_reason'], 'capacity')
         original = sorted(self.starts(), key=lambda row: row['started'])
         for entry in original[:15]:
             (self.control / f"{entry['pid']}.release").touch()
@@ -142,6 +149,114 @@ class SchedulingTests(unittest.TestCase):
                   for name in ('first', 'second', 'third')}
         self.assertEqual(counts, {'first': 10, 'second': 10, 'third': 10})
         self.assertIsNone(first.poll())
+
+    def test_timestamped_history_records_ready_admitted_and_released_requests(self):
+        self.prepare('sample', 2)
+        process = self.launch('sample')
+        self.until(lambda: len(self.starts()) == 2)
+        history = self.root / 'sample' / 'run' / 'scheduling.jsonl'
+        self.assertTrue(history.exists(), 'admission observations must be retained')
+        live = json.loads(self.cli('show', 'sample', '--json').stdout)['scheduling']
+        self.assertEqual((live['ready'], live['global_ready']), (0, 0))
+        for entry in self.starts():
+            (self.control / f"{entry['pid']}.release").touch()
+        stdout, stderr = process.communicate(timeout=8)
+        self.assertEqual(process.returncode, 0, stdout + stderr)
+        observations = [json.loads(line) for line in history.read_text().splitlines()]
+        self.assertTrue({'started', 'ready', 'admitted', 'released', 'finished'} <=
+                        {row['event'] for row in observations})
+        ready = [row for row in observations if row['event'] == 'ready']
+        self.assertTrue(any(row['ready'] > 0 and row['global_running'] < 30 for row in ready))
+        admissions = [row for row in observations if row['event'] == 'admitted']
+        self.assertEqual(sorted(row['running'] for row in admissions), [1, 2])
+        self.assertTrue(any(row['event'] == 'released' and row['running'] == 0
+                            for row in observations))
+        for row in observations:
+            self.assertEqual(row['schema_version'], 1)
+            self.assertTrue(row['observed_at_utc'].endswith('+00:00'))
+            self.assertGreater(row['monotonic_seconds'], 0)
+            self.assertTrue(row['boot_id'])
+            self.assertEqual(row['global_ready'],
+                             sum(run['ready'] for run in row['experiments'].values()))
+            self.assertEqual(row['global_eligible_ready'],
+                             sum(run['eligible_ready'] for run in row['experiments'].values()))
+            self.assertNotIn('cases', row, 'history records counts, not case input or outputs')
+        self.assertIn('observed_at_utc=', stderr)
+        self.assertIn('ready=', stderr)
+
+    def test_history_distinguishes_recovery_block_from_healthy_ready_work(self):
+        from experiment_runner import scheduling
+        account = {'account': 'a' * 64, 'transport': 'b' * 64}
+        other = {'account': 'c' * 64, 'transport': 'b' * 64}
+        for name in ('recovering', 'healthy'):
+            (self.root / name).mkdir()
+        with patch.dict(os.environ, {'ORACLE_EXPERIMENT_BACKOFF_DIRECTORY':
+                                    str(self.root / 'admission')}):
+            recovering = scheduling.ExperimentQueue(self.root / 'recovering', 2, scopes=account)
+            healthy = scheduling.ExperimentQueue(self.root / 'healthy', 1, scopes=other)
+            ticket = recovering.gate.try_acquire(account, concurrency=30, timeout_seconds=30,
+                                                  owner_pid=os.getpid())['ticket']
+            recovering.gate.report(ticket, {'status': 'failed', 'exit_code': 1, 'error': 'HTTP 503',
+                'model_result': {'stop_reason': 'error', 'response_metadata': {'http_status': 503}}})
+            thread_errors = []
+            def second_request():
+                try:
+                    with recovering.slot('second', 30):
+                        pass
+                except Exception as error:
+                    thread_errors.append(error)
+            with recovering.slot('first', 30):
+                # The first recovery request is admitted after the cooldown.
+                # Its active ticket fills the temporary account limit of one.
+                thread = threading.Thread(target=second_request)
+                thread.start()
+                try:
+                    self.until(lambda: scheduling.snapshot(self.root / 'recovering')['ready'] == 1)
+                    status = scheduling.snapshot(self.root / 'recovering')
+                    self.assertEqual(status['global_running'], 1)
+                    self.assertEqual(status['eligible_ready'], 0)
+                    self.assertEqual(status['wait_reason'], 'recovery_limit')
+                    with healthy.slot('other-account', 30):
+                        history = [json.loads(line) for line in
+                                   (self.root / 'healthy' / 'scheduling.jsonl').read_text().splitlines()]
+                        admitted = next(row for row in history if row['event'] == 'admitted')
+                        blocked = admitted['experiments'][recovering.owner]
+                        self.assertEqual((blocked['ready'], blocked['eligible_ready']), (1, 0))
+                        self.assertEqual(blocked['wait_reason'], 'recovery_limit')
+                        self.assertEqual(admitted['global_running'], 2)
+                        self.assertEqual(admitted['global_eligible_ready'], 0)
+                finally:
+                    if thread_errors:
+                        recovering.stopped.set()
+            thread.join(timeout=4)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(thread_errors, [])
+            recovering.close()
+            healthy.close()
+            history_text = (self.root / 'recovering' / 'scheduling.jsonl').read_text()
+            rows = [json.loads(line) for line in history_text.splitlines()]
+            self.assertTrue(any(row['event'] == 'ready' and row['wait_reason'] == 'recovery_limit'
+                                and row['ready'] == 1 and row['global_eligible_ready'] == 0 for row in rows))
+            self.assertTrue(any(row['event'] == 'progress' and row['wait_reason'] == 'account_backoff'
+                                and row['cooldown_until_utc'] is not None for row in rows))
+            for value in account.values():
+                self.assertNotIn(value, history_text)
+
+    def test_resume_appends_history_without_rewriting_observations_or_receipts(self):
+        self.prepare('sample', 1)
+        self.env.pop('FAKE_RUNNER_CONTROL')
+        self.cli('run', 'sample')
+        history = self.root / 'sample' / 'run' / 'scheduling.jsonl'
+        receipts = history.with_name('results.jsonl')
+        original_history = history.read_bytes()
+        original_receipts = receipts.read_bytes()
+        self.cli('run', 'sample')
+        self.assertTrue(history.read_bytes().startswith(original_history))
+        self.assertGreater(history.stat().st_size, len(original_history))
+        self.assertEqual(receipts.read_bytes(), original_receipts)
+        rows = [json.loads(line) for line in history.read_text().splitlines()]
+        self.assertEqual(len({row['owner'] for row in rows if row['event'] == 'started'}), 2)
+        self.assertEqual(len(json.loads((self.root / 'calls.json').read_text())), 1)
 
     def test_external_concurrency_settings_are_rejected(self):
         self.prepare('sample', 1)
@@ -232,7 +347,8 @@ class SchedulingTests(unittest.TestCase):
             self.assertIn('concurrency', value)
             if command[0] in ('run', 'show'):
                 for name in ('scheduling', 'global_running', 'fair_share', 'prefix_warmup',
-                             'queue_wait_seconds', 'cooldown_until_utc'):
+                             'queue_wait_seconds', 'cooldown_until_utc', 'scheduling.jsonl',
+                             'observed_at_utc', 'global_ready', 'global_eligible_ready', 'boot_id'):
                     self.assertIn(name, value)
 
 

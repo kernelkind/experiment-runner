@@ -72,6 +72,68 @@ def _clean(state, now):
     return queue
 
 
+def _snapshot(state, now, saved):
+    """Capture counts and constraints together while holding the shared state lock."""
+    queue = _clean(state, now)
+    occupied = SharedProviderBackoff.occupancy(state, now)
+    epoch = time.time()
+    experiments = {}
+    for owner, run in queue['experiments'].items():
+        running = [job for job in queue['running'].values() if job['owner'] == owner]
+        waiting = [job for job in queue['waiting'].values() if job['owner'] == owner]
+        blocked, until = _backoff(state, run, now)
+        reason = blocked or next((job.get('wait_reason') for job in waiting
+                                 if job.get('wait_reason')), run.get('wait_reason'))
+        if reason == 'capacity' and occupied < LIMIT:
+            reason = 'ready'
+        experiments[owner] = {
+            'pid': run['pid'], 'queued': max(0, run['pending'] - len(running)),
+            'running': len(running), 'ready': run['ready'], 'waiting': len(waiting),
+            'eligible_ready': run['ready'] if not blocked and not run.get('pause_reason') else 0,
+            'wait_reason': reason, 'pause_reason': run.get('pause_reason'),
+            'cooldown_until_utc': (datetime.fromtimestamp(epoch + until - now, timezone.utc).isoformat()
+                                   if until > now else None),
+        }
+    common = {
+        'observed_at_utc': datetime.fromtimestamp(epoch, timezone.utc).isoformat(),
+        'monotonic_seconds': now, 'boot_id': state['boot'],
+        'global_running': occupied, 'global_limit': LIMIT,
+        'global_ready': sum(run['ready'] for run in experiments.values()),
+        'global_eligible_ready': sum(run['eligible_ready'] for run in experiments.values()),
+        'experiments': experiments,
+    }
+    run = queue['experiments'].get(saved['owner'])
+    if run is None:
+        return {**saved, **common,
+                'state': 'interrupted' if saved['state'] == 'running' else saved['state'],
+                'queued': 0, 'running': 0, 'ready': 0, 'eligible_ready': 0,
+                'wait_reason': None, 'cooldown_until_utc': None}
+    running = [j for j in queue['running'].values() if j['owner'] == saved['owner']]
+    waiting = [j for j in queue['waiting'].values() if j['owner'] == saved['owner']]
+    elapsed = [now - j['started'] for j in running]
+    waits = [now - j['queued_at'] for j in waiting]
+    reason = experiments[saved['owner']]['wait_reason']
+    blocked, until = _backoff(state, run, now)
+    if not blocked and reason == 'provider_backoff' and not waiting and run['until'] <= now:
+        reason = None
+    if reason is None and run['pending'] > len(running):
+        reason = 'capacity' if occupied >= LIMIT else 'ready'
+    cooldown = max([0, *(j.get('cooldown_until', 0) - now for j in waiting), until - now])
+    orphaned = process_start(run['pid']) != run['process_start']
+    return {**saved, **common,
+            'state': 'interrupted' if orphaned else 'pausing' if run.get('pause_reason') else 'running',
+            'pause_reason': run.get('pause_reason'), 'queued': max(0, run['pending'] - len(running)),
+            'running': len(running), 'ready': run['ready'],
+            'eligible_ready': experiments[saved['owner']]['eligible_ready'],
+            'wait_reason': reason, 'queue_wait_seconds': max([saved.get('queue_wait_seconds', 0), *waits]),
+            'running_elapsed_seconds': max([0, *elapsed]),
+            'cooldown_until_utc': (datetime.fromtimestamp(epoch + cooldown, timezone.utc).isoformat()
+                                   if cooldown else None),
+            'cases': {j['case']: {'state': 'running', 'elapsed_seconds': now - j['started']}
+                      for j in running} | {j['case']: {'state': 'queued', 'wait_reason': j.get('wait_reason'),
+                                                     'wait_seconds': now - j['queued_at']} for j in waiting}}
+
+
 def snapshot(run_directory):
     path = Path(run_directory) / 'scheduling.json'
     if not path.exists():
@@ -79,37 +141,7 @@ def snapshot(run_directory):
     saved = json.loads(path.read_text())
     gate = SharedProviderBackoff(directory())
     with gate._state() as (state, now):
-        queue = _clean(state, now)
-        run = queue['experiments'].get(saved['owner'])
-        running = [j for j in queue['running'].values() if j['owner'] == saved['owner']]
-        waiting = [j for j in queue['waiting'].values() if j['owner'] == saved['owner']]
-        occupied = gate.occupancy(state, now)
-        if run is None:
-            return {**saved, 'state': 'interrupted' if saved['state'] == 'running' else saved['state'],
-                    'queued': 0, 'running': 0, 'global_running': occupied, 'global_limit': LIMIT,
-                    'wait_reason': None, 'cooldown_until_utc': None}
-        elapsed = [now - j['started'] for j in running]
-        waits = [now - j['queued_at'] for j in waiting]
-        reason = next((j.get('wait_reason') for j in waiting if j.get('wait_reason')), run.get('wait_reason'))
-        blocked, until = _backoff(state, run, now)
-        if blocked and run['pending'] > len(running):
-            reason = blocked
-        elif reason == 'provider_backoff' and not waiting and run['until'] <= now:
-            reason = None
-        if reason is None and run['pending'] > len(running):
-            reason = 'capacity' if occupied >= LIMIT else 'ready'
-        cooldown = max([0, *(j.get('cooldown_until', 0) - now for j in waiting), until - now])
-        orphaned = process_start(run['pid']) != run['process_start']
-        return {**saved, 'state': 'interrupted' if orphaned else 'pausing' if run.get('pause_reason') else 'running',
-                'pause_reason': run.get('pause_reason'), 'queued': max(0, run['pending'] - len(running)),
-                'running': len(running), 'global_running': occupied, 'global_limit': LIMIT,
-                'wait_reason': reason, 'queue_wait_seconds': max([saved.get('queue_wait_seconds', 0), *waits]),
-                'running_elapsed_seconds': max([0, *elapsed]),
-                'cooldown_until_utc': (datetime.fromtimestamp(time.time() + cooldown, timezone.utc).isoformat()
-                                       if cooldown else None),
-                'cases': {j['case']: {'state': 'running', 'elapsed_seconds': now - j['started']}
-                          for j in running} | {j['case']: {'state': 'queued', 'wait_reason': j.get('wait_reason'),
-                                                         'wait_seconds': now - j['queued_at']} for j in waiting}}
+        return _snapshot(state, now, saved)
 
 
 def pause(run_directory, reason='requested'):
@@ -150,12 +182,24 @@ class ExperimentQueue:
             queue = _clean(state, now)
             queue['experiments'][self.owner] = {'pid': os.getpid(), 'process_start': process_start(os.getpid()),
                 'pending': count, 'ready': 0, 'scopes': None, 'last_grant': 0, 'until': 0, 'wait_reason': None}
+            observation = _snapshot(state, now, self.saved)
         self._save()
+        self._record(observation, 'started')
 
     def _save(self):
         temporary = self.path.with_name('.scheduling-' + self.owner)
         temporary.write_text(json.dumps(self.saved) + '\n')
         os.replace(temporary, self.path)
+
+    def _append_history(self, value, event):
+        # The caller holds the experiment lock, never the host-wide state lock.
+        observation = {key: item for key, item in value.items() if key != 'cases'}
+        with self.path.with_suffix('.jsonl').open('a') as output:
+            output.write(json.dumps({**observation, 'schema_version': 1, 'event': event}) + '\n')
+
+    def _record(self, value, event):
+        with self.lock:
+            self._append_history(value, event)
 
     def progress(self, *, force=False):
         with self.lock:
@@ -163,10 +207,13 @@ class ExperimentQueue:
                 return
             self.last_progress = time.monotonic()
             value = snapshot(self.path.parent)
+            self._append_history(value, 'progress')
             print(f"experiment-runner: queued={value['queued']} running={value['running']} "
                   f"valid={value['valid']} failed={value['failed']} reused={value['reused']} "
                   f"global={value.get('global_running', 0)}/{LIMIT} "
                   f"wait={value.get('wait_reason') or '-'}"
+                  f" observed_at_utc={value['observed_at_utc']} ready={value['ready']}"
+                  f" global_ready={value['global_ready']} global_eligible_ready={value['global_eligible_ready']}"
                   + (f" eligible={value['cooldown_until_utc']}" if value.get('cooldown_until_utc') else ''),
                   file=sys.stderr, flush=True)
 
@@ -189,6 +236,8 @@ class ExperimentQueue:
         with self.gate._state() as (state, now):
             queue = _clean(state, now)
             queue['experiments'][self.owner]['wait_reason'] = 'prefix_warmup' if active else None
+            observation = _snapshot(state, now, self.saved)
+        self._record(observation, 'prefix_warmup_started' if active else 'prefix_warmup_finished')
 
     def check_pause(self):
         with self.gate._state() as (state, now):
@@ -229,6 +278,8 @@ class ExperimentQueue:
             run = queue['experiments'][self.owner]
             run['until'] = until
             run['wait_reason'] = 'provider_backoff' if until > now else None
+            observation = _snapshot(state, now, self.saved)
+        self._record(observation, 'backoff')
 
     @contextmanager
     def activate(self):
@@ -257,6 +308,7 @@ class ExperimentQueue:
         token = None
         provider_ticket = None
         pending = False
+        admitted = False
         try:
             with self.gate._state() as (state, now):
                 queue = _clean(state, now)
@@ -264,6 +316,8 @@ class ExperimentQueue:
                 run['ready'] += 1
                 run['scopes'] = self.scopes
                 pending = True
+                observation = _snapshot(state, now, self.saved)
+            self._record(observation, 'ready')
             # One shared waiter per experiment; other pending requests wait
             # locally without repeatedly scanning or rewriting host state.
             with self.admission_lock:
@@ -320,10 +374,12 @@ class ExperimentQueue:
                                 queue['experiments'][self.owner]['ready'] -= 1
                                 pending = False
                                 admitted = True
+                                observation = _snapshot(state, now, self.saved)
                     if admitted:
                         break
                     self.progress()
                     time.sleep(0.1)
+            self._record(observation, 'admitted')
             with self.lock:
                 self.saved['queue_wait_seconds'] = max(self.saved['queue_wait_seconds'], time.monotonic() - queued_at)
                 self._save()
@@ -343,6 +399,8 @@ class ExperimentQueue:
                     queue['experiments'][self.owner]['ready'] -= 1
                 queue['waiting'].pop(identifier, None)
                 queue['running'].pop(identifier, None)
+                observation = _snapshot(state, now, self.saved)
+            self._record(observation, 'released' if admitted else 'cancelled')
 
     def close(self):
         value = snapshot(self.path.parent)
@@ -350,10 +408,12 @@ class ExperimentQueue:
             queue = _clean(state, now)
             queue['experiments'].pop(self.owner, None)
             _clean(state, now)
+            observation = _snapshot(state, now, {**self.saved, 'state': 'finished'})
         with self.lock:
             self.saved.update(value, state='paused' if value.get('pause_reason') else 'finished', unresolved=value['queued'], queued=0,
                               running=0, wait_reason=None, cooldown_until_utc=None, cases={})
             self._save()
+            self._append_history({**observation, 'state': self.saved['state']}, 'finished')
         self.progress(force=True)
 
 
