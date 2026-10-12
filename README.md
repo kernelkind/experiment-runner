@@ -246,6 +246,15 @@ Oracle's old Python/shell/Node entry points delegate to this package.
 the shared `main` checkout is the standard. A project worktree itself does not
 select a runner revision.
 
+Related offline evidence checks can use `experiment.report_scope()` to share
+parsed files, frozen plan validation and receipt indexes. File identity, size,
+mtime and ctime are checked before reuse; changed files are read and validated
+again. Receipt, request, schema and review checks still run. The scope retains
+no verdicts across operations. `isolated=True` starts a fresh scope for one batch
+so a long hierarchy advancement does not retain the whole experiment history
+in memory. `result_records(path)` supplies the receipt-digest index used by
+project failed-call and reused-producer review checks.
+
 ## Update the shared binary after code merges
 
 After **every code change merged into local `main`**, verify that the shared

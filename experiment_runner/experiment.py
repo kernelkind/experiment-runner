@@ -24,6 +24,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+from contextvars import ContextVar
 from types import SimpleNamespace
 
 if not __package__:
@@ -35,7 +36,63 @@ from experiment_runner.inputs import CACHE_PREFIX_END, template_prefix, without_
 from experiment_runner.prompt_cache import prefix_policy
 
 
+class ReportFiles(engine.ReceiptFiles):
+    """One operation's parsed evidence; changed files invalidate cached reads."""
+
+    def __init__(self):
+        super().__init__()
+        self.loads = {}
+        self._ledgers = {}
+
+    def ledger(self, path):
+        path = Path(path)
+        with self._lock:
+            stamp = self._stamp(path)
+            entry = self._ledgers.get(path)
+            if entry is None or entry['stamp'] != stamp:
+                raw = path.read_bytes()
+                if self._stamp(path) != stamp:
+                    raise engine.RunnerError(f'source changed while reading: {path}')
+                lines = raw.splitlines(keepends=True)
+                entry = dict(stamp=stamp, lines=lines, records=[json.loads(line) for line in lines])
+                self._ledgers[path] = entry
+            return entry
+
+
+_REPORT_FILES = ContextVar('experiment_report_files', default=None)
+
+
+@contextmanager
+def report_scope(*, isolated=False):
+    """Share file reads across related reports, never across operations."""
+    if not isolated and _REPORT_FILES.get() is not None:
+        yield _REPORT_FILES.get()
+        return
+    token = _REPORT_FILES.set(ReportFiles())
+    try:
+        yield _REPORT_FILES.get()
+    finally:
+        _REPORT_FILES.reset(token)
+
+
+def result_records(path):
+    """Index native receipt records once per unchanged ledger in this scope."""
+    files = _REPORT_FILES.get() or ReportFiles()
+    with files._lock:
+        entry = files.ledger(path)
+        if 'by_digest' not in entry:
+            entry['by_digest'] = {inputs.digest(record): record for record in entry['records']}
+        return entry['by_digest']
+
+
 def read(path):
+    files = _REPORT_FILES.get()
+    if files is not None:
+        try:
+            return files.json(Path(path))
+        except (OSError, UnicodeError, ValueError):
+            # Keep the established error diagnostics on malformed/missing files.
+            return engine._load_json(Path(path), str(path))
     return engine._load_json(Path(path), str(path))
 
 
@@ -61,18 +118,32 @@ def locked(directory):
 
 def load(directory):
     directory = Path(directory).resolve()
-    envelope = read(directory / "experiment.json")
+    files = _REPORT_FILES.get()
+    saved = files.loads.get(directory) if files is not None else None
+    if saved is not None and saved['stamps'] == {
+            path: files._stamp(path) for path in saved['stamps']}:
+        return saved['value']
+    stamps = {}
+    def observe(path):
+        if files is not None:
+            stamps[path] = files._stamp(path)
+        return path
+    envelope = read(observe(directory / "experiment.json"))
     plan = envelope["plan"]
     if inputs.digest(plan) != envelope["sha256"]:
         raise ValueError("prepared experiment changed; prepare a new experiment")
     for name, expected in plan["files"].items():
-        if engine._sha256_file(directory / name) != expected:
+        path = observe(directory / name)
+        if (files.sha256(path) if files else engine._sha256_file(path)) != expected:
             raise ValueError(f"prepared {name} changed; prepare a new experiment")
-    config = engine.PromptRunnerConfig.load(directory / "runner-config.json")
-    manifest = read(Path(plan["run_directory"]) / "manifest.json")
+    config = engine.PromptRunnerConfig.load(observe(directory / "runner-config.json"), files=files)
+    manifest = read(observe(Path(plan["run_directory"]) / "manifest.json"))
     if inputs.digest(manifest) != plan["manifest_sha256"]:
         raise ValueError("prepared run manifest changed")
-    return plan, config, manifest
+    value = plan, config, manifest
+    if files is not None and stamps == {path: files._stamp(path) for path in stamps}:
+        files.loads[directory] = dict(stamps=stamps, value=value)
+    return value
 
 
 def spec_setup(path, *, preparation_context=None, include_request_preview=True):
@@ -760,8 +831,14 @@ def cache_warmup_records(directory, plan, config):
 
 
 def report(directory, only=None, note_ids=None, *, generation_costs=False, include_request_preview=True):
+    with report_scope():
+        return _report(directory, only, note_ids, generation_costs=generation_costs,
+                       include_request_preview=include_request_preview)
+
+
+def _report(directory, only=None, note_ids=None, *, generation_costs=False, include_request_preview=True):
     directory = Path(directory).resolve()
-    files = engine.ReceiptFiles()
+    files = _REPORT_FILES.get()
     plan, config, manifest = load(directory)
     selected = plan["cases"]
     for requested, available, field in (
@@ -777,18 +854,16 @@ def report(directory, only=None, note_ids=None, *, generation_costs=False, inclu
         selected = [c for c in selected if c.get("evidence", {}).get("note_id") in note_ids]
     selected_jobs = {"prompt:" + c.get("job_id", c["id"]) for c in selected}
     manifest_hash = inputs.digest(manifest)
-    provenance = engine._load_runner_upgrades(
+    provenance = files.provenance(
         config.run_directory,
         manifest_sha256=manifest_hash,
         initial_wrapper_sha256=manifest["wrapper_sha256"],
     )
     ledger = config.run_directory / "results.jsonl"
-    latest = engine._load_latest_results(ledger, manifest_hash, provenance)
-    records = (
-        [json.loads(line) for line in ledger.read_bytes().splitlines()]
-        if ledger.exists()
-        else []
-    )
+    evidence = files.ledger(ledger) if ledger.exists() else None
+    latest = engine._load_latest_results(ledger, manifest_hash, provenance,
+        evidence=None if evidence is None else zip(evidence['lines'], evidence['records']))
+    records = evidence['records'] if evidence is not None else []
     reconciled_costs = engine.load_reconciled_costs(config.run_directory, records)
     reviews_path = directory / "reviews.jsonl"
     comments_path = directory / "ui-comments.json"
@@ -798,7 +873,7 @@ def report(directory, only=None, note_ids=None, *, generation_costs=False, inclu
         else {}
     )
     reviews = (
-        [json.loads(line) for line in reviews_path.read_bytes().splitlines()]
+        files.ledger(reviews_path)['records']
         if reviews_path.exists()
         else []
     )

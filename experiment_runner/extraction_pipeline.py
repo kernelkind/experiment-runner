@@ -916,10 +916,11 @@ class PromptRunnerConfig:
     prompt_cache_prefix: str | None = None
 
     @classmethod
-    def load(cls, path: Path) -> "PromptRunnerConfig":
+    def load(cls, path: Path, *, files=None) -> "PromptRunnerConfig":
         config_path = path.expanduser().resolve()
         base = config_path.parent
-        value = _expect_object(_load_json(config_path, "config"), "config")
+        value = _expect_object(files.json(config_path) if files is not None
+                               else _load_json(config_path, "config"), "config")
         _expect_fields(
             value,
             "config",
@@ -1443,17 +1444,19 @@ def _load_latest_results(
     manifest_sha256: str,
     provenance: RunnerProvenance,
     references: dict[str, SourceResultReference] | None = None,
+    *, evidence=None,
 ) -> dict[str, dict[str, Any]]:
     if not path.exists():
         return {}
     latest: dict[str, dict[str, Any]] = {}
     try:
-        lines = path.read_bytes().splitlines(keepends=True)
+        lines = path.read_bytes().splitlines(keepends=True) if evidence is None else None
     except (OSError, UnicodeError) as error:
         raise RunnerError(f"could not read results ledger {path}: {error}") from error
     active_wrapper = provenance.initial_wrapper_sha256
     boundary_index = 0
-    for line_number, line in enumerate(lines, start=1):
+    rows = ((line, None) for line in lines) if evidence is None else evidence
+    for line_number, (line, parsed) in enumerate(rows, start=1):
         while (
             boundary_index < len(provenance.boundaries)
             and provenance.boundaries[boundary_index][0] <= line_number
@@ -1461,7 +1464,7 @@ def _load_latest_results(
             active_wrapper = provenance.boundaries[boundary_index][1]
             boundary_index += 1
         try:
-            raw = json.loads(line)
+            raw = json.loads(line) if evidence is None else parsed
         except (UnicodeError, json.JSONDecodeError) as error:
             raise RunnerError(
                 f"results ledger line {line_number} is not valid JSON: {error}"

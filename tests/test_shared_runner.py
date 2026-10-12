@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from collections import Counter
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -21,6 +22,60 @@ class SharedRunnerTests(unittest.TestCase):
             'ORACLE_EXPERIMENT_BACKOFF_DIRECTORY': str(Path(temporary.name) / 'backoff')})
         environment.start()
         self.addCleanup(environment.stop)
+
+    def test_related_reports_share_reads_and_still_reject_changed_producer_evidence(self):
+        from experiment_runner import experiment, project as bindings
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'prompt.txt').write_text('GENERIC PROMPT\n{TASK}')
+            (root / 'cases.json').write_text(json.dumps({'cases': [
+                {'id': name, 'inputs': {'TASK': name}} for name in ('one', 'two')]}))
+            (root / 'spec.json').write_text(json.dumps({
+                'schema_version': 1, 'prompt': {'id': 'P1', 'path': 'prompt.txt'},
+                'dataset': {'adapter': 'generic', 'path': 'cases.json'},
+                'runner': {'provider': 'local', 'model': 'fixture/model',
+                           'reasoning_effort': 'off', 'transport': 'http',
+                           'runner_binary': str(ROOT / 'tests/fixtures/fake-runner.py'),
+                           'output_schema': {'type': 'object'}}}))
+            environment = {**os.environ, 'FAKE_RUNNER_LOG': str(root / 'calls.json'),
+                           'FAKE_RUNNER_PROMPT_RESPONSE': '{"answer":"fixture"}'}
+            for arguments in (('prepare', 'source', '--spec', 'spec.json'), ('run', 'source'),
+                              ('prepare', 'reuse', '--from', 'source'), ('run', 'reuse')):
+                result = subprocess.run([str(CLI), *arguments], cwd=root, env=environment,
+                                        capture_output=True, text=True, timeout=30)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            bindings.configure(root)
+            self.addCleanup(bindings.configure)
+            reads = Counter()
+            original = Path.read_bytes
+            def counted(path):
+                reads[path] += 1
+                return original(path)
+            with experiment.report_scope(), patch.object(Path, 'read_bytes', counted):
+                for name in ('one', 'two'):
+                    case, = experiment.report(root / 'reuse', only=[name],
+                        include_request_preview=False)['cases']
+                    self.assertEqual(case['status'], 'valid')
+                    self.assertTrue(case['reused'])
+                    source, = experiment.report(root / 'source', only=[name],
+                        include_request_preview=False)['cases']
+                    self.assertEqual(source['status'], 'valid')
+                for name in ('source', 'reuse'):
+                    for file in ('experiment.json', 'runner-config.json', 'run/manifest.json', 'run/results.jsonl'):
+                        self.assertEqual(reads[root / name / file], 1, (name, file, reads))
+                config = root / 'source/runner-config.json'
+                config.write_bytes(config.read_bytes() + b'\n')
+                with self.assertRaisesRegex(ValueError, 'prepared runner-config.json changed'):
+                    experiment.report(root / 'source', include_request_preview=False)
+            ledger = root / 'reuse/run/results.jsonl'
+            lines = ledger.read_text().splitlines()
+            changed = json.loads(lines[0])
+            changed['reused_from']['result_sha256'] = '0' * 64
+            lines[0] = json.dumps(changed)
+            ledger.write_text('\n'.join(lines) + '\n')
+            report = experiment.report(root / 'reuse', include_request_preview=False)
+            case = next(c for c in report['cases'] if c.get('job_id', c['id']) == changed['note_id'])
+            self.assertEqual(case['status'], 'invalid_receipt')
     def test_local_worker_runs_exact_inputs_and_preserves_its_receipt_metadata(self):
         with tempfile.TemporaryDirectory() as temporary:
             project = Path(temporary)
