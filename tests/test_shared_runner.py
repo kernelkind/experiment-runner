@@ -23,6 +23,55 @@ class SharedRunnerTests(unittest.TestCase):
         environment.start()
         self.addCleanup(environment.stop)
 
+    def test_project_prompt_sources_are_frozen_and_prompt_overrides_are_checked(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'adapter.py').write_text('from experiment_runner.inputs import *\n')
+            (root / 'extension.py').write_text(
+                'from pathlib import Path\nimport hashlib\n'
+                'def code_files(dataset):\n    return {}\n'
+                'def add_commands(commands):\n    pass\n'
+                'def handle_command(args):\n    return NotImplemented\n'
+                'def enrich_report(result, plan, cases):\n    pass\n'
+                'def prompt_sources(prompt):\n'
+                '    shared = Path(prompt["source_path"]).parent / "common.txt"\n'
+                '    if shared.read_text() not in prompt["text"]:\n'
+                '        raise ValueError("shared prompt wording differs")\n'
+                '    return {str(shared): hashlib.sha256(shared.read_bytes()).hexdigest()}\n')
+            (root / 'experiment-runner.json').write_text(json.dumps(
+                {'schema_version': 1, 'inputs': 'adapter', 'extension': 'extension'}))
+            shared = root / 'common.txt'
+            shared.write_text('Shared rules.\n')
+            (root / 'prompt.txt').write_text('Shared rules.\n{TASK}')
+            (root / 'cases.json').write_text(json.dumps(
+                {'cases': [{'id': 'one', 'inputs': {'TASK': 'Data'}}]}))
+            (root / 'spec.json').write_text(json.dumps({
+                'schema_version': 1, 'prompt': {'id': 'P1', 'path': 'prompt.txt'},
+                'dataset': {'adapter': 'generic', 'path': 'cases.json'},
+                'runner': {'provider': 'local', 'model': 'fixture/model',
+                           'reasoning_effort': 'off', 'transport': 'http',
+                           'runner_binary': str(ROOT / 'tests/fixtures/fake-runner.py')}}))
+            prepared = subprocess.run([str(CLI), 'prepare', 'E1', '--spec', 'spec.json'],
+                cwd=root, capture_output=True, text=True, timeout=30)
+            self.assertEqual(prepared.returncode, 0, prepared.stderr)
+            plan = json.loads((root / 'E1/experiment.json').read_text())['plan']
+            self.assertEqual(plan['sources'][str(shared)], hashlib.sha256(shared.read_bytes()).hexdigest())
+            (root / 'bad.txt').write_text('Different rules.\n{TASK}')
+            rejected = subprocess.run([str(CLI), 'prepare', 'E2', '--from', 'E1',
+                '--prompt', 'bad.txt', '--prompt-id', 'P2'], cwd=root,
+                capture_output=True, text=True, timeout=30)
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn('shared prompt wording differs', rejected.stderr)
+            self.assertFalse((root / 'E2').exists())
+            extension = root / 'extension.py'
+            extension.write_text(extension.read_text().replace(
+                'hashlib.sha256(shared.read_bytes()).hexdigest()', '"0" * 64'))
+            stale = subprocess.run([str(CLI), 'prepare', 'E3', '--spec', 'spec.json'],
+                cwd=root, capture_output=True, text=True, timeout=30)
+            self.assertNotEqual(stale.returncode, 0)
+            self.assertIn('project prompt source changed', stale.stderr)
+            self.assertFalse((root / 'E3').exists())
+
     def test_related_reports_share_reads_and_still_reject_changed_producer_evidence(self):
         from experiment_runner import experiment, project as bindings
         with tempfile.TemporaryDirectory() as temporary:

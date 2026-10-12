@@ -162,6 +162,7 @@ def spec_setup(path, *, preparation_context=None, include_request_preview=True):
         "text": prompt_path.read_bytes().decode(),
         "source_path": str(prompt_path),
     }
+    prompt_sources = project.prompt_sources(prompt)
     dataset = spec["dataset"]
     engine._expect_fields(
         dataset,
@@ -204,6 +205,7 @@ def spec_setup(path, *, preparation_context=None, include_request_preview=True):
         "runner": runner,
         "sources": {
             **sources,
+            **prompt_sources,
             str(path): engine._sha256_file(path),
             str(prompt_path): engine._sha256_file(prompt_path),
         },
@@ -343,7 +345,8 @@ def prepare(args, *, preparation_context=None, include_request_preview=True):
             "text": path.read_bytes().decode(),
             "source_path": str(path),
         }
-        setup["sources"] = {**setup["sources"], str(path): engine._sha256_file(path)}
+        setup["sources"] = {**setup["sources"], str(path): engine._sha256_file(path),
+                            **project.prompt_sources(setup["prompt"])}
         setup["cases"] = [
             {**c, "prompt": inputs.render(without_cache_marker(setup["prompt"]["text"]), c["inputs"])}
             for c in setup["cases"]

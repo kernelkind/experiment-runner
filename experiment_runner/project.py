@@ -1,6 +1,7 @@
 """Explicit project extensions; the executor has no project-code dependency."""
 from contextvars import ContextVar
 import importlib
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -64,6 +65,24 @@ def code_files(dataset):
     if selected:
         files.update(selected.code_files(dataset))
     return files
+
+
+def prompt_sources(prompt):
+    """Validate project-owned prompt composition and freeze its source hashes."""
+    selected = extension()
+    callback = getattr(selected, 'prompt_sources', None) if selected else None
+    if callback is None:
+        return {}
+    sources = callback(prompt)
+    if not isinstance(sources, dict):
+        raise ValueError('project prompt_sources must return a source-hash mapping')
+    for name, expected in sources.items():
+        if (not isinstance(name, str) or not Path(name).is_absolute()
+                or not isinstance(expected, str) or not re.fullmatch('[0-9a-f]{64}', expected)):
+            raise ValueError('project prompt_sources needs absolute paths and SHA-256 hashes')
+        if hashlib.sha256(Path(name).read_bytes()).hexdigest() != expected:
+            raise ValueError('project prompt source changed: ' + name)
+    return sources
 
 
 class InputAdapters:

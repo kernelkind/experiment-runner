@@ -52,6 +52,17 @@ The command is illustrative: supply an existing, authorized spec. Input and
 prompt paths resolve relative to the spec. Review and hierarchy extensions are
 loaded from the selected project, never copied into this package.
 
+A project extension may implement `prompt_sources(prompt)`. Preparation calls
+it for a spec's prompt and for an explicit `--prompt` replacement, before
+publishing the experiment. The callback receives `id`, `text` and `source_path`;
+it validates project-owned composition and returns absolute source paths mapped
+to SHA-256 hashes. The runner verifies those hashes and freezes them alongside
+the prompt and input sources. A rejection makes no model calls and creates no
+experiment. Existing projects without the hook retain their behavior. An
+unchanged `prepare --from` keeps the original frozen prompt and dependencies.
+This supports shared prompt components without putting project rules in the
+executor or rewriting historical prompts.
+
 `show <experiment> --inputs-only` prints only each saved case's `id`, exact
 `inputs` and `input_sha256`, without reading answer reports or invoking request
 previews. `--case` selects one object; `--only` selects a cases list. Evidence,
