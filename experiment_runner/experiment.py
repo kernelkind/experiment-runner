@@ -151,9 +151,12 @@ def spec_setup(path, *, preparation_context=None, include_request_preview=True):
     spec = read(path)
     engine._expect_fields(
         spec, "experiment spec", {"schema_version", "prompt", "dataset", "runner"}
+        | ({"scheduling_group"} & spec.keys())
     )
     if type(spec["schema_version"]) is not int or spec["schema_version"] != 1:
         raise ValueError("expected experiment schema_version 1")
+    from . import scheduling
+    group = scheduling.validate_group(spec.get('scheduling_group'))
     prompt = spec["prompt"]
     engine._expect_fields(prompt, "prompt", {"id", "path"})
     prompt_path = resolve(prompt["path"], path.parent)
@@ -198,6 +201,7 @@ def spec_setup(path, *, preparation_context=None, include_request_preview=True):
         else None
     )
     return {
+        **({'scheduling_group': group} if group is not None else {}),
         "prompt": prompt,
         "dataset": {**dataset, "path": str(source_path)},
         "cases": cases,
@@ -278,6 +282,7 @@ def request_preview(plan, manifest, cases, *, include_reusable_case_ids=False):
 
 
 def prepare(args, *, preparation_context=None, include_request_preview=True):
+    from . import scheduling
     destination = args.destination.expanduser().resolve()
     if destination.exists():
         raise ValueError("experiment destination already exists")
@@ -287,6 +292,9 @@ def prepare(args, *, preparation_context=None, include_request_preview=True):
         old, _, old_manifest = load(args.from_experiment)
         inherited_history = old_manifest.get("request_reuse", {}).get("history_root")
         setup = {k: old[k] for k in ("prompt", "dataset", "cases", "runner", "sources")}
+        group = old.get('scheduling_group') or scheduling.bound_group(Path(old['run_directory']))
+        if group is not None:
+            setup['scheduling_group'] = group
         setup['preparation'] = old.get('preparation')
         if 'cache_warmup' in old:
             setup['cache_warmup'] = old['cache_warmup']
@@ -296,6 +304,11 @@ def prepare(args, *, preparation_context=None, include_request_preview=True):
         setup = spec_setup(args.spec, preparation_context=preparation_context,
                            include_request_preview=include_request_preview)
         baseline = report(args.baseline.resolve(), include_request_preview=include_request_preview) if args.baseline else None
+    group = scheduling.validate_group(getattr(args, 'scheduling_group', None))
+    if group is not None:
+        if setup.get('scheduling_group') not in (None, group):
+            raise ValueError('scheduling group differs from the supplied experiment')
+        setup['scheduling_group'] = group
     if args.only:
         requested = set(args.only)
         unknown = requested - {c["id"] for c in setup["cases"]}
@@ -1014,9 +1027,11 @@ def _report(directory, only=None, note_ids=None, *, generation_costs=False, incl
         "cases": cases,
         "baseline_only": sorted(set(baseline) - {c["id"] for c in cases}),
     }
-    from .scheduling import snapshot
+    from .scheduling import bound_group, snapshot
     result['scheduling'] = snapshot(config.run_directory)
     result['scheduling'].update(valid=summary['valid'], failed=summary['failed'], reused=summary['reused'])
+    result['scheduling'].setdefault('scheduling_group',
+        plan.get('scheduling_group') or bound_group(config.run_directory))
     if plan.get('cache_warmup') or warmup_calls:
         result['cache_warmup'] = {**plan.get('cache_warmup', {}),
                                   'attempts': len(warmup_calls),
@@ -1140,10 +1155,10 @@ def reconcile_costs(directory):
 def run(directory, max_new_attempts=None, runner_upgrade_reason=None, *,
         max_cost_usd=None, max_request_cost_usd=None, attempt_budget_path=None,
         additional_attempt_budget_paths=(), include_request_preview=True,
-        only=None, warm_cache=True, keep_retrying_provider_errors=False):
+        only=None, warm_cache=True, keep_retrying_provider_errors=False, scheduling_group=None):
     directory = directory.resolve()
     if (directory / 'bounded-build.json').exists():
-        if (any(x is not None for x in (max_cost_usd, max_request_cost_usd, attempt_budget_path, only))
+        if (any(x is not None for x in (max_cost_usd, max_request_cost_usd, attempt_budget_path, only, scheduling_group))
                 or additional_attempt_budget_paths or not warm_cache or keep_retrying_provider_errors):
             raise ValueError('bounded builds use their frozen shared attempt budget and subscription route')
         run_build = project.import_module('bounded_hierarchy_build').run_build
@@ -1155,6 +1170,10 @@ def run(directory, max_new_attempts=None, runner_upgrade_reason=None, *,
                 "imported experiments are read-only; prepare --from this experiment to run a candidate"
             )
         from . import scheduling
+        group = scheduling.validate_group(scheduling_group)
+        if group is not None and plan.get('scheduling_group') not in (None, group):
+            raise ValueError('scheduling group differs from the prepared experiment')
+        group = scheduling.bind_group(config.run_directory, group or plan.get('scheduling_group'))
         cases = {c["id"]: c for c in plan["cases"]}
         selected = None if only is None else set(only)
         if selected is not None and (len(only) != len(selected) or selected - cases.keys()):
@@ -1175,7 +1194,7 @@ def run(directory, max_new_attempts=None, runner_upgrade_reason=None, *,
         engine.compatibility.upgrade_worker(config.run_directory, manifest, identity)
         engine._append_json_line(directory / 'execution-settings.jsonl', dict(
             manifest_sha256=inputs.digest(manifest), concurrency=scheduling.LIMIT,
-            scheduling='shared-fair-queue-v1',
+            scheduling='shared-fair-queue-v2', scheduling_group=group,
             prepared_concurrency=config.concurrency, only=only, warm_cache=warm_cache,
             keep_retrying_provider_errors=keep_retrying_provider_errors,
             started_at_utc=datetime.now(timezone.utc).isoformat()))
@@ -1261,6 +1280,7 @@ def run(directory, max_new_attempts=None, runner_upgrade_reason=None, *,
                 keep_retrying_provider_errors=keep_retrying_provider_errors,
                 runner_upgrade_reason=runner_upgrade_reason if wrapper_changed else None,
                 before_new_attempt=(warm_before_dispatch if warm_cache and plan.get('cache_warmup', {}).get('eligible') else None),
+                scheduling_group=group,
             )
         except engine.RunnerError as caught:
             error = caught
@@ -1320,7 +1340,9 @@ def compact(result, *, prepared=False):
     if schedule:
         print(f"Queue: {schedule['state']}; queued={schedule['queued']} running={schedule['running']}; "
               f"global={schedule.get('global_running', 0)}/{schedule['global_limit']}; "
-              f"wait={schedule.get('wait_reason') or '-'}")
+              f"wait={schedule.get('wait_reason') or '-'}; "
+              f"group={schedule.get('scheduling_group') or 'independent'}; "
+              f"group_running={schedule.get('groups', {}).get(schedule.get('group'), {}).get('running', 0)}")
     if "prepared_inputs" in result:
         print("Offline input sizing (rendered prompt proxy, not provider billing): "
               + json.dumps(result["prepared_inputs"]))
@@ -1413,8 +1435,18 @@ Internal request queue:
   All experiments by this user on this host share at most 30 active requests.
   Capacity is automatic: no concurrency flag or runner.concurrency in new specs.
   Historical concurrency fields stay frozen but do not control dispatch.
-  Ready experiments share freed slots fairly; unused shares can be borrowed.
-  When endpoint capacity permits, one run can use 30, two sustained runs balance
+  Share slots between overall experiments, then between their batches.
+  Prepare all related batches with the same --scheduling-group ID, or use the
+  top-level scheduling_group field in the spec. IDs are 1-64 letters, digits,
+  dots, underscores or hyphens, starting with a letter or digit. They identify
+  the effort, not a model, prompt, prefix, batch or agent. More batches in one
+  group do not increase its share. Ungrouped batches have independent shares.
+  prepare --from inherits the ID, including subsets and warmups. Resumes retain
+  membership; conflicting frozen/saved IDs are refused before inference.
+  For a legacy ungrouped batch, run --scheduling-group ID binds membership once
+  in run/scheduling-group.json without changing old plans, requests or receipts.
+  Ready groups share freed slots fairly; unused shares can be borrowed.
+  When endpoint capacity permits, one group can use 30, two sustained groups balance
   near 15 each, three near 10. Fixed native endpoint limits can reduce admission;
   a serial local endpoint admits one request across experiments using it.
   Endpoint metadata is discovered without inference before worker launch.
@@ -1449,6 +1481,9 @@ Internal request queue:
   scheduling reports queued/ready/running/valid/failed/reused, global_running out of
   global_limit: 30, and wait_reason (capacity, fair_share, account_backoff,
   transport_backoff, provider_backoff, recovery_limit, prefix_warmup or ready).
+  scheduling_group identifies explicit membership; group identifies its effective
+  allocation. groups contains per-group batches/running/queued/ready/eligible_ready.
+  Progress reports group and group_running. Group counts include warmups and retries.
   provider_backoff is a batch's shared-pressure delay.
   queue_wait_seconds is the longest admission wait, excluding worker execution
   and earlier preparation. running_elapsed_seconds is the oldest current
@@ -1482,6 +1517,9 @@ Internal request queue:
   completed receipts and exact reuse survive. Compatible live workers continue;
   incompatible changes request a handover before new dispatch. Coordinators
   retain loaded workflow code until individually paused and restarted.
+  Older loaded coordinators do not implement group fairness. Updating the launcher
+  alone cannot regroup their active batches; resume the parent workflow and its
+  drained child batches using the same saved inputs, limits and authorization.
   Changed request-producing code still
   requires a newly prepared experiment; --runner-upgrade-reason cannot bypass it.
   Project adapter/evaluator changes still require --runner-upgrade-reason.
@@ -1495,6 +1533,8 @@ Internal request queue:
         "A template's <!-- prompt-cache-end --> marker can include shared input data;\n"
         "the runner validates the prefix and warms it automatically.\n\n"
         "Internal scheduling: a shared fair queue admits at most 30 requests across experiments.\n"
+        "Use one --scheduling-group ID for all batches of the same overall experiment;\n"
+        "slots are shared between groups first, then their batches.\n"
         "No external concurrency setting. run --help explains live queue status.\n",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Global options: --project-root PATH selects project adapters; --version prints the shared release.\n\n"
@@ -1580,6 +1620,8 @@ Example from your project checkout (replace the spec and destination):
     p.add_argument("--prompt-id")
     p.add_argument("--repeat", action="store_true")
     p.add_argument("--history-root", type=Path)
+    p.add_argument('--scheduling-group', metavar='ID',
+                   help='share one scheduling allocation across all batches of this overall experiment; inherited by --from')
     p.add_argument("--model")
     p.add_argument("--reasoning-effort")
     p.add_argument("--provider", choices=("openai-codex", "openrouter", "local"))
@@ -1636,6 +1678,8 @@ Example from your project checkout (replace the spec and destination):
   requests once, so answer reuse is not counted as a cache hit or new savings.""",
     )
     p.add_argument("experiment", type=Path)
+    p.add_argument('--scheduling-group', metavar='ID',
+                   help='bind an older ungrouped batch to an overall experiment; saved for subsequent resumes')
     p.add_argument('--only', action='append', metavar='CASE_ID',
                    help='dispatch only these frozen cases; the full report retains unselected cases')
     p.add_argument('--keep-retrying-provider-errors', action='store_true',
@@ -1734,7 +1778,7 @@ def main(argv=None):
                 raise ValueError('--max-new-attempts must be positive')
             if args.runner_upgrade_reason is not None and (not args.runner_upgrade_reason.strip()):
                 raise ValueError('--runner-upgrade-reason must not be blank')
-            result = run(args.experiment, args.max_new_attempts, args.runner_upgrade_reason, max_cost_usd=args.max_cost_usd, max_request_cost_usd=args.max_request_cost_usd, attempt_budget_path=args.attempt_budget, only=args.only, keep_retrying_provider_errors=args.keep_retrying_provider_errors)
+            result = run(args.experiment, args.max_new_attempts, args.runner_upgrade_reason, max_cost_usd=args.max_cost_usd, max_request_cost_usd=args.max_request_cost_usd, attempt_budget_path=args.attempt_budget, only=args.only, keep_retrying_provider_errors=args.keep_retrying_provider_errors, scheduling_group=args.scheduling_group)
             if (args.experiment / 'bounded-build.json').exists():
                 print(json.dumps(result, indent=2))
                 return int(result.get('status') != 'finished')

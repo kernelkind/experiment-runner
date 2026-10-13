@@ -4003,6 +4003,7 @@ def _execute_prompt_batch(
     before_new_attempt: Callable[[NewJobBudget], None] | None = None,
     request_queue=None,
     keep_retrying_provider_errors: bool = False,
+    scheduling_group: str | None = None,
 ) -> dict[str, object]:
     from experiment_runner import scheduling
     # Historical concurrency stays in frozen plans; dispatch capacity is internal.
@@ -4059,7 +4060,8 @@ def _execute_prompt_batch(
     owned_queue = request_queue is None
     queue = request_queue or scheduling.ExperimentQueue(config.run_directory, len(config.prompts),
         scope_loader=_experiment_scope_loader(config, config),
-        endpoint_loader=_experiment_endpoint_loader(config, worker_identity), worker_identity=worker_identity)
+        endpoint_loader=_experiment_endpoint_loader(config, worker_identity), worker_identity=worker_identity,
+        scheduling_group=scheduling_group)
     if not owned_queue:
         queue.extend(len(config.prompts))
     (config.run_directory / "output.json").unlink(missing_ok=True)

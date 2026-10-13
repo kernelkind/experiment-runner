@@ -51,7 +51,7 @@ class SchedulingTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return result
 
-    def prepare(self, name, count, *, provider='openai-codex'):
+    def prepare(self, name, count, *, provider='openai-codex', scheduling_group=None):
         (self.root / f'{name}.txt').write_text('GENERIC PROMPT\n{TASK}')
         (self.root / f'{name}-cases.json').write_text(json.dumps({'cases': [
             {'id': str(i), 'inputs': {'TASK': f'{name}-{i}'}} for i in range(count)]}))
@@ -61,7 +61,157 @@ class SchedulingTests(unittest.TestCase):
             'runner': {'provider': provider, 'auth_file': None,
                        'model': 'fixture/model', 'reasoning_effort': 'off' if provider == 'local' else 'low',
                        'runner_binary': str(ROOT / 'tests/fixtures/fake-runner.py')}}))
-        self.cli('prepare', name, '--spec', f'{name}-spec.json')
+        arguments = ['prepare', name, '--spec', f'{name}-spec.json']
+        if scheduling_group is not None:
+            arguments += ['--scheduling-group', scheduling_group]
+        self.cli(*arguments)
+
+    def test_scheduling_group_is_preserved_on_inheritance_and_resume(self):
+        self.prepare('source', 1, scheduling_group='distillation')
+        self.assertEqual(json.loads(self.cli('show', 'source', '--json').stdout)
+                         ['scheduling']['scheduling_group'], 'distillation')
+        self.cli('prepare', 'inherited', '--from', 'source')
+        for name in ('source', 'inherited'):
+            plan = json.loads((self.root / name / 'experiment.json').read_text())['plan']
+            self.assertEqual(plan['scheduling_group'], 'distillation')
+        process = self.launch('source')
+        self.until(lambda: len(self.starts()) == 1)
+        live = json.loads(self.cli('show', 'source', '--json').stdout)['scheduling']
+        self.assertEqual(live['scheduling_group'], 'distillation')
+        self.assertEqual(live['groups']['distillation']['running'], 1)
+        (self.control / f"{self.starts()[0]['pid']}.release").touch()
+        stdout, stderr = process.communicate(timeout=8)
+        self.assertEqual(process.returncode, 0, stdout + stderr)
+        self.cli('run', 'source')
+        self.assertEqual(len(self.starts()), 1, 'resume must retain the saved answer')
+        self.cli('prepare', 'another', '--spec', 'source-spec.json', '--scheduling-group', 'another')
+        self.cli('run', 'another')
+        self.assertEqual(len(self.starts()), 1, 'changing scheduling membership must preserve exact reuse')
+        rejected = subprocess.run([str(CLI), 'run', 'source', '--scheduling-group', 'another'],
+            cwd=self.root, env=self.env, text=True, capture_output=True, timeout=10)
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn('scheduling group', rejected.stderr)
+
+    def test_existing_ungrouped_plan_can_bind_once_without_changing_frozen_inputs(self):
+        self.prepare('older', 1)
+        frozen = (self.root / 'older/experiment.json').read_bytes()
+        process = self.launch('older', '--scheduling-group', 'distillation')
+        self.until(lambda: len(self.starts()) == 1)
+        (self.control / f"{self.starts()[0]['pid']}.release").touch()
+        stdout, stderr = process.communicate(timeout=8)
+        self.assertEqual(process.returncode, 0, stdout + stderr)
+        self.assertEqual((self.root / 'older/experiment.json').read_bytes(), frozen)
+        self.cli('run', 'older')
+        self.cli('prepare', 'inherited', '--from', 'older')
+        plan = json.loads((self.root / 'inherited/experiment.json').read_text())['plan']
+        self.assertEqual(plan['scheduling_group'], 'distillation')
+        self.assertEqual(len(self.starts()), 1)
+
+    def test_scheduling_group_spec_and_invalid_or_conflicting_membership(self):
+        self.prepare('template', 1)
+        path = self.root / 'template-spec.json'
+        spec = json.loads(path.read_text())
+        path.write_text(json.dumps({**spec, 'scheduling_group': 'distillation'}))
+        self.cli('prepare', 'specified', '--spec', str(path))
+        plan = json.loads((self.root / 'specified/experiment.json').read_text())['plan']
+        self.assertEqual(plan['scheduling_group'], 'distillation')
+        for number, group in enumerate(('', ' spaces ', 'bad/name', 'a' * 65, 'different')):
+            name = f'bad-{number}'
+            rejected = subprocess.run([str(CLI), 'prepare', name, '--from', 'specified',
+                '--scheduling-group', group], cwd=self.root, env=self.env,
+                text=True, capture_output=True, timeout=10)
+            self.assertNotEqual(rejected.returncode, 0)
+            self.assertIn('scheduling group', rejected.stderr)
+            self.assertFalse((self.root / name).exists())
+        self.assertEqual(self.starts(), [])
+
+    def test_one_hundred_batches_balance_against_two_other_groups(self):
+        from experiment_runner import scheduling
+        with patch.dict(os.environ, self.env):
+            queues, leases, workers, errors = [], [], [], []
+            release = threading.Event()
+            def enter(queue, case):
+                try:
+                    with queue.slot(case, 60):
+                        release.wait(10)
+                except BaseException as error:
+                    errors.append(error)
+            try:
+                for number in range(100):
+                    path = self.root / f'dist-{number}'
+                    path.mkdir()
+                    queues.append(scheduling.ExperimentQueue(path, 1, scheduling_group='distillation'))
+                for number in range(30):
+                    lease = queues[number].slot('one', 60)
+                    lease.__enter__()
+                    leases.append(lease)
+                for queue in queues[30:]:
+                    workers.append(threading.Thread(target=enter, args=(queue, 'one')))
+                for group in ('hierarchy', 'review'):
+                    path = self.root / group
+                    path.mkdir()
+                    queue = scheduling.ExperimentQueue(path, 30, scheduling_group=group)
+                    queues.append(queue)
+                    workers.extend(threading.Thread(target=enter, args=(queue, str(i))) for i in range(30))
+                for worker in workers:
+                    worker.start()
+                self.until(lambda: scheduling.snapshot(queues[-1].path.parent)['global_ready'] == 130)
+                for lease in leases[:20]:
+                    lease.__exit__(None, None, None)
+                leases = leases[20:]
+                self.until(lambda: {k: v['running'] for k, v in
+                    scheduling.snapshot(queues[-1].path.parent)['groups'].items()} ==
+                    {'distillation': 10, 'hierarchy': 10, 'review': 10})
+                status = scheduling.snapshot(queues[-1].path.parent)
+                self.assertEqual(status['global_running'], 30)
+                self.assertEqual(status['groups']['distillation']['batches'], 100)
+            finally:
+                release.set()
+                for lease in leases:
+                    lease.__exit__(None, None, None)
+                for worker in workers:
+                    if worker.ident is not None:
+                        worker.join(timeout=10)
+                for queue in queues:
+                    queue.close()
+            self.assertEqual(errors, [])
+            self.assertTrue(all(not worker.is_alive() for worker in workers))
+
+    def test_many_batches_share_one_group_without_crowding_out_another(self):
+        for name in ('dista', 'distb', 'distc'):
+            self.prepare(name, 30, scheduling_group='distillation')
+        self.prepare('other', 30, scheduling_group='hierarchy')
+        first = self.launch('dista')
+        self.until(lambda: len(self.starts()) == 30)
+        for name in ('distb', 'distc', 'other'):
+            self.launch(name)
+            self.until(lambda name=name: json.loads(self.cli('show', name, '--json').stdout)
+                       ['scheduling'].get('ready') == 30)
+        held = sorted(self.starts(), key=lambda row: row['started'])
+        for row in held[:15]:
+            (self.control / f"{row['pid']}.release").touch()
+        self.until(lambda: sum('other-' in row['prompt'] for row in self.starts()) == 15)
+        self.assertEqual(sum('distb-' in row['prompt'] or 'distc-' in row['prompt']
+                             for row in self.starts()), 0)
+        live = json.loads(self.cli('show', 'other', '--json').stdout)['scheduling']
+        self.assertEqual({name: value['running'] for name, value in live['groups'].items()},
+                         {'distillation': 15, 'hierarchy': 15})
+        for row in held[15:]:
+            (self.control / f"{row['pid']}.release").touch()
+        self.until(lambda: sum('distb-' in row['prompt'] or 'distc-' in row['prompt']
+                              for row in self.starts()) == 15)
+        self.assertTrue(any('distb-' in row['prompt'] for row in self.starts()))
+        self.assertTrue(any('distc-' in row['prompt'] for row in self.starts()))
+        # The other group completes and lends all its unused capacity back.
+        deadline = time.monotonic() + 15
+        while any(process.poll() is None for process in self.processes) and time.monotonic() < deadline:
+            for row in self.starts():
+                (self.control / f"{row['pid']}.release").touch()
+            time.sleep(0.03)
+        for process in self.processes:
+            stdout, stderr = process.communicate(timeout=3)
+            self.assertEqual(process.returncode, 0, stdout + stderr)
+        self.assertEqual(len(self.starts()), 120)
 
     def launch(self, name, *args, endpoint=None):
         environment = {**self.env, **({'FAKE_RUNNER_ADMISSION': json.dumps(endpoint)} if endpoint else {})}
@@ -761,10 +911,12 @@ class SchedulingTests(unittest.TestCase):
             self.assertIn('30', value)
             self.assertIn('queue', value)
             self.assertIn('concurrency', value)
+            self.assertIn('--scheduling-group', value)
             if command[0] in ('run', 'show'):
                 for name in ('scheduling', 'global_running', 'fair_share', 'prefix_warmup',
                              'queue_wait_seconds', 'cooldown_until_utc', 'scheduling.jsonl',
-                             'observed_at_utc', 'global_ready', 'global_eligible_ready', 'boot_id'):
+                             'observed_at_utc', 'global_ready', 'global_eligible_ready', 'boot_id',
+                             'group_running', 'eligible_ready', 'scheduling-group.json'):
                     self.assertIn(name, value)
 
     def test_help_tells_workflows_to_start_all_ready_batches_before_waiting(self):

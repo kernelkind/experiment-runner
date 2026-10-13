@@ -107,7 +107,7 @@ test('shared CLI warms the exact SSE prefix and accounts for real worker receipt
     return output;
   }
   try {
-    await command('prepare', 'ordinary', '--spec', 'spec.json');
+    await command('prepare', 'ordinary', '--spec', 'spec.json', '--scheduling-group', 'cache-integration');
     await command('prepare', 'cached', '--from', 'ordinary', '--prompt-cache');
     assert.equal(observations.length, 0);
     for (const name of ['ordinary', 'cached']) await command('run', name, '--attempt-budget', path.join(root, 'budget.json'));
@@ -126,6 +126,9 @@ test('shared CLI warms the exact SSE prefix and accounts for real worker receipt
     assert.equal(load('cached/report.json').usage.cached_input_tokens, 120);
     assert.equal(load('cached/report.json').summary.attempts, 3);
     assert.equal(load('cached/report.json').cache_warmup.attempts, 1);
+    assert.equal(load('cached/report.json').scheduling.scheduling_group, 'cache-integration');
+    assert.equal(load('cached/cache-warmups/0001/experiment.json').plan.scheduling_group, 'cache-integration');
+    assert.equal(load('cached/cache-warmups/0001/report.json').scheduling.scheduling_group, 'cache-integration');
     const stats = load('cached/report.json').usage.cost_statistics;
     assert.equal(stats.requests, 3);
     assert.equal(stats.comparison_requests, 2);

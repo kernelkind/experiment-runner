@@ -6,9 +6,11 @@ There is no daemon, per-experiment concurrency setting or second capacity pool.
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import sys
 import threading
@@ -29,6 +31,45 @@ def directory():
 
 def current_slot():
     return _slot.get()
+
+
+def validate_group(value):
+    if value is not None and (not isinstance(value, str)
+            or re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,63}', value) is None):
+        raise ValueError('scheduling group must be 1-64 letters, digits, dots, underscores or hyphens')
+    return value
+
+
+def bound_group(run_directory):
+    path = Path(run_directory) / 'scheduling-group.json'
+    if not path.exists():
+        return None
+    value = json.loads(path.read_text())
+    if (not isinstance(value, dict) or set(value) != {'schema_version', 'scheduling_group'}
+            or type(value['schema_version']) is not int or value['schema_version'] != 1
+            or value['scheduling_group'] is None):
+        raise ValueError('invalid saved scheduling group')
+    return validate_group(value['scheduling_group'])
+
+
+def bind_group(run_directory, group):
+    """Bind operational membership under the caller's experiment execution lock."""
+    group = validate_group(group)
+    saved = bound_group(run_directory)
+    if saved is not None:
+        if group is not None and saved != group:
+            raise ValueError('scheduling group differs from the saved execution binding')
+        return saved
+    if group is not None:
+        path = Path(run_directory) / 'scheduling-group.json'
+        temporary = path.with_name('.scheduling-group-' + secrets.token_hex(8))
+        temporary.write_text(json.dumps({'schema_version': 1, 'scheduling_group': group}) + '\n')
+        os.replace(temporary, path)
+    return group
+
+
+def _group(run, owner):
+    return run.get('group', 'batch:' + owner)
 
 
 def _ready(run):
@@ -105,8 +146,14 @@ def _fill_slots(gate, state, now):
     """Any coordinator can reserve the next fair registered waiters' slots."""
     queue = state['queue']
     counts = {owner: 0 for owner in queue['experiments']}
+    group_counts, group_grants = {}, {}
+    for owner, run in queue['experiments'].items():
+        group = _group(run, owner)
+        group_counts.setdefault(group, 0)
+        group_grants[group] = max(group_grants.get(group, 0), run['last_grant'])
     for job in queue['running'].values():
         counts[job['owner']] += 1
+        group_counts[_group(queue['experiments'][job['owner']], job['owner'])] += 1
     while gate.occupancy(state, now) < LIMIT:
         eligible = {}
         heads = {job['owner']: identifier for identifier, job in queue['waiting'].items()}
@@ -125,7 +172,10 @@ def _fill_slots(gate, state, now):
                 eligible[owner] = identifier
         if not eligible:
             return
-        owner = min(eligible, key=lambda value: (counts[value], queue['experiments'][value]['last_grant']))
+        owner = min(eligible, key=lambda value: (
+            group_counts[_group(queue['experiments'][value], value)],
+            group_grants[_group(queue['experiments'][value], value)],
+            counts[value], queue['experiments'][value]['last_grant']))
         identifier = eligible[owner]
         if identifier is None:
             # A ready owner may be handing its local admission lock to its next
@@ -152,6 +202,9 @@ def _fill_slots(gate, state, now):
             'expires': now + timeout + 30, 'provider_ticket': ticket}
         queue['sequence'] += 1
         run['last_grant'] = queue['sequence']
+        group = _group(run, owner)
+        group_grants[group] = queue['sequence']
+        group_counts[group] += 1
         run['endpoint_ready' if 'endpoint_ready' in run else 'ready'] -= 1
         counts[owner] += 1
 
@@ -162,6 +215,7 @@ def _snapshot(state, now, saved):
     occupied = SharedProviderBackoff.occupancy(state, now)
     epoch = time.time()
     experiments = {}
+    groups = {}
     for owner, run in queue['experiments'].items():
         running = [job for job in queue['running'].values() if job['owner'] == owner]
         waiting = [job for job in queue['waiting'].values() if job['owner'] == owner]
@@ -171,6 +225,7 @@ def _snapshot(state, now, saved):
         if reason == 'capacity' and occupied < LIMIT and not blocked:
             reason = 'ready'
         experiments[owner] = {
+            'group': _group(run, owner),
             'pid': run['pid'], 'queued': max(0, run['pending'] - len(running)),
             'running': len(running), 'ready': _ready(run), 'waiting': len(waiting),
             'eligible_ready': _ready(run) if not blocked and not run.get('pause_reason') else 0,
@@ -178,6 +233,11 @@ def _snapshot(state, now, saved):
             'cooldown_until_utc': (datetime.fromtimestamp(epoch + until - now, timezone.utc).isoformat()
                                    if until > now else None),
         }
+        group = groups.setdefault(_group(run, owner),
+            {'batches': 0, 'running': 0, 'queued': 0, 'ready': 0, 'eligible_ready': 0})
+        group['batches'] += 1
+        for key in ('running', 'queued', 'ready', 'eligible_ready'):
+            group[key] += experiments[owner][key]
     common = {
         'observed_at_utc': datetime.fromtimestamp(epoch, timezone.utc).isoformat(),
         'monotonic_seconds': now, 'boot_id': state['boot'],
@@ -185,6 +245,7 @@ def _snapshot(state, now, saved):
         'global_ready': sum(run['ready'] for run in experiments.values()),
         'global_eligible_ready': sum(run['eligible_ready'] for run in experiments.values()),
         'experiments': experiments,
+        'groups': groups,
     }
     run = queue['experiments'].get(saved['owner'])
     if run is None:
@@ -246,8 +307,11 @@ def pause(run_directory, reason='requested'):
 
 class ExperimentQueue:
     def __init__(self, run_directory, count, *, scopes=None, scope_loader=None,
-                 endpoint_loader=None, worker_identity=None):
+                 endpoint_loader=None, worker_identity=None, scheduling_group=None):
         self.path = Path(run_directory) / 'scheduling.json'
+        self.scheduling_group = bind_group(run_directory, scheduling_group)
+        group = self.scheduling_group or ('batch:' + hashlib.sha256(
+            str(Path(run_directory).resolve()).encode()).hexdigest())
         self.gate = SharedProviderBackoff(directory())
         self.owner = secrets.token_hex(16)
         self.scopes, self.scope_loader = scopes, scope_loader
@@ -261,13 +325,15 @@ class ExperimentQueue:
         self.pause_reason = None
         self.stopped = threading.Event()
         self.lock = threading.Lock()
-        self.saved = {'owner': self.owner, 'state': 'running', 'queued': count, 'running': 0,
+        self.saved = {'owner': self.owner, 'scheduling_group': self.scheduling_group,
+                      'group': group, 'state': 'running', 'queued': count, 'running': 0,
                       'queue_wait_seconds': 0, 'global_limit': LIMIT, 'valid': 0, 'failed': 0, 'reused': 0}
         self.last_progress = 0
         with self.gate._state() as (state, now):
             queue = _clean(state, now)
             queue['experiments'][self.owner] = {'pid': os.getpid(), 'process_start': process_start(os.getpid()),
-                'pending': count, 'ready': 0, 'scopes': None, 'last_grant': 0, 'until': 0, 'wait_reason': None}
+                'group': group, 'pending': count, 'ready': 0, 'scopes': None,
+                'last_grant': 0, 'until': 0, 'wait_reason': None}
             observation = _snapshot(state, now, self.saved)
         self._save()
         self._record(observation, 'started')
@@ -300,6 +366,8 @@ class ExperimentQueue:
                   f"wait={value.get('wait_reason') or '-'}"
                   f" observed_at_utc={value['observed_at_utc']} ready={value['ready']}"
                   f" global_ready={value['global_ready']} global_eligible_ready={value['global_eligible_ready']}"
+                  f" group={value.get('scheduling_group') or 'independent'}"
+                  f" group_running={value['groups'].get(value.get('group'), {}).get('running', 0)}"
                   + (f" eligible={value['cooldown_until_utc']}" if value.get('cooldown_until_utc') else ''),
                   file=sys.stderr, flush=True)
 

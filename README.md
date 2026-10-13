@@ -176,13 +176,49 @@ warmups and retries use those same slots. There is no concurrency CLI option.
 Remove `runner.concurrency` from new specs. Historical plans/configs remain
 readable and keep that field unchanged; it does not control dispatch.
 
-When several experiments have requests ready, the next freed slot goes to the
-experiment with fewer running requests, rotating equal contenders. When worker
-endpoint capacity permits, one run can use all 30; two sustained runs balance
-near 15 each, three near 10. A newcomer
-gets freed slots until it catches up; running requests are never preempted.
-Unused shares can be borrowed. Fairness is between experiments, rather than
-between agents or token budgets.
+When an overall experiment produces multiple batches, give all of them the
+same **scheduling group**. Slots are shared between groups first, then between
+their batches. A hundred ready distillation batches count as one contender
+against a hierarchy experiment. With sufficient ready work, two groups balance
+near 15 requests each, three near 10. A newcomer gets freed slots until it
+catches up; active requests finish normally. Groups with insufficient eligible
+work lend their unused capacity to the others. Account recovery and endpoint
+limits still apply.
+
+Set membership once during preparation:
+
+```bash
+bin/experiment-runner prepare target/batch-a --spec comparisons.json \
+  --scheduling-group distillation
+```
+
+Every child batch from that overall experiment must receive the same ID.
+Specs may instead provide top-level `"scheduling_group": "distillation"`.
+`prepare --from` inherits membership, including when selecting cases or creating
+a warmup. An ordinary ungrouped batch has its own allocation. IDs are 1–64
+letters, digits, dots, underscores or hyphens, beginning with a letter or digit;
+they identify the effort, not the prompt, model, cache key, batch or agent.
+Independent workflows belonging to the same effort must share the same ID.
+
+An older ungrouped prepared batch can join a group on its next run:
+
+```bash
+bin/experiment-runner run target/older-batch --scheduling-group distillation
+```
+
+Keep that run's existing authorization, budgets and limits. The runner saves
+membership in `run/scheduling-group.json`; subsequent resumes retain it without
+the flag. Conflicting prepared or saved membership is rejected before inference.
+Grouping changes no model request, saved receipt, cache key or exact-reuse
+identity. It cannot reassign a running coordinator: loaded coordinators retain
+their old scheduling policy until individually drained and resumed. Existing
+ungrouped coordinators remain readable; they do not implement group fairness.
+
+`show --json` reports `scheduling.scheduling_group` and `scheduling.groups`, with
+each group's batches, running, queued, ready and eligible-ready counts. Progress
+includes `group` and `group_running`; timestamped scheduling history retains
+the same coherent group counts. Fairness is per explicitly identified effort,
+not per agent or token budget.
 
 Waiting cases stay in the runner process; model workers start only after
 admission. Native workers advertise `experiment_scopes: true` in `--identity`
