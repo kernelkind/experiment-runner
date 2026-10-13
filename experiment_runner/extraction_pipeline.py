@@ -3769,17 +3769,20 @@ def _provider_retry_after_delay(record: dict[str, Any]) -> float | None:
 
 
 def provider_retry_delay(record: dict[str, Any], *, keep_retrying: bool = False) -> float | None:
-    """Retry temporary provider failures, retaining their lifetime attempt count."""
+    """Overload retries automatically; broader transient retries are opt-in."""
     if prompt_failure_kind(record) != "provider_transient":
         return None
-    if not keep_retrying and record["attempt"] >= 2:
+    error = (record.get("model_result") or {}).get("response_metadata", {}).get("error") or {}
+    overloaded = isinstance(error, dict) and error.get("code") == "server_is_overloaded"
+    if not overloaded and not keep_retrying and record["attempt"] >= 2:
         return None
     delay = _provider_retry_after_delay(record)
-    if keep_retrying:
+    if overloaded or keep_retrying:
         # Bound the exponent before calculating it; a long-lived case can have
         # an arbitrarily large saved counter. Explicit server deadlines win.
         backoff = min(60.0, 2.0 ** min(6, record["attempt"]))
-        return max(backoff, delay) if delay is not None else None
+        # An unusable header does not negate explicit overload evidence.
+        return max(backoff, delay or 0.0) if overloaded or delay is not None else None
     return delay if delay is not None and delay <= 60 else None
 
 
@@ -3981,8 +3984,8 @@ def _execute_prompt_batch(
         else:
             fresh.append((index, prompt))
     # A due retry takes priority; while it waits, fresh cases can use free slots.
-    # Only shared-pressure evidence delays the batch. Default retries retain
-    # their two-attempt lifetime bound; the explicit opt-in keeps backing off.
+    # Only shared-pressure evidence delays the batch. Explicit overload keeps
+    # retrying automatically; broader transient retries require the opt-in.
     try:
         with ThreadPoolExecutor(max_workers=concurrency) as pool:
             try:

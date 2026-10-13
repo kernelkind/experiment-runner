@@ -14,6 +14,32 @@ CLI = ROOT / 'bin/experiment-runner'
 
 
 class UpdateTests(unittest.TestCase):
+    def test_pause_stops_overload_retries_and_resume_preserves_the_counter(self):
+        self.prepare(count=1)
+        self.budget.write_text(json.dumps({'schema_version': 1, 'limit': 3, 'used': 0}))
+        self.env['FAKE_RUNNER_FAILURES'] = json.dumps({'E1-0': {'attempts': 100,
+            'metadata': {'http_status': 200, 'error': {'code': 'server_is_overloaded'}}}})
+        process = subprocess.Popen([str(CLI), 'run', 'E1', '--attempt-budget', str(self.budget)],
+            cwd=self.root, env=self.env, text=True, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, start_new_session=True)
+        self.processes.append(process)
+        deadline = time.monotonic() + 10
+        while len(self.calls()) < 2 and time.monotonic() < deadline:
+            time.sleep(.03)
+        self.assertEqual(len(self.calls()), 2)
+        self.cli('pause', 'E1')
+        stdout, stderr = process.communicate(timeout=5)
+        self.assertEqual(process.returncode, 0, stdout + stderr)
+        self.assertEqual(len(self.calls()), 2)
+        self.assertEqual(json.loads(self.budget.read_text())['used'], 2)
+        self.assertEqual(json.loads(self.cli('show', 'E1', '--json').stdout)['scheduling']['state'], 'paused')
+        del self.env['FAKE_RUNNER_FAILURES']
+        self.cli('run', 'E1', '--attempt-budget', str(self.budget))
+        receipts = [json.loads(line) for line in (self.root / 'E1/run/results.jsonl').read_text().splitlines()]
+        self.assertEqual([r['attempt'] for r in receipts], [1, 2, 3])
+        self.assertEqual(receipts[-1]['status'], 'succeeded')
+        self.assertEqual(json.loads(self.budget.read_text())['used'], 3)
+
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)

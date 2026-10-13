@@ -364,6 +364,42 @@ class NativePrefixTests(unittest.TestCase):
                  ok=False, env={'FAKE_RUNNER_FAIL_STAGE': 'prompt'})
         self.assertEqual(self.show('local')['summary']['attempts'], 1)
 
+    def test_explicit_overload_continues_within_one_run_until_third_attempt_succeeds(self):
+        self.prepare('overload-live')
+        env = {'FAKE_RUNNER_FAILURES': json.dumps({'Tea': {'attempts': 2,
+            'metadata': {'http_status': 200, 'error': {'code': 'server_is_overloaded'}}}})}
+        self.cli('run', 'overload-live', '--only', 'one', '--max-new-attempts', '3', env=env)
+        records = [json.loads(line) for line in
+                   (self.root / 'overload-live/run/results.jsonl').read_text().splitlines()]
+        self.assertEqual([r['status'] for r in records], ['failed', 'failed', 'succeeded'])
+        self.assertEqual([r['attempt'] for r in records], [1, 2, 3])
+        self.assertEqual(len({r['prompt_sha256'] for r in records}), 1)
+        self.assertTrue(all(r['model_result']['http_attempts'] == 1 for r in records))
+        self.assertEqual(len(self.calls()), 3)
+
+    def test_explicit_overload_retries_until_success_and_preserves_attempts_on_resume(self):
+        self.prepare('overload')
+        budget = self.write('overload-budget.json', {'schema_version': 1, 'limit': 3, 'used': 0})
+        failures = {'Tea': {'attempts': 2, 'metadata': {
+            'http_status': 200, 'error': {'code': 'server_is_overloaded'}}}}
+        env = {'FAKE_RUNNER_FAILURES': json.dumps(failures)}
+        self.cli('run', 'overload', '--only', 'one', '--max-new-attempts', '2',
+                 '--attempt-budget', budget, ok=False, env=env)
+        receipts = self.root / 'overload/run/results.jsonl'
+        original = receipts.read_bytes()
+        self.assertEqual([r['attempt'] for r in map(json.loads, original.splitlines())], [1, 2])
+        self.assertEqual(json.loads(budget.read_text())['used'], 2)
+        self.cli('run', 'overload', '--only', 'one', '--attempt-budget', budget, env=env)
+        self.assertTrue(receipts.read_bytes().startswith(original))
+        rows = [json.loads(line) for line in receipts.read_text().splitlines()]
+        self.assertEqual([r['attempt'] for r in rows], [1, 2, 3])
+        self.assertEqual([r['status'] for r in rows], ['failed', 'failed', 'succeeded'])
+        self.assertEqual(len({r['prompt_sha256'] for r in rows}), 1)
+        self.assertEqual(json.loads(budget.read_text())['used'], 3)
+        self.assertEqual(len(self.calls()), 3)
+        self.cli('run', 'overload', '--only', 'one', '--attempt-budget', budget, env=env)
+        self.assertEqual(len(self.calls()), 3, 'completed overload recovery should reuse its result')
+
     def test_run_only_dispatches_selected_cases_and_keeps_the_full_frozen_report(self):
         self.prepare()
         directory = self.root / 'E1'

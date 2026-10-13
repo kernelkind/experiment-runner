@@ -158,22 +158,33 @@ that many successful completions. Failures from requests already in flight
 share one backoff generation; a late failure does not restart recovery or
 extend the wait unless it carries an explicit `Retry-After`. A new failure
 during recovery can increase backoff. Resume does not recreate a new outage
-from an old receipt. Retry eligibility remains separate: each case gets at
-most two lifetime attempts, with a minimum two-second retry delay honoring
-`Retry-After`; delays over 60 seconds or invalid headers prevent an automatic
-retry. Observe successful completions per minute alongside failure counts,
-retry usage/cost and admission history when assessing actual throughput.
+from an old receipt. Explicit `server_is_overloaded` responses keep retrying
+automatically with per-request 2/4/8/.../60-second exponential backoff; there is
+no two-attempt cutoff for overload. Longer valid `Retry-After` values take
+precedence; malformed values fall back to exponential backoff. Saved attempt
+counts survive resume, including overload cases previously stopped at attempt
+two. Every retry consumes the authorized attempt/spending allowance, and pause
+or cancellation stops new attempts. Failure receipts are preserved.
+
+Other transient failures retain at most two lifetime attempts by default, with a minimum
+two-second retry delay honoring `Retry-After`; delays over 60 seconds or invalid
+headers prevent their automatic retry. Local, validation and unknown failures
+are not automatically retried. Observe successful completions per minute
+alongside failure counts, retry usage/cost and admission history when assessing
+actual throughput.
 
 When explicitly authorized to keep retrying temporary provider failures, use
 `run EXPERIMENT --keep-retrying-provider-errors`. This removes the two-attempt
 lifetime bound for recognized transient provider errors, with per-case
 2/4/8/.../60-second exponential backoff. Longer valid `Retry-After` values are
-honored; malformed headers prevent retry. The same experiment, exact request,
-saved receipts and lifetime attempt counter are retained on resume. Successful
+honored; malformed headers prevent retry for these other errors. The same
+experiment, exact request, saved receipts and lifetime attempt counter are
+retained on resume. Successful
 answers are never redrawn. Warmups use the same retry policy. Local crashes,
 timeouts, invalid outputs, source changes, unknown errors and fatal provider
 errors are not retried by this option. Attempt and spending caps still apply,
-and every failed attempt counts. The default two-attempt policy is unchanged.
+and every failed attempt counts. Explicit overload recovery is automatic and
+does not need this option; other failures retain the default two-attempt policy.
 
 Queued work consumes no attempt reservation;
 once admitted, existing conservative accounting remains in force. Failed or

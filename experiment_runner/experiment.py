@@ -1425,12 +1425,17 @@ Internal request queue:
   Active requests finish normally. Late in-flight failures share one cooldown
   generation, except explicit Retry-After deadlines. Recovery starts at one
   request and doubles after successful completions; new pressure can slow it.
-  Cases keep at most two lifetime attempts, including saved attempts on resume.
-  Old receipts do not recreate an outage. Invalid or >60s Retry-After prevents
-  default automatic retry. Explicit run --keep-retrying-provider-errors retries
-  temporary provider failures with per-case 2/4/8/.../60s exponential backoff,
-  honoring longer valid Retry-After values. Saved attempt counters survive resume.
-  Attempt/spending caps still apply. Local, validation and fatal errors stop.
+  Explicit server_is_overloaded errors keep retrying automatically with per-case
+  2/4/8/.../60s exponential backoff. There is no two-attempt cutoff for overload.
+  Honor longer valid Retry-After; malformed values fall back to exponential delay.
+  Saved attempt counts survive resume. Attempts/spending caps, pause and cancel
+  still apply. Other transient errors keep their two-attempt lifetime bound;
+  invalid or >60s Retry-After prevents their automatic retry. Local, validation
+  and unknown errors do not retry. Old receipts do not recreate an outage.
+  Explicit run --keep-retrying-provider-errors also keeps retrying other recognized
+  transient provider errors with exponential backoff, honoring valid Retry-After.
+  It does not retry local, validation, fatal or unknown errors. No flag is needed
+  for explicit overload recovery.
   Measure successful completions/minute, failures and retry cost.
   Workers launch only after admission; queued cases consume no attempt budget.
   Warmups and retries share the same slots/budget. Reused answers need neither.

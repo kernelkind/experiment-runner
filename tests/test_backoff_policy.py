@@ -69,6 +69,22 @@ class BackoffPolicyTests(unittest.TestCase):
                 self.gate.report(ticket, failed)
                 self.assertIn('ticket', self.acquire(scopes))
 
+    def test_explicit_overload_retries_beyond_two_attempts_with_exponential_delay(self):
+        failed = self.failure({'http_status': 200, 'error': {'code': 'server_is_overloaded'}})
+        for attempt, delay in ((1, 2), (2, 4), (3, 8), (6, 60), (10000, 60)):
+            with self.subTest(attempt=attempt):
+                failed['attempt'] = attempt
+                self.assertEqual(provider_retry_delay(failed), delay)
+        failed['model_result']['response_metadata']['retry_after'] = '120'
+        self.assertEqual(provider_retry_delay(failed), 120)
+        failed['model_result']['response_metadata']['retry_after'] = 'invalid'
+        self.assertEqual(provider_retry_delay(failed), 60)
+
+    def test_other_transient_failures_keep_the_existing_retry_bound(self):
+        failed = self.stream_failure()
+        failed['attempt'] = 2
+        self.assertIsNone(provider_retry_delay(failed))
+
     def test_in_flight_failures_share_one_cooldown_and_recover_capacity(self):
         first = self.acquire()['ticket']
         second = self.acquire()['ticket']
