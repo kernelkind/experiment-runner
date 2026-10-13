@@ -304,7 +304,12 @@ Each run retains append-only operational history at
 startup, readiness, admission, release/cancellation, prefix-warmup boundaries,
 batch backoff, periodic progress and completion. Each row captures
 `observed_at_utc`, `monotonic_seconds`, `boot_id`, occupancy, ready counts and
-blocking reasons from the same locked queue state. `experiments` gives each
+blocking reasons from one coherent atomic queue-state read. Observations do not
+take the admission lock or rewrite authoritative state; admission, release and
+provider recovery still validate and update state under that lock. Waiters at
+full capacity use these read-only hints until a reservation, pause, expiry or
+free slot appears, with a bounded locked refresh for stale owners.
+`experiments` gives each
 active owner's PID, queued/ready/eligible-ready/running/waiting counts,
 `wait_reason`, `pause_reason` and cooldown deadline. `waiting` counts shared
 admission entries; additional ready threads wait locally.

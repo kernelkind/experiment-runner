@@ -61,12 +61,17 @@ def _blocked(state, run, now):
     return reason, until
 
 
-def _clean(state, now):
+def _queue_state(state):
     queue = state.setdefault('queue', {'experiments': {}, 'waiting': {}, 'running': {}, 'sequence': 0})
     if (not isinstance(queue, dict) or set(queue) != {'experiments', 'waiting', 'running', 'sequence'}
             or any(not isinstance(queue[key], dict) for key in ('experiments', 'waiting', 'running'))
             or type(queue['sequence']) is not int):
         raise ValueError('invalid experiment queue state')
+    return queue
+
+
+def _clean(state, now):
+    queue = _queue_state(state)
     for owner, run in list(queue['experiments'].items()):
         if process_start(run['pid']) != run['process_start']:
             alive = [job for job in queue['running'].values() if job['owner'] == owner
@@ -152,7 +157,7 @@ def _fill_slots(gate, state, now):
 
 
 def _snapshot(state, now, saved):
-    """Capture counts and constraints together while holding the shared state lock."""
+    """Capture counts and constraints from one coherent decoded state."""
     queue = _clean(state, now)
     occupied = SharedProviderBackoff.occupancy(state, now)
     epoch = time.time()
@@ -219,8 +224,8 @@ def snapshot(run_directory):
         return {'state': 'idle', 'queued': 0, 'running': 0, 'global_limit': LIMIT}
     saved = json.loads(path.read_text())
     gate = SharedProviderBackoff(directory())
-    with gate._state() as (state, now):
-        return _snapshot(state, now, saved)
+    state, now = gate.observation()
+    return _snapshot(state, now, saved)
 
 
 def pause(run_directory, reason='requested'):
@@ -321,13 +326,44 @@ class ExperimentQueue:
         self._record(observation, 'prefix_warmup_started' if active else 'prefix_warmup_finished')
 
     def check_pause(self):
-        with self.gate._state() as (state, now):
-            queue = _clean(state, now)
+        try:
+            queue = _queue_state(self.gate.read_state())
             self.pause_reason = queue['experiments'][self.owner].get('pause_reason')
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            with self.gate._state() as (state, now):
+                queue = _clean(state, now)
+                self.pause_reason = queue['experiments'][self.owner].get('pause_reason')
         if self.pause_reason:
             self.stopped.set()
             from .extraction_pipeline import ExperimentPaused
             raise ExperimentPaused('experiment paused: ' + self.pause_reason)
+
+    def _wait_hint(self, identifier, refresh_at):
+        """Busy observations only defer polling; every grant stays under the lock."""
+        if self.stopped.is_set() or time.monotonic() >= refresh_at:
+            return False
+        try:
+            state = self.gate.read_state()
+            queue = _queue_state(state)
+            run = queue['experiments'][self.owner]
+            if (run.get('pause_reason') or identifier in queue['running']
+                    or identifier not in queue['waiting']):
+                return False
+            now = time.monotonic()
+            running = queue['running'].values()
+            if (any(job['expires'] <= now for job in running)
+                    or any(ticket['expires'] <= now for ticket in state['tickets'].values())):
+                return False
+            # Deliberately conservative: no repeated process-liveness scans in
+            # idle pollers. Periodic locked refresh removes stale reservations.
+            tracked = {job['provider_ticket'] for job in running}
+            occupied = len(queue['running']) + sum(key not in tracked for key in state['tickets'])
+            if occupied >= LIMIT:
+                return True
+            blocked, _ = _blocked(state, run, now)
+            return blocked is not None
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            return False
 
     def check_worker(self, identity):
         self.check_pause()
@@ -424,7 +460,12 @@ class ExperimentQueue:
                                                        if self.endpoint_admission is not None else {})}
                     queue['waiting'][identifier] = waiter
                     registered = True
+                refresh_at = 0
                 while True:
+                    if self._wait_hint(identifier, refresh_at):
+                        self.progress()
+                        time.sleep(0.1)
+                        continue
                     admitted = False
                     with self.gate._state() as (state, now):
                         queue = _clean(state, now)
@@ -456,6 +497,7 @@ class ExperimentQueue:
                                 job['wait_reason'] = 'capacity' if self.gate.occupancy(state, now) >= LIMIT else 'fair_share'
                     if admitted:
                         break
+                    refresh_at = time.monotonic() + 5 + int(self.owner[:8], 16) % 1000 / 1000
                     self.progress()
                     time.sleep(0.1)
             self._record(observation, 'admitted')

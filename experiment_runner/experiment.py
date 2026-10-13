@@ -1462,7 +1462,7 @@ Internal request queue:
   and global_eligible_ready sum across experiments. Ready warmups count once.
   Timestamped history: EXPERIMENT/run/scheduling.jsonl, beside scheduling.json.
   Each observation retains observed_at_utc, monotonic_seconds, boot_id, counts
-  and all active experiments' wait/pause reasons from one locked queue state.
+  and all active experiments' wait/pause reasons from one coherent atomic state read.
   Startup/ready/admitted/released/cancelled/warmup/backoff/finished transitions
   and periodic progress are retained; resume appends without rewriting history.
   For empty slots, inspect global_running < 30 with global_eligible_ready > 0

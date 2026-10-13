@@ -48,6 +48,76 @@ class SharedProviderBackoff:
             raise ValueError('invalid experiment backoff scopes')
         return {role: role + ':' + value for role, value in scopes.items()}
 
+    def _read_state(self):
+        """Read one atomic private state file; no admission or cleanup writes."""
+        try:
+            descriptor = os.open(self.directory / 'state.json', os.O_RDONLY | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            return None
+        with os.fdopen(descriptor) as source:
+            info = os.fstat(source.fileno())
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or info.st_mode & 0o077 or info.st_size > 1_048_576):
+                raise ValueError('invalid experiment backoff state file')
+            try:
+                state = json.load(source)
+            except (ValueError, UnicodeError) as error:
+                raise ValueError('invalid experiment backoff state') from error
+        if (not isinstance(state, dict) or state.get('schema_version') != 1
+                or not isinstance(state.get('scopes'), dict)
+                or not isinstance(state.get('tickets'), dict)
+                or len(state['scopes']) > 256 or len(state['tickets']) > 1024):
+            raise ValueError('invalid experiment backoff state')
+        if state.get('boot') != self.boot:
+            return state
+        for value in state['scopes'].values():
+            if (not isinstance(value, dict) or set(value) != {
+                    'seconds', 'until', 'generation', 'limit', 'successes', 'ceiling', 'updated'}
+                    or any(type(value[name]) not in (int, float) or not math.isfinite(value[name])
+                           or value[name] < 0 for name in value)
+                    or value['seconds'] > 60 or value['limit'] > value['ceiling']):
+                raise ValueError('invalid experiment backoff scope state')
+        for ticket in state['tickets'].values():
+            if (not isinstance(ticket, dict) or set(ticket) != {
+                    'pid', 'process_start', 'expires', 'started', 'generations', 'limits', 'concurrency'}
+                    or type(ticket['pid']) is not int
+                    or type(ticket['concurrency']) is not int or not 1 <= ticket['concurrency'] <= 1024
+                    or any(type(ticket[key]) not in (int, float) or not math.isfinite(ticket[key])
+                           for key in ('expires', 'started'))
+                    or not isinstance(ticket['generations'], dict)
+                    or not isinstance(ticket['limits'], dict)):
+                raise ValueError('invalid experiment backoff ticket')
+        return state
+
+    def read_state(self):
+        """Validated advisory state; callers must lock before changing admission."""
+        state = self._read_state()
+        if state is None or state.get('boot') != self.boot:
+            raise ValueError('experiment backoff state is unavailable for observation')
+        return state
+
+    @staticmethod
+    def _clean_state(state, now):
+        for identifier, ticket in list(state['tickets'].items()):
+            if ticket['expires'] <= now or process_start(ticket['pid']) != ticket['process_start']:
+                del state['tickets'][identifier]
+        occupied = {key for ticket in state['tickets'].values() for key in ticket['generations']}
+        for key, value in list(state['scopes'].items()):
+            if key not in occupied and value['until'] <= now and value['updated'] + 3600 < now:
+                del state['scopes'][key]
+
+    def observation(self):
+        """Clean a decoded observation only; authoritative state remains locked."""
+        try:
+            state = self.read_state()
+        except (OSError, ValueError):
+            # Preserve normal initialization, boot reset and error diagnostics.
+            with self._state() as value:
+                return value
+        now = time.monotonic()
+        self._clean_state(state, now)
+        return state, now
+
     @contextmanager
     def _state(self):
         descriptor = os.open(self.directory / 'state.lock',
@@ -55,51 +125,12 @@ class SharedProviderBackoff:
         with os.fdopen(descriptor, 'a') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             path = self.directory / 'state.json'
-            try:
-                descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
-            except FileNotFoundError:
-                state = {'schema_version': 1, 'boot': self.boot, 'scopes': {}, 'tickets': {}}
-            else:
-                with os.fdopen(descriptor) as source:
-                    info = os.fstat(source.fileno())
-                    if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
-                            or info.st_mode & 0o077 or info.st_size > 1_048_576):
-                        raise ValueError('invalid experiment backoff state file')
-                    try:
-                        state = json.load(source)
-                    except (ValueError, UnicodeError) as error:
-                        raise ValueError('invalid experiment backoff state') from error
-            if (not isinstance(state, dict) or state.get('schema_version') != 1
-                    or not isinstance(state.get('scopes'), dict)
-                    or not isinstance(state.get('tickets'), dict)
-                    or len(state['scopes']) > 256 or len(state['tickets']) > 1024):
-                raise ValueError('invalid experiment backoff state')
+            state = self._read_state() or {'schema_version': 1, 'boot': self.boot, 'scopes': {}, 'tickets': {}}
             if state.get('boot') != self.boot:
                 state = {'schema_version': 1, 'boot': self.boot, 'scopes': {}, 'tickets': {}}
             previous = json.dumps(state, sort_keys=True, separators=(',', ':'), allow_nan=False)
             now = time.monotonic()
-            for value in state['scopes'].values():
-                if (not isinstance(value, dict) or set(value) != {
-                        'seconds', 'until', 'generation', 'limit', 'successes', 'ceiling', 'updated'}
-                        or any(type(value[name]) not in (int, float) or not math.isfinite(value[name])
-                               or value[name] < 0 for name in value)
-                        or value['seconds'] > 60 or value['limit'] > value['ceiling']):
-                    raise ValueError('invalid experiment backoff scope state')
-            for identifier, ticket in list(state['tickets'].items()):
-                if (not isinstance(ticket, dict) or set(ticket) != {
-                        'pid', 'process_start', 'expires', 'started', 'generations', 'limits', 'concurrency'}
-                        or type(ticket['pid']) is not int
-                        or type(ticket['concurrency']) is not int or not 1 <= ticket['concurrency'] <= 1024
-                        or type(ticket['expires']) not in (int, float)
-                        or not isinstance(ticket['generations'], dict)
-                        or not isinstance(ticket['limits'], dict)):
-                    raise ValueError('invalid experiment backoff ticket')
-                if (ticket['expires'] <= now or process_start(ticket['pid']) != ticket['process_start']):
-                    del state['tickets'][identifier]
-            occupied = {key for ticket in state['tickets'].values() for key in ticket['generations']}
-            for key, value in list(state['scopes'].items()):
-                if key not in occupied and value['until'] <= now and value['updated'] + 3600 < now:
-                    del state['scopes'][key]
+            self._clean_state(state, now)
             yield state, now
             if json.dumps(state, sort_keys=True, separators=(',', ':'), allow_nan=False) == previous:
                 return

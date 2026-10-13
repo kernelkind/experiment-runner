@@ -4,7 +4,7 @@ import io
 import os
 import signal
 from pathlib import Path
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import subprocess
 import tempfile
 import tarfile
@@ -166,6 +166,124 @@ class SchedulingTests(unittest.TestCase):
             resume.set()
             self.assertTrue(entered[0].wait(1))
         self.assertEqual(errors, [])
+
+    def test_full_capacity_waiter_observes_capacity_without_repeated_host_locks(self):
+        from experiment_runner import scheduling
+
+        with patch.dict(os.environ, self.env):
+            for name in ('busy', 'waiting'):
+                (self.root / name).mkdir()
+            scopes = {'account': 'a' * 64, 'transport': 'b' * 64}
+            busy = scheduling.ExperimentQueue(self.root / 'busy', 30, scopes=scopes)
+            waiting = scheduling.ExperimentQueue(self.root / 'waiting', 1, scopes=scopes)
+            entered, release = threading.Event(), threading.Event()
+            original, calls, errors = waiting.gate._state, [], []
+
+            @contextmanager
+            def counted_state():
+                calls.append(time.monotonic())
+                with original() as value:
+                    yield value
+
+            def run():
+                try:
+                    with waiting.slot('candidate', 30):
+                        entered.set()
+                        release.wait(2)
+                except BaseException as error:
+                    errors.append(error)
+
+            worker = threading.Thread(target=run)
+            try:
+                with ExitStack() as leases:
+                    for number in range(30):
+                        leases.enter_context(busy.slot(str(number), 30))
+                    with patch.object(waiting.gate, '_state', counted_state):
+                        worker.start()
+                        self.until(lambda: scheduling.snapshot(waiting.path.parent)['ready'] == 1)
+                        before = len(calls)
+                        threading.Event().wait(0.35)
+                        self.assertFalse(entered.is_set())
+                        self.assertLessEqual(len(calls) - before, 1,
+                                             'full-capacity polling repeatedly locked the host queue')
+                    # Releasing existing reservations must remain immediately
+                    # visible to a waiter; hints never grant a request themselves.
+                self.assertTrue(entered.wait(1), errors)
+            finally:
+                release.set()
+                if worker.ident is not None:
+                    worker.join(timeout=3)
+                busy.close()
+                waiting.close()
+            self.assertEqual(errors, [])
+            self.assertFalse(worker.is_alive())
+
+    def test_pause_checks_and_progress_observations_do_not_lock_or_rewrite_state(self):
+        from experiment_runner import scheduling
+        from experiment_runner.extraction_pipeline import ExperimentPaused
+
+        with patch.dict(os.environ, self.env):
+            (self.root / 'sample').mkdir()
+            queue = scheduling.ExperimentQueue(self.root / 'sample', 1)
+            try:
+                state_path = queue.gate.directory / 'state.json'
+                before = state_path.read_bytes()
+                with patch.object(type(queue.gate), '_state', side_effect=AssertionError('observation locked')):
+                    queue.check_pause()
+                    status = scheduling.snapshot(queue.path.parent)
+                    queue.progress(force=True)
+                self.assertEqual(status['state'], 'running')
+                self.assertEqual(state_path.read_bytes(), before)
+                scheduling.pause(queue.path.parent, 'test pause')
+                with patch.object(type(queue.gate), '_state', side_effect=AssertionError('pause check locked')):
+                    with self.assertRaises(ExperimentPaused):
+                        queue.check_pause()
+            finally:
+                queue.close()
+
+    def test_observation_cleans_expired_tickets_without_mutating_authoritative_state(self):
+        from experiment_runner import scheduling
+
+        with patch.dict(os.environ, self.env):
+            (self.root / 'sample').mkdir()
+            queue = scheduling.ExperimentQueue(self.root / 'sample', 1,
+                scopes={'account': 'a' * 64, 'transport': 'b' * 64})
+            try:
+                ticket = queue.gate.try_acquire(queue.scopes, concurrency=30,
+                    timeout_seconds=30, owner_pid=os.getpid())['ticket']
+                with queue.gate._state() as (state, now):
+                    state['tickets'][ticket]['expires'] = now - 1
+                before = (queue.gate.directory / 'state.json').read_bytes()
+                self.assertEqual(scheduling.snapshot(queue.path.parent)['global_running'], 0)
+                self.assertEqual((queue.gate.directory / 'state.json').read_bytes(), before)
+                with queue.gate._state() as (state, _):
+                    self.assertEqual(state['tickets'], {})
+            finally:
+                queue.close()
+
+    def test_advisory_observation_rejects_unsafe_state_through_locked_validation(self):
+        from experiment_runner import scheduling
+
+        with patch.dict(os.environ, self.env):
+            (self.root / 'sample').mkdir()
+            queue = scheduling.ExperimentQueue(self.root / 'sample', 1)
+            state_path = queue.gate.directory / 'state.json'
+            original = queue.gate._state
+            try:
+                state_path.chmod(0o644)
+                with patch.object(type(queue.gate), '_state', wraps=original) as locked:
+                    with self.assertRaisesRegex(ValueError, 'invalid experiment backoff state file'):
+                        scheduling.snapshot(queue.path.parent)
+                    self.assertEqual(locked.call_count, 1)
+                state_path.chmod(0o600)
+                before = state_path.read_bytes()
+                state_path.write_text('{')
+                with self.assertRaisesRegex(ValueError, 'invalid experiment backoff state'):
+                    queue.check_pause()
+                state_path.write_bytes(before)
+            finally:
+                state_path.chmod(0o600)
+                queue.close()
 
     def test_pause_releases_a_peer_reservation_before_its_waiter_adopts_it(self):
         from experiment_runner import scheduling
