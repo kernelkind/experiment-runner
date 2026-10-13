@@ -11,13 +11,16 @@ OPERATIONAL_FILES = frozenset({
 
 
 def request_code(identity):
+    registry = Path(__file__).with_name('frontier_runner') / 'request-compatibility.json'
+    known = json.loads(registry.read_text())
     value = identity.get('request_code_sha256')
     if value is not None:
         if not isinstance(value, str) or len(value) != 64 or any(c not in '0123456789abcdef' for c in value):
             raise ValueError('invalid request code SHA-256')
-        return value
-    registry = Path(__file__).with_name('frontier_runner') / 'request-compatibility.json'
-    return json.loads(registry.read_text()).get(identity.get('runner_sha256'))
+        # Exact, reviewed observation-only revisions share a request family.
+        # Unknown fingerprints still compare strictly; raw receipts stay intact.
+        return known.get(value, value)
+    return known.get(identity.get('runner_sha256'))
 
 
 def compatible(original, current):

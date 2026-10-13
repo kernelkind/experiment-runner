@@ -118,22 +118,51 @@ test('WebSocket: unsupported provider and unknown transport are refused', async 
   await assert.rejects(prepare({ ...config, transport: 'auto' }), /transport/);
 });
 
-test('WebSocket: rejected upgrade is one attempt with no SSE request', async () => {
+for (const status of [403, 429, 503]) test(`WebSocket: rejected ${status} upgrade retains status and retry headers without fallback`, async () => {
   let upgrades = 0;
   let posts = 0;
   const server = createServer((_request, response) => { posts++; response.writeHead(500); response.end(); });
-  server.on('upgrade', (_request, socket) => { upgrades++; socket.end('HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n'); });
+  server.on('upgrade', (_request, socket) => { upgrades++; socket.end(
+    `HTTP/1.1 ${status} Fixture failure\r\nContent-Length: 0\r\nRetry-After: 120\r\nRetry-After-Ms: 120000\r\n\r\n`); });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   try {
     const request = await prepare(config);
     request.model = { ...request.model, baseUrl: `http://127.0.0.1:${server.address().port}/test/pi` };
     const receipt = await execute(request, { apiKey: token });
     assert.equal(receipt.valid, false);
-    assert.equal(receipt.response_metadata.http_status, undefined);
+    assert.equal(receipt.response_metadata.http_status, status);
+    assert.equal(receipt.response_metadata.retry_after, '120');
+    assert.equal(receipt.response_metadata.retry_after_ms, '120000');
     assert.equal(receipt.response_metadata.transport_error.phase, 'headers');
     assert.equal(upgrades, 1);
     assert.equal(posts, 0);
     assert.equal(receipt.http_attempts, 1);
+  } finally {
+    server.closeAllConnections();
+    await new Promise(resolve => server.close(resolve));
+  }
+});
+
+test('WebSocket: concurrent rejected upgrades keep separate statuses and deadlines', async () => {
+  const server = createServer((_request, response) => { response.writeHead(500); response.end(); });
+  let upgrades = 0;
+  server.on('upgrade', (request, socket) => {
+    upgrades++;
+    const status = request.url.startsWith('/busy/') ? 503 : 403;
+    const delay = status === 503 ? 12 : 34;
+    socket.end(`HTTP/1.1 ${status} Fixture failure\r\nContent-Length: 0\r\nRetry-After: ${delay}\r\n\r\n`);
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const results = await Promise.all(['busy', 'denied'].map(async name => {
+      const request = await prepare(config);
+      request.model = { ...request.model, baseUrl: `http://127.0.0.1:${server.address().port}/${name}/pi` };
+      return execute(request, { apiKey: token });
+    }));
+    assert.deepEqual(results.map(result => result.response_metadata.http_status), [503, 403]);
+    assert.deepEqual(results.map(result => result.response_metadata.retry_after), ['12', '34']);
+    assert.equal(upgrades, 2);
+    assert.ok(results.every(result => result.http_attempts === 1 && !result.valid));
   } finally {
     server.closeAllConnections();
     await new Promise(resolve => server.close(resolve));

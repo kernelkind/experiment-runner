@@ -357,6 +357,9 @@ function errorDetails(error, redact, depth = 0) {
     else if (typeof value === 'number' && Number.isFinite(value)) details[key] = value;
   }
   Object.assign(details, scalarFields(error?.metadata, ['provider_name', 'error_type', 'provider_code'], redact));
+  if (error?.metadata?.limit_source === 'openrouter_in_flight_budget') {
+    details.limit_source = 'openrouter_in_flight_budget';
+  }
   if (error?.cause && depth < 2) details.cause = errorDetails(error.cause, redact, depth + 1);
   return details;
 }
@@ -393,19 +396,33 @@ function upstreamRequestSummary(body, redact) {
 }
 
 // Observe metadata and timing without retaining another copy of the token stream.
-function observeResponse(response, metadata, timing, elapsed, redact, captureDebug, provider) {
+async function observeResponse(response, metadata, timing, elapsed, redact, captureDebug, provider) {
   timing.headers_ms = elapsed();
   metadata.http_status = response.status;
   for (const [header, key] of [['x-request-id', 'request_id'], ['retry-after', 'retry_after'],
+    ['retry-after-ms', 'retry_after_ms'],
     ['x-agent-request-id', 'proxy_request_id']]) {
     const value = response.headers.get(header);
     if (value) metadata[key] = redact(value).slice(0, 1024);
   }
+  const retry = response.headers.get('x-should-retry');
+  if (retry === 'true' || retry === 'false') metadata.should_retry = retry === 'true';
   // The Codex SDK parses successful bodies as SSE regardless of Content-Type.
   // Observe that same body; otherwise SDK usage survives while raw metadata is
   // silently lost. OpenRouter still respects an explicitly different type.
   const contentType = response.headers.get('content-type');
-  if (!response.ok || !response.body || (provider !== 'openai-codex'
+  if (!response.ok) {
+    // The SDK turns rejection bodies into friendly prose. Preserve their
+    // structured classification first, without another request or raw body.
+    try {
+      const body = await response.clone().json();
+      if (body?.error && typeof body.error === 'object' && !Array.isArray(body.error)) {
+        metadata.error = errorDetails(body.error, redact);
+      }
+    } catch { /* Non-JSON rejections remain classified by actual HTTP status. */ }
+    return response;
+  }
+  if (!response.body || (provider !== 'openai-codex'
       && contentType && !contentType.includes('text/event-stream'))) return response;
   const decoder = new TextDecoder();
   let buffer = '';
@@ -541,10 +558,12 @@ async function executeDecisions(request, { apiKey, fetch, signal }) {
   try {
     const response = await fetch(url, init);
     metadata.http_status = response.status;
-    for (const [header, key] of [['retry-after', 'retry_after'], ['x-request-id', 'request_id'],
+    for (const [header, key] of [['retry-after', 'retry_after'], ['retry-after-ms', 'retry_after_ms'], ['x-request-id', 'request_id'],
       ['x-agent-request-id', 'proxy_request_id']]) {
       if (response.headers.has(header)) metadata[key] = response.headers.get(header);
     }
+    const retry = response.headers.get('x-should-retry');
+    if (retry === 'true' || retry === 'false') metadata.should_retry = retry === 'true';
     phase = 'body';
     rawResponse = await response.text();
     phase = 'parse';
@@ -624,7 +643,7 @@ async function executeModel(request, { apiKey, fetch = globalThis.fetch, signal,
       let response;
       try {
         response = request.transport === 'websocket' && !offline
-          ? await websocketResponse(wire, init, responseMetadata, abort)
+          ? await websocketResponse(wire, init, responseMetadata, abort, redact)
           : await fetch(input, { ...init, dispatcher: streamDispatcher });
       }
       catch (error) {
@@ -632,7 +651,7 @@ async function executeModel(request, { apiKey, fetch = globalThis.fetch, signal,
         timing.error_ms = elapsed();
         throw error;
       }
-      const observed = observeResponse(response, responseMetadata, timing, elapsed, redact, request.debug?.echo_upstream_body,
+      const observed = await observeResponse(response, responseMetadata, timing, elapsed, redact, request.debug?.echo_upstream_body,
         request.model.provider);
       // observeResponse sees the in-process parser interface. Never report its
       // synthetic status as a successful HTTP request to the server.

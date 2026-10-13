@@ -107,10 +107,13 @@ function policyFacts(result) {
   const metadata = result.response_metadata;
   const facts = {};
   if (Number.isInteger(metadata.http_status)) facts.http_status = metadata.http_status;
-  if (metadata.retry_after !== undefined) facts.retry_after =
-    typeof metadata.retry_after === 'string' && metadata.retry_after.length <= 128
-      || typeof metadata.retry_after === 'number' && Number.isFinite(metadata.retry_after)
-      ? metadata.retry_after : 'invalid';
+  for (const key of ['retry_after', 'retry_after_ms']) {
+    if (metadata[key] !== undefined) facts[key] =
+      typeof metadata[key] === 'string' && metadata[key].length <= 128
+        || typeof metadata[key] === 'number' && Number.isFinite(metadata[key])
+        ? metadata[key] : 'invalid';
+  }
+  if (typeof metadata.should_retry === 'boolean') facts.should_retry = metadata.should_retry;
   if (metadata.abort_reason) facts.abort_reason = true;
   if (metadata.terminal_event) facts.terminal_event = metadata.terminal_event;
   if (['headers', 'body'].includes(metadata.transport_error?.phase)) {
@@ -121,6 +124,17 @@ function policyFacts(result) {
     const code = metadata.error.code;
     facts.error = { code: typeof code === 'number' && Number.isFinite(code)
       || typeof code === 'string' && code.length <= 128 ? code : 'other' };
+  }
+  for (const name of ['type', 'error_type']) {
+    const value = metadata.error?.[name];
+    if (typeof value === 'string' && value.length <= 128) {
+      facts.error ??= {};
+      facts.error[name] = value;
+    }
+  }
+  if (metadata.error?.limit_source === 'openrouter_in_flight_budget') {
+    facts.error ??= {};
+    facts.error.limit_source = 'openrouter_in_flight_budget';
   }
   if (typeof metadata.id === 'string' && metadata.id) facts.id = 'present';
   if (Number.isInteger(metadata.websocket_close?.code)) {

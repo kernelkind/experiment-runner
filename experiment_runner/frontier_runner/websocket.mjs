@@ -1,4 +1,4 @@
-import { WebSocket } from 'undici';
+import { WebSocket, getGlobalDispatcher } from 'undici';
 
 /** Adapt one Responses WebSocket to the SDK's existing event parser.
  * The Response is an in-process parser interface, NOT an HTTP response from
@@ -14,11 +14,38 @@ export function websocketRequest(wire) {
   return { url: url.href, method: 'GET', headers, body: { type: 'response.create', ...body } };
 }
 
-export async function websocketResponse(wire, init, metadata, signal) {
+export async function websocketResponse(wire, init, metadata, signal, redact) {
   const headers = new Headers(init.headers);
   for (const name of ['content-type', 'content-encoding', 'content-length', 'accept', 'openai-beta']) headers.delete(name);
   // Real private credentials stay inside the connection. `wire` has redacted headers.
-  const socket = new WebSocket(wire.url, { headers });
+  // Undici's WebSocket error event erases rejected upgrade statuses. Observe
+  // this socket's real handshake through its dispatcher, without probing,
+  // reconnecting, changing the request or mixing concurrent sockets' receipts.
+  const observeHeaders = (status, raw) => {
+    metadata.http_status = status;
+    const responseHeaders = new Headers(Array.isArray(raw)
+      ? Array.from({ length: raw.length / 2 }, (_, i) => [String(raw[i * 2]), String(raw[i * 2 + 1])])
+      : raw);
+    for (const [name, key] of [['retry-after', 'retry_after'], ['retry-after-ms', 'retry_after_ms'],
+      ['x-agent-request-id', 'proxy_request_id'], ['x-request-id', 'request_id']]) {
+      const value = responseHeaders.get(name);
+      if (value) metadata[key] = redact(value).slice(0, 1024);
+    }
+    const retry = responseHeaders.get('x-should-retry');
+    if (retry === 'true' || retry === 'false') metadata.should_retry = retry === 'true';
+  };
+  const dispatcher = getGlobalDispatcher().compose(dispatch => (options, handler) =>
+    dispatch(options, new Proxy(handler, { get(target, name) {
+      const value = Reflect.get(target, name, target);
+      if (name === 'onResponseStart') return (controller, status, raw, ...rest) => {
+        observeHeaders(status, raw);
+        return value.call(target, controller, status, raw, ...rest);
+      };
+      // Undici wraps callbacks in a class with private state. Preserve their
+      // receiver and all lifecycle methods rather than copying enumerable keys.
+      return typeof value === 'function' ? value.bind(target) : value;
+    } })));
+  const socket = new WebSocket(wire.url, { headers, dispatcher });
   metadata.websocket_frames = 0;
   metadata.websocket_bytes = 0;
   let controller;

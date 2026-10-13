@@ -4,9 +4,183 @@ import { mkdtemp, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { zstdDecompressSync } from 'node:zlib';
 import test from 'node:test';
 import { execute, prepare } from './model.mjs';
 import { experimentAdmission } from './backoff.mjs';
+
+test('native CLI retries warmups and the HR14 503-stream failure sequence without a flag', async t => {
+  const home = await mkdtemp(join(tmpdir(), 'oracle-transient-recovery-'));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const key = 'test.' + Buffer.from(JSON.stringify({
+    'https://api.openai.com/auth': { chatgpt_account_id: 'local-fixture' },
+  })).toString('base64url') + '.local';
+  await symlink(process.execPath, join(home, 'node'));
+  await writeFile(join(home, 'agent-account'), `#!${process.execPath}\n` +
+    `const a=process.argv.slice(2);require('node:assert/strict').deepEqual(a.slice(0,3),['exec','pi','--']);\n` +
+    `process.execve(a[3],a.slice(3),{...process.env,PI_CODING_AGENT_DIR:${JSON.stringify(home)}});\n`,
+    { mode: 0o700 });
+  const prefix = 'Fixture instructions' + ' word'.repeat(1100);
+  const calls = [], statuses = new Map();
+  const frame = value => `data: ${JSON.stringify(value)}\n\n`;
+  const server = createServer(async (request, response) => {
+    assert.equal(request.headers.authorization, `Bearer ${key}`);
+    if (request.url.startsWith('/request-status/scopes?')) {
+      response.end(JSON.stringify({ schema: 1, account_scope: 'account-fixture', transport_scope: 'transport-fixture' }));
+      return;
+    }
+    if (request.url.startsWith('/request-status/')) {
+      response.end(JSON.stringify(statuses.get(request.url.split('/').at(-1))));
+      return;
+    }
+    assert.equal(request.url, '/selected/pi/codex/responses');
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    const bytes = Buffer.concat(chunks);
+    const body = JSON.parse((request.headers['content-encoding'] === 'zstd'
+      ? zstdDecompressSync(bytes) : bytes).toString('utf8'));
+    const prompt = body.input.flatMap(item => Array.isArray(item.content)
+      ? item.content.map(part => part.text ?? '') : []).join('');
+    const kind = prompt === prefix ? 'warmup' : prompt.endsWith('Tea') ? 'Tea' : 'Coffee';
+    const attempt = 1 + calls.filter(call => call.kind === kind).length;
+    const reference = `proxy-reference-fixture-${calls.length}`;
+    calls.push({ kind, attempt, body, at: performance.now() });
+    if ((kind === 'warmup' && attempt <= 2) || (kind === 'Tea' && attempt === 1)) {
+      response.writeHead(503, { 'Content-Type': 'application/json' });
+      response.end(JSON.stringify({ error: { code: 'provider_error', type: 'invalid_request_error',
+        message: 'Fixture unavailable' } }));
+      return;
+    }
+    response.writeHead(200, { 'Content-Type': 'text/event-stream', 'X-Agent-Request-Id': reference });
+    response.write(frame({ type: 'response.created', response: { id: `resp-${reference}`, status: 'in_progress' } }));
+    if (kind === 'Tea' && attempt === 2) {
+      statuses.set(reference, { schema: 1, request_id: reference, state: 'unknown',
+        request_context: 'active', error_phase: 'body', http_status: 200,
+        read_error_kind: 'http2_stream_error', read_error_code: 'internal_error' });
+      setTimeout(() => response.destroy(), 10);
+      return;
+    }
+    const item = { id: `msg-${reference}`, type: 'message', role: 'assistant', status: 'completed',
+      content: [{ type: 'output_text', text: 'answer', annotations: [] }] };
+    response.end([
+      { type: 'response.output_item.added', output_index: 0, item: { ...item, content: [] } },
+      { type: 'response.output_text.delta', output_index: 0, content_index: 0, delta: 'answer' },
+      { type: 'response.output_item.done', output_index: 0, item },
+      { type: 'response.completed', response: { id: `resp-${reference}`, model: 'gpt-6.1-sol',
+        status: 'completed', output: [item], usage: { input_tokens: 1, output_tokens: 1 } } },
+    ].map(frame).join(''));
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => { server.closeAllConnections(); server.close(); });
+  const baseUrl = `http://127.0.0.1:${server.address().port}/selected/pi`;
+  await writeFile(join(home, 'models.json'), JSON.stringify({ providers: { 'openai-codex': { baseUrl, apiKey: key } } }));
+  await writeFile(join(home, 'auth.json'), JSON.stringify({ 'openai-codex': { type: 'api_key', key } }));
+  await writeFile(join(home, 'prompt.txt'), prefix + '{VALUE}');
+  await writeFile(join(home, 'cases.json'), JSON.stringify({ cases: ['Tea', 'Coffee'].map(id => ({ id, inputs: { VALUE: id } })) }));
+  await writeFile(join(home, 'spec.json'), JSON.stringify({ schema_version: 1,
+    prompt: { id: 'transient-fixture-v1', path: 'prompt.txt' },
+    dataset: { adapter: 'generic', path: 'cases.json' },
+    runner: { runner_binary: new URL('../run-model.sh', import.meta.url).pathname,
+      provider: 'openai-codex', model: 'gpt-6.1-sol', reasoning_effort: 'medium', timeout_seconds: 5 } }));
+  const budget = join(home, 'budget.json'), experiment = join(home, 'experiment');
+  await writeFile(budget, JSON.stringify({ schema_version: 1, limit: 7, used: 0 }));
+  const env = { ...process.env, PATH: `${home}:${process.env.PATH}`,
+    ORACLE_EXPERIMENT_BACKOFF_DIRECTORY: join(home, 'backoff') };
+  async function cli(...args) {
+    const child = spawn('python3', ['-B', new URL('../experiment.py', import.meta.url).pathname, ...args],
+      { env, stdio: ['ignore', 'pipe', 'pipe'], timeout: 45000 });
+    let output = '';
+    child.stdout.on('data', bytes => { output += bytes; });
+    child.stderr.on('data', bytes => { output += bytes; });
+    const status = await new Promise((resolve, reject) => {
+      child.once('error', reject); child.once('close', resolve);
+    });
+    assert.equal(status, 0, output);
+    assert.ok(!output.includes(key));
+  }
+  await cli('prepare', experiment, '--spec', join(home, 'spec.json'), '--prompt-cache', '--history-root', home);
+  await cli('run', experiment, '--attempt-budget', budget, '--max-new-attempts', '7');
+  assert.equal(calls.length, 7);
+  assert.equal(JSON.parse(await readFile(budget, 'utf8')).used, 7);
+  const report = JSON.parse(await readFile(join(experiment, 'report.json'), 'utf8'));
+  assert.equal(report.summary.valid, 2);
+  assert.equal(report.cache_warmup.attempts, 3);
+  for (const kind of ['warmup', 'Tea']) {
+    const attempts = calls.filter(call => call.kind === kind);
+    assert.equal(attempts.length, 3);
+    assert.deepEqual(attempts.map(call => call.body), Array(3).fill(attempts[0].body));
+    assert.ok(attempts[1].at - attempts[0].at >= 1900);
+    assert.ok(attempts[2].at - attempts[1].at >= 3900);
+  }
+  const receipts = (await readFile(join(experiment, 'run/results.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
+  assert.deepEqual(receipts.filter(row => row.note_id === 'Tea').map(row => row.attempt), [1, 2, 3]);
+  assert.ok(receipts.every(row => row.model_result.http_attempts === 1));
+  assert.equal(receipts.find(row => row.note_id === 'Tea' && row.attempt === 1)
+    .model_result.response_metadata.error.code, 'provider_error');
+  await cli('run', experiment, '--attempt-budget', budget);
+  assert.equal(calls.length, 7, 'resume redrew a completed case or warmup');
+});
+
+test('native rejection metadata distinguishes credit, retry instructions and temporary payment pressure', async t => {
+  const home = await mkdtemp(join(tmpdir(), 'oracle-retry-headers-'));
+  const previous = process.env.ORACLE_EXPERIMENT_BACKOFF_DIRECTORY;
+  t.after(async () => {
+    if (previous === undefined) delete process.env.ORACLE_EXPERIMENT_BACKOFF_DIRECTORY;
+    else process.env.ORACLE_EXPERIMENT_BACKOFF_DIRECTORY = previous;
+    await rm(home, { recursive: true, force: true });
+  });
+  const key = 'test.' + Buffer.from(JSON.stringify({
+    'https://api.openai.com/auth': { chatgpt_account_id: 'local-fixture' },
+  })).toString('base64url') + '.local';
+  const cases = [
+    { name: 'quota', provider: 'openai-codex', status: 429, error: {
+      code: 'insufficient_quota', type: 'invalid_request_error', message: 'Fixture credit exhausted' }, pressure: false },
+    { name: 'fatal-auth', provider: 'openai-codex', status: 401,
+      error: { code: 'server_is_overloaded' }, pressure: false },
+    { name: 'server-do-not-retry', provider: 'openai-codex', status: 503,
+      error: { code: 'server_error' }, headers: { 'x-should-retry': 'false' }, pressure: false },
+    { name: 'server-retry-ms', provider: 'openai-codex', status: 503,
+      error: { code: 'provider_error' }, headers: { 'retry-after-ms': '120000' }, pressure: true },
+    { name: 'temporary-payment', provider: 'openrouter', status: 402, error: {
+      code: 402, metadata: { limit_source: 'openrouter_in_flight_budget', private_value: 'PRIVATE' } },
+      headers: { 'retry-after': '120' }, pressure: true },
+    { name: 'exhausted-credit', provider: 'openrouter', status: 402,
+      error: { code: 402 }, pressure: false },
+  ];
+  for (const fixture of cases) {
+    const directory = join(home, fixture.name);
+    process.env.ORACLE_EXPERIMENT_BACKOFF_DIRECTORY = directory;
+    const request = await prepare({ provider: fixture.provider,
+      model: fixture.provider === 'openai-codex' ? 'gpt-6.1-sol' : 'xiaomi/mimo-v2.6-pro',
+      reasoning: fixture.provider === 'openai-codex' ? 'medium' : 'provider-default',
+      prompt: 'Exact fixture input' });
+    request.model = { ...request.model, baseUrl: fixture.provider === 'openai-codex'
+      ? 'http://127.0.0.1:9876/fixture/pi' : 'http://127.0.0.1:9876/openrouter/api/v1' };
+    let calls = 0;
+    const result = await execute(request, { apiKey: key, experimentConcurrency: 30,
+      fetch: async (_url, init) => {
+        if (init.method === 'GET') return new Response(JSON.stringify({
+          schema: 1, account_scope: 'account-fixture', transport_scope: 'transport-fixture' }));
+        calls++;
+        return new Response(JSON.stringify({ error: fixture.error }), { status: fixture.status,
+          headers: { 'content-type': 'application/json', ...fixture.headers } });
+      } });
+    assert.equal(calls, 1, fixture.name);
+    assert.equal(result.http_attempts, 1);
+    assert.equal(result.valid, false);
+    assert.equal(result.response_metadata.http_status, fixture.status);
+    assert.equal(result.response_metadata.error.code, fixture.error.code);
+    if (fixture.name === 'temporary-payment') {
+      assert.equal(result.response_metadata.error.limit_source, 'openrouter_in_flight_budget');
+      assert.ok(!JSON.stringify(result.response_metadata).includes('PRIVATE'));
+    }
+    if (fixture.name === 'server-retry-ms') assert.equal(result.response_metadata.retry_after_ms, '120000');
+    if (fixture.name === 'server-do-not-retry') assert.equal(result.response_metadata.should_retry, false);
+    const state = JSON.parse(await readFile(join(directory, 'state.json'), 'utf8'));
+    assert.equal(Object.keys(state.tickets).length, 0);
+    assert.equal(Object.values(state.scopes).some(scope => scope.seconds > 0), fixture.pressure, fixture.name);
+  }
+});
 
 test('unavailable or invalid scope discovery stops before model dispatch', async t => {
   const home = await mkdtemp(join(tmpdir(), 'oracle-backoff-scopes-'));

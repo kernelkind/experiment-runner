@@ -3653,6 +3653,33 @@ def run_prompts(
                                  concurrency=config.concurrency)
 
 
+_PROVIDER_TRANSIENT_CODES = frozenset({
+    'server_error', 'server_is_overloaded', 'rate_limit_exceeded',
+    'usage_limit_reached', 'websocket_connection_limit_reached',
+    'service_unavailable_error', 'rate_limit_error', 'overloaded_error',
+})
+_PROVIDER_FATAL_CODES = frozenset({
+    'insufficient_quota', 'invalid_api_key', 'authentication_error', 'authentication',
+    'permission_denied', 'payment_required', 'usage_not_included',
+    'billing_hard_limit_reached', 'billing_not_active',
+    'project_spend_limit_exceeded', 'organization_usage_limit_exceeded',
+})
+_PROVIDER_REQUEST_ERRORS = frozenset({
+    'invalid_request', 'invalid_request_error', 'invalid_prompt', 'not_found',
+    'unsupported_parameter', 'unsupported_value', 'invalid_model', 'model_not_found',
+    'precondition_failed', 'payload_too_large', 'unprocessable',
+    'context_length_exceeded', 'max_tokens_exceeded', 'token_limit_exceeded',
+    'string_too_long', 'content_policy_violation', 'refusal',
+    'invalid_image', 'image_too_large', 'image_too_small', 'unsupported_image_format',
+    'image_not_found',
+})
+_TRANSPORT_TRANSIENT_CODES = frozenset({
+    'ECONNRESET', 'ECONNREFUSED', 'EPIPE', 'ETIMEDOUT', 'EAI_AGAIN',
+    'ENETUNREACH', 'EHOSTUNREACH', 'UND_ERR_SOCKET', 'UND_ERR_CONNECT_TIMEOUT',
+    'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT',
+})
+
+
 def prompt_failure_kind(record: dict[str, Any]) -> str:
     """Retry only explicit transient provider responses, never inferred outages."""
     result = record.get("model_result") or {}
@@ -3663,22 +3690,65 @@ def prompt_failure_kind(record: dict[str, Any]) -> str:
         return "unknown"
     # A local abort or successful transport followed by validation failure takes
     # precedence over any provider metadata that happened to arrive earlier.
-    if metadata.get("abort_reason") or record.get("exit_code") in (None, 0):
+    if (metadata.get("abort_reason") or record.get("exit_code") in (None, 0)
+            or result.get("stop_reason") in ("stop", "length", "aborted", "toolUse")):
         return "local"
     proxy = metadata.get("proxy_status") or {}
     if (metadata.get("terminal_event") == "response.completed"
             or isinstance(proxy, dict) and (proxy.get("terminal_event") == "completed"
                                             or proxy.get("state") == "complete")):
         return "local"
+    if isinstance(proxy, dict) and (proxy.get('state') in ('canceled', 'deadline_exceeded')
+            or proxy.get('request_context') in ('canceled', 'deadline_exceeded')):
+        return "local"
     error = metadata.get("error") or {}
     code = error.get("code") if isinstance(error, dict) else None
-    if code is None:
-        code = metadata.get("http_status")
     if isinstance(code, str) and code.isdecimal():
         code = int(code)
-    if code in (401, 402, 403, 404):
+    status = metadata.get("http_status")
+    if isinstance(status, str) and status.isdecimal():
+        status = int(status)
+    labels = {error.get(key) for key in ('code', 'type', 'error_type')
+              if isinstance(error, dict) and isinstance(error.get(key), str)}
+    # Provider-owned quota/auth and request errors override a generic wrapper
+    # status. Retrying cannot repair the request or replenish paid credit.
+    if labels & _PROVIDER_FATAL_CODES:
         return "provider_fatal"
-    if code in (408, 429, 500, 502, 503, 504):
+    if status in (401, 403, 404) or code in (401, 403, 404):
+        return "provider_fatal"
+    if status == 402 or code == 402:
+        # OpenRouter documents one temporary 402: outstanding in-flight spending
+        # with an explicit wait deadline. Ordinary exhausted credit stays fatal.
+        if (result.get('provider') == 'openrouter' and isinstance(error, dict)
+                and error.get('limit_source') == 'openrouter_in_flight_budget'
+                and metadata.get('should_retry') is not False
+                and any(metadata.get(key) is not None for key in ('retry_after', 'retry_after_ms'))
+                and _provider_retry_after_delay(record) is not None):
+            return "provider_transient"
+        return "provider_fatal"
+    # A generic invalid_request_error envelope can also wrap rate limits and
+    # server failures. Specific request codes still stop; a generic label alone
+    # must not hide the actual HTTP 429/503.
+    if (labels & (_PROVIDER_REQUEST_ERRORS - {'invalid_request_error'})
+            or code == 'invalid_request_error' and not (type(status) is int
+                and (status in (408, 409, 425, 429) or 500 <= status <= 599))
+            or isinstance(error, dict) and error.get('error_type') == 'unmapped'):
+        return "unknown"
+    if metadata.get('should_retry') is False:
+        return 'unknown'
+    if metadata.get('should_retry') is True and result.get('stop_reason') == 'error':
+        return 'provider_transient'
+    # An error code inside an HTTP-200/101 stream is separate from the transport
+    # status. Conversely, a symbolic body code must not hide an HTTP 503.
+    if type(status) is int and 400 <= status < 500 and status not in (408, 409, 425, 429):
+        return "unknown"
+    if any(type(value) is int and (value in (408, 409, 425, 429) or 500 <= value <= 599)
+           for value in (status, code)):
+        return "provider_transient"
+    if (result.get("stop_reason") == "error" and
+            (labels & _PROVIDER_TRANSIENT_CODES or result.get('provider') == 'openrouter'
+             and isinstance(error, dict) and error.get('error_type') in (
+                 'provider_overloaded', 'provider_unavailable', 'server', 'timeout'))):
         return "provider_transient"
     if (result.get("stop_reason") == "error"
             and metadata.get("terminal_event") not in ("response.failed", "response.incomplete")
@@ -3692,23 +3762,35 @@ def prompt_failure_kind(record: dict[str, Any]) -> str:
             return "provider_transient"
         if (kind in ("http2_goaway", "http2_stream_error", "http2_connection_error")
                 and proxy.get("read_error_code") in (
-                    "no_error", "internal_error", "refused_stream", "cancel", "enhance_your_calm")):
+                    "no_error", "internal_error", "refused_stream", "cancel", "enhance_your_calm",
+                    "settings_timeout", "connect_error")):
             return "provider_transient"
     if result.get("provider") == "openai-codex" and result.get("stop_reason") == "error":
-        if (metadata.get("http_status") == 200 and code in (
-                "server_error", "server_is_overloaded", "rate_limit_exceeded", "usage_limit_reached")):
-            return "provider_transient"
         close = metadata.get("websocket_close") or {}
         transport = metadata.get("transport_error") or {}
-        if (code == 101 and isinstance(metadata.get("id"), str) and metadata["id"]
-                and isinstance(close, dict) and close.get("code") in (1006, 1011)
+        if (status == 101 and metadata.get('terminal_event') not in (
+                'response.failed', 'response.incomplete', 'error')
+                and isinstance(close, dict) and close.get("code") in (1000, 1001, 1006, 1011, 1012, 1013, 1014)
                 and isinstance(transport, dict) and transport.get("phase") == "body"):
             return "provider_transient"
+    # The native fetch path records bounded, structured cause codes. A confirmed
+    # connection failure is retryable even if the proxy supplied no receipt;
+    # arbitrary exception messages and certificate/configuration errors are not.
+    transport = metadata.get('transport_error') or {}
+    if (result.get('stop_reason') == 'error'
+            and metadata.get('terminal_event') not in ('response.failed', 'response.incomplete', 'error')
+            and isinstance(transport, dict) and transport.get('phase') in ('headers', 'body')):
+        for _ in range(3):
+            if isinstance(transport.get('code'), str) and transport['code'] in _TRANSPORT_TRANSIENT_CODES:
+                return 'provider_transient'
+            transport = transport.get('cause')
+            if not isinstance(transport, dict):
+                break
     # Codex can fail inside an HTTP-200 stream without a structured error code.
     # Recognize only its explicit processing-error retry message, not arbitrary
     # error prose, transport failures, or model-generated output.
     message = result.get("error")
-    if (code == 200 and result.get("provider") == "openai-codex"
+    if (status == 200 and result.get("provider") == "openai-codex"
             and result.get("stop_reason") == "error" and isinstance(message, str)
             and message.startswith("Codex error: An error occurred while processing your request. "
                                    "You can retry your request, or contact us")):
@@ -3719,7 +3801,7 @@ def prompt_failure_kind(record: dict[str, Any]) -> str:
 def provider_cooldown_scope(record: dict[str, Any]) -> str | None:
     """Shared pressure requires explicit rate/overload or connection evidence."""
     kind = prompt_failure_kind(record)
-    if kind in ("local", "provider_fatal"):
+    if kind != "provider_transient":
         return None
     result = record.get("model_result") or {}
     if not isinstance(result, dict):
@@ -3729,8 +3811,12 @@ def provider_cooldown_scope(record: dict[str, Any]) -> str | None:
         return None
     error = metadata.get("error") or {}
     code = error.get("code") if isinstance(error, dict) else None
-    if metadata.get("http_status") in (429, "429") or code in (
-            429, "429", "rate_limit_exceeded", "usage_limit_reached", "server_is_overloaded"):
+    pressure = {'rate_limit_exceeded', 'usage_limit_reached', 'server_is_overloaded',
+                'websocket_connection_limit_reached', 'rate_limit_error',
+                'overloaded_error', 'provider_overloaded'}
+    if (metadata.get("http_status") in (429, "429") or code in (429, "429")
+            or isinstance(error, dict) and any(isinstance(error.get(key), str)
+                and error[key] in pressure for key in ('code', 'type', 'error_type'))):
         return "account"
     proxy = metadata.get("proxy_status") or {}
     if (kind == "provider_transient" and isinstance(proxy, dict)
@@ -3744,7 +3830,8 @@ def provider_cooldown_scope(record: dict[str, Any]) -> str | None:
         if (proxy.get("read_error_kind") == "http2_stream_error"
                 and proxy.get("read_error_code") == "enhance_your_calm"):
             return "account"
-    if (kind == "provider_transient" and metadata.get("retry_after") is not None
+    if (kind == "provider_transient" and any(metadata.get(key) is not None
+            for key in ('retry_after', 'retry_after_ms'))
             and _provider_retry_after_delay(record) is not None):
         return "account"
     return None
@@ -3755,37 +3842,38 @@ def provider_cooldown_required(record: dict[str, Any]) -> bool:
 
 
 def _provider_retry_after_delay(record: dict[str, Any]) -> float | None:
-    value = (record.get("model_result") or {}).get("response_metadata", {}).get("retry_after")
-    delay = 2.0
-    if value is not None:
+    metadata = (record.get("model_result") or {}).get("response_metadata", {})
+    delays = []
+    supplied = False
+    for key in ('retry_after', 'retry_after_ms'):
+        value = metadata.get(key)
+        if value is None:
+            continue
+        supplied = True
         try:
             try:
                 delay = float(value)
             except ValueError:
+                if key == 'retry_after_ms':
+                    continue
                 delay = parsedate_to_datetime(value).timestamp() - time.time()
         except (ValueError, TypeError, OverflowError):
-            return None
-        if not math.isfinite(delay):
-            return None
-    return max(2.0, delay)
+            continue
+        if math.isfinite(delay):
+            delays.append(delay / 1000 if key == 'retry_after_ms' else delay)
+    if delays:
+        return max(2.0, *delays)
+    return None if supplied else 2.0
 
 
 def provider_retry_delay(record: dict[str, Any], *, keep_retrying: bool = False) -> float | None:
-    """Overload retries automatically; broader transient retries are opt-in."""
+    """Every verified temporary failure retries; the old opt-in is compatible."""
     if prompt_failure_kind(record) != "provider_transient":
         return None
-    error = (record.get("model_result") or {}).get("response_metadata", {}).get("error") or {}
-    overloaded = isinstance(error, dict) and error.get("code") == "server_is_overloaded"
-    if not overloaded and not keep_retrying and record["attempt"] >= 2:
-        return None
-    delay = _provider_retry_after_delay(record)
-    if overloaded or keep_retrying:
-        # Bound the exponent before calculating it; a long-lived case can have
-        # an arbitrarily large saved counter. Explicit server deadlines win.
-        backoff = min(60.0, 2.0 ** min(6, record["attempt"]))
-        # An unusable header does not negate explicit overload evidence.
-        return max(backoff, delay or 0.0) if overloaded or delay is not None else None
-    return delay if delay is not None and delay <= 60 else None
+    # Bound before exponentiation, since saved lifetime counts can be arbitrarily
+    # large. A malformed header cannot negate verified temporary failure evidence.
+    backoff = min(60.0, 2.0 ** min(6, record["attempt"]))
+    return max(backoff, _provider_retry_after_delay(record) or 0.0)
 
 
 def _execute_prompt_batch(
@@ -3965,7 +4053,8 @@ def _execute_prompt_batch(
             backoff_started = now
             backoff_until = max(backoff_until, now + max(
                 backoff_seconds, _provider_retry_after_delay(record) or 0.0))
-        elif (record.get("model_result") or {}).get("response_metadata", {}).get("retry_after") is not None:
+        elif any((record.get("model_result") or {}).get("response_metadata", {}).get(key) is not None
+                 for key in ('retry_after', 'retry_after_ms')):
             delay = _provider_retry_after_delay(record)
             if delay is not None:
                 backoff_until = max(backoff_until, now + delay)
@@ -3989,8 +4078,8 @@ def _execute_prompt_batch(
         else:
             fresh.append((index, prompt))
     # A due retry takes priority; while it waits, fresh cases can use free slots.
-    # Only shared-pressure evidence delays the batch. Explicit overload keeps
-    # retrying automatically; broader transient retries require the opt-in.
+    # Only shared-pressure evidence delays the batch. Every verified temporary
+    # failure keeps retrying automatically within the existing budgets.
     try:
         with ThreadPoolExecutor(max_workers=concurrency) as pool:
             try:

@@ -314,17 +314,15 @@ class SharedRunnerTests(unittest.TestCase):
 
 
 class NativePrefixTests(unittest.TestCase):
-    def test_provider_retry_opt_in_resumes_same_cases_beyond_two_attempts(self):
+    def test_automatic_provider_retry_resumes_same_cases_beyond_two_attempts(self):
         self.prepare('retry')
         environment = {'FAKE_RUNNER_FAILURES': json.dumps({
             'Tea {POST}': {'attempts': 3, 'metadata': {'http_status': 503}}})}
-        self.cli('run', 'retry', ok=False, env=environment)
+        self.cli('run', 'retry', '--max-new-attempts', '3', ok=False, env=environment)
         before = self.show('retry')
         self.assertEqual(before['summary']['attempts'], 3)
         self.assertEqual(before['summary']['failed'], 1)
-        self.cli('run', 'retry', ok=False, env=environment)
-        self.assertEqual(len(self.calls()), 3, 'default resume exceeded two lifetime attempts')
-        self.cli('run', 'retry', '--keep-retrying-provider-errors', env=environment)
+        self.cli('run', 'retry', env=environment)
         after = self.show('retry')
         self.assertEqual(after['summary']['valid'], 2)
         self.assertEqual(after['summary']['attempts'], 5)
@@ -336,16 +334,16 @@ class NativePrefixTests(unittest.TestCase):
         self.assertTrue(all(row['model_result']['http_attempts'] == 1 for row in retries))
         settings = [json.loads(row) for row in
                     (self.root / 'retry/execution-settings.jsonl').read_text().splitlines()]
-        self.assertTrue(settings[-1]['keep_retrying_provider_errors'])
+        self.assertFalse(settings[-1]['keep_retrying_provider_errors'])
         self.cli('run', 'retry', '--keep-retrying-provider-errors', env=environment)
         self.assertEqual(len(self.calls()), 5, 'resume redrew a successful answer')
 
-    def test_provider_retry_opt_in_keeps_attempt_budget_and_local_failure_final(self):
+    def test_automatic_provider_retry_keeps_attempt_budget_and_local_failure_final(self):
         self.prepare('limited')
         environment = {'FAKE_RUNNER_FAILURES': json.dumps({
             'Tea {POST}': {'attempts': 100, 'metadata': {'http_status': 503}}})}
         self.cli('run', 'limited', '--only', 'one', '--max-new-attempts', '3',
-                 '--keep-retrying-provider-errors', ok=False, env=environment)
+                 ok=False, env=environment)
         self.assertEqual(self.show('limited')['summary']['attempts'], 3)
         self.prepare('local', '--repeat')
         self.cli('run', 'local', '--only', 'one', '--keep-retrying-provider-errors',
@@ -377,11 +375,10 @@ class NativePrefixTests(unittest.TestCase):
         self.assertTrue(all(r['model_result']['http_attempts'] == 1 for r in records))
         self.assertEqual(len(self.calls()), 3)
 
-    def test_explicit_overload_retries_until_success_and_preserves_attempts_on_resume(self):
+    def test_transient_retry_preserves_receipts_and_persistent_budget_on_resume(self):
         self.prepare('overload')
         budget = self.write('overload-budget.json', {'schema_version': 1, 'limit': 3, 'used': 0})
-        failures = {'Tea': {'attempts': 2, 'metadata': {
-            'http_status': 200, 'error': {'code': 'server_is_overloaded'}}}}
+        failures = {'Tea': {'attempts': 2, 'metadata': {'http_status': 503}}}
         env = {'FAKE_RUNNER_FAILURES': json.dumps(failures)}
         self.cli('run', 'overload', '--only', 'one', '--max-new-attempts', '2',
                  '--attempt-budget', budget, ok=False, env=env)
@@ -399,6 +396,20 @@ class NativePrefixTests(unittest.TestCase):
         self.assertEqual(len(self.calls()), 3)
         self.cli('run', 'overload', '--only', 'one', '--attempt-budget', budget, env=env)
         self.assertEqual(len(self.calls()), 3, 'completed overload recovery should reuse its result')
+
+    def test_provider_auth_failure_after_a_transient_failure_stops_without_redrawing(self):
+        self.prepare('auth-after-transient')
+        failed = {'FAKE_RUNNER_FAILURES': json.dumps({'Tea': {'attempts': 100,
+            'metadata': {'http_status': 503}}})}
+        self.cli('run', 'auth-after-transient', '--only', 'one', '--max-new-attempts', '1',
+                 ok=False, env=failed)
+        fatal = {'FAKE_RUNNER_FAILURES': json.dumps({'Tea': {'attempts': 100,
+            'metadata': {'http_status': 401, 'error': {'code': 'invalid_api_key'}}}})}
+        self.cli('run', 'auth-after-transient', '--only', 'one', ok=False, env=fatal)
+        self.assertEqual(len(self.calls()), 2)
+        self.cli('run', 'auth-after-transient', '--only', 'one',
+                 '--keep-retrying-provider-errors', ok=False, env=fatal)
+        self.assertEqual(len(self.calls()), 2)
 
     def test_run_only_dispatches_selected_cases_and_keeps_the_full_frozen_report(self):
         self.prepare()

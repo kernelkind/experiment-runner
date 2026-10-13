@@ -180,7 +180,13 @@ class SchedulingTests(unittest.TestCase):
             source.extractall(legacy, filter='data')
         self.prepare('remote', 40)
         self.prepare('local', 2, provider='local')
-        remote = subprocess.Popen([str(legacy / 'bin/experiment-runner'), 'run', 'remote'],
+        # A previous coordinator must prepare its own experiment. Feeding it a
+        # current-code plan tests provenance refusal instead of coexistence.
+        prepared = subprocess.run([str(legacy / 'bin/experiment-runner'), 'prepare', 'remote-previous',
+            '--spec', 'remote-spec.json'], cwd=self.root, env=self.env,
+            text=True, capture_output=True, timeout=15)
+        self.assertEqual(prepared.returncode, 0, prepared.stdout + prepared.stderr)
+        remote = subprocess.Popen([str(legacy / 'bin/experiment-runner'), 'run', 'remote-previous'],
             cwd=self.root, env=self.env, text=True, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, start_new_session=True)
         self.processes.append(remote)

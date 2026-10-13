@@ -158,33 +158,53 @@ that many successful completions. Failures from requests already in flight
 share one backoff generation; a late failure does not restart recovery or
 extend the wait unless it carries an explicit `Retry-After`. A new failure
 during recovery can increase backoff. Resume does not recreate a new outage
-from an old receipt. Explicit `server_is_overloaded` responses keep retrying
-automatically with per-request 2/4/8/.../60-second exponential backoff; there is
-no two-attempt cutoff for overload. Longer valid `Retry-After` values take
-precedence; malformed values fall back to exponential backoff. Saved attempt
-counts survive resume, including overload cases previously stopped at attempt
-two. Every retry consumes the authorized attempt/spending allowance, and pause
-or cancellation stops new attempts. Failure receipts are preserved.
+from an old receipt. **Every verified temporary provider failure retries
+automatically until success or an authorized limit, pause or cancellation.**
+Per-case delays are 2/4/8/16/32/60/60... seconds, using the saved lifetime
+attempt counter. There is no two-attempt cutoff, including on resume. Warmups
+use the same policy. Longer valid `Retry-After` or `retry-after-ms` deadlines
+take precedence; if both are present, honor the longer one. Malformed headers
+fall back to exponential delay. The native worker still makes exactly one
+transport attempt per invocation; retries have separate immutable receipts.
 
-Other transient failures retain at most two lifetime attempts by default, with a minimum
-two-second retry delay honoring `Retry-After`; delays over 60 seconds or invalid
-headers prevent their automatic retry. Local, validation and unknown failures
-are not automatically retried. Observe successful completions per minute
-alongside failure counts, retry usage/cost and admission history when assessing
-actual throughput.
+The production classifier covers these recorded errors:
 
-When explicitly authorized to keep retrying temporary provider failures, use
-`run EXPERIMENT --keep-retrying-provider-errors`. This removes the two-attempt
-lifetime bound for recognized transient provider errors, with per-case
-2/4/8/.../60-second exponential backoff. Longer valid `Retry-After` values are
-honored; malformed headers prevent retry for these other errors. The same
-experiment, exact request, saved receipts and lifetime attempt counter are
-retained on resume. Successful
-answers are never redrawn. Warmups use the same retry policy. Local crashes,
-timeouts, invalid outputs, source changes, unknown errors and fatal provider
-errors are not retried by this option. Attempt and spending caps still apply,
-and every failed attempt counts. Explicit overload recovery is automatic and
-does not need this option; other failures retain the default two-attempt policy.
+| Evidence | Retry behavior |
+| --- | --- |
+| HTTP 408, 409, 425, 429 or 5xx; numeric equivalents inside an error stream | Retry, unless a structured permanent error or explicit no-retry header takes precedence. Symbolic body codes do not hide the actual HTTP status. |
+| `server_error`, `server_is_overloaded`, rate-limit/temporary usage-limit codes, `websocket_connection_limit_reached`, service-unavailable/overloaded types | Retry for SSE and WebSocket error responses. |
+| OpenRouter `provider_overloaded`, `provider_unavailable`, `server`, `timeout` | Retry; canonical request, output-limit and refusal types take precedence over generic numeric codes. |
+| Verified active proxy interruption; structured socket/connect/reset/timeout/temporary-DNS cause codes | Retry the failed request. Arbitrary exception prose is insufficient. Local aborts and canceled/deadline-expired request contexts stop. |
+| WebSocket closes before a terminal response: 1000, 1001, 1006, 1011–1014 | Retry after a completed upgrade and recorded body interruption. Protocol, unsupported-data, policy and size failures are not retryable. |
+| OpenRouter 402 with `limit_source=openrouter_in_flight_budget` and a valid retry deadline | Retry the documented temporary in-flight spending wait. Ordinary exhausted credit remains fatal. |
+| Explicit `x-should-retry` | Honor true/false without overriding authentication, exhausted credit, invalid requests, completed output or local cancellation. |
+
+Authentication/access failures, exhausted paid credit, malformed requests,
+context/output limits, local crashes/timeouts, invalid outputs, source changes,
+certificate failures and unknown causes do not retry. Incomplete output alone
+does not establish a temporary provider failure. Structured HTTP rejection
+details are retained before the SDK reduces them to friendly text; raw rejection
+bodies are not added to receipts. Classification also controls shared admission,
+so a permanent error cannot impose overload recovery on unrelated work.
+
+HTTP status/header behavior follows the [official OpenAI SDK](https://github.com/openai/openai-python/blob/main/src/openai/_base_client.py);
+OpenRouter's typed errors and temporary 402 follow its [error contract](https://openrouter.ai/docs/api/reference/errors-and-debugging).
+HTTP 425 follows [RFC 8470](https://www.rfc-editor.org/rfc/rfc8470#section-5.2).
+Proxy HTTP/2 evidence is interpreted using [RFC 9113](https://www.rfc-editor.org/rfc/rfc9113.html#section-7);
+WebSocket meanings follow the [IANA registry](https://www.iana.org/assignments/websocket).
+These define retry classification, not a promise that a particular retry succeeds
+or that an interrupted generation was never processed. Every attempt counts
+toward the existing attempt/spending allowance; missing usage remains unknown.
+
+No retry flag is required. `--keep-retrying-provider-errors` is retained as a
+compatibility option with the same automatic behavior. Successful answers are
+never redrawn. Observe successful completions/minute alongside failure counts,
+retry usage/cost and admission history when assessing throughput.
+
+Rejected WebSocket upgrades preserve their actual HTTP status and retry headers
+through a connection-specific dispatcher observer. A 503/429 handshake can
+therefore retry; 403 stays fatal. No SSE fallback or extra handshake probe is
+sent, and concurrent connections do not share response metadata.
 
 Queued work consumes no attempt reservation;
 once admitted, existing conservative accounting remains in force. Failed or
@@ -270,7 +290,11 @@ Changed request-producing code or transport requires a new experiment. An
 explicit reason cannot override incompatible model requests. Unknown historical
 or custom workers without a request-code fingerprint retain strict worker-hash
 checks. The checked-in compatibility registry identifies two verified previous
-native workers; it does not declare every historical runner compatible.
+native workers and one verified error-observation revision; it does not declare
+every historical runner compatible. Its exact request fingerprint maps to the
+unchanged serialization family; raw fingerprints and receipt prefixes remain
+audited. SSE, WebSocket, cached-prefix and System One serialization were checked
+against the preceding release before registering this update.
 Only add a historical mapping after verifying identical native serialization
 and receipt/budget behavior; preserve existing mappings when adding new ones.
 

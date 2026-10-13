@@ -1425,17 +1425,18 @@ Internal request queue:
   Active requests finish normally. Late in-flight failures share one cooldown
   generation, except explicit Retry-After deadlines. Recovery starts at one
   request and doubles after successful completions; new pressure can slow it.
-  Explicit server_is_overloaded errors keep retrying automatically with per-case
-  2/4/8/.../60s exponential backoff. There is no two-attempt cutoff for overload.
-  Honor longer valid Retry-After; malformed values fall back to exponential delay.
+  Every verified temporary provider failure retries automatically with per-case
+  2/4/8/.../60s exponential backoff until success or an authorized stop.
+  There is no two-attempt cutoff. This includes HTTP 408/409/425/429/5xx,
+  SSE/WebSocket server/rate/overload errors and verified network interruptions.
+  Honor longer valid Retry-After/retry-after-ms; malformed values fall back.
   Saved attempt counts survive resume. Attempts/spending caps, pause and cancel
-  still apply. Other transient errors keep their two-attempt lifetime bound;
-  invalid or >60s Retry-After prevents their automatic retry. Local, validation
-  and unknown errors do not retry. Old receipts do not recreate an outage.
-  Explicit run --keep-retrying-provider-errors also keeps retrying other recognized
-  transient provider errors with exponential backoff, honoring valid Retry-After.
-  It does not retry local, validation, fatal or unknown errors. No flag is needed
-  for explicit overload recovery.
+  still apply. Local, validation, request/length, fatal and unknown errors stop.
+  Authentication/exhausted-credit errors are fatal, including within HTTP 200.
+  OpenRouter's explicit in-flight-budget 402 with a valid wait deadline retries;
+  ordinary 402 does not. Explicit server no-retry instructions are respected.
+  Old receipts do not recreate an outage. No retry flag is required;
+  --keep-retrying-provider-errors remains a compatibility option with no effect.
   Measure successful completions/minute, failures and retry cost.
   Workers launch only after admission; queued cases consume no attempt budget.
   Warmups and retries share the same slots/budget. Reused answers need neither.
@@ -1637,7 +1638,7 @@ Example from your project checkout (replace the spec and destination):
     p.add_argument('--only', action='append', metavar='CASE_ID',
                    help='dispatch only these frozen cases; the full report retains unselected cases')
     p.add_argument('--keep-retrying-provider-errors', action='store_true',
-                   help='keep retrying temporary provider failures with exponential backoff; preserve attempts and spending limits')
+                   help='compatibility option; verified temporary provider errors already retry automatically')
     p.add_argument("--max-new-attempts", type=int,
                    help="cap newly sent attempts, including provider retries; reserve spending for this allowance")
     p.add_argument("--attempt-budget", type=Path,

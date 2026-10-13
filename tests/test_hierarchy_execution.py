@@ -237,10 +237,10 @@ class HierarchyExecutionTests(unittest.TestCase):
         self.assertEqual(result['summary']['valid'], 3)
         self.assertEqual(len(json.loads((self.root / 'calls.json').read_text())), 3)
 
-    def test_selected_run_preserves_provider_retries_and_two_lifetime_attempts(self):
+    def test_selected_run_preserves_automatic_retries_and_saved_lifetime_counts(self):
         self.prepare()
         failures = {name: {'attempts': attempts, 'metadata': {'http_status': 503}}
-                    for name, attempts in (('one', 1), ('two', 100))}
+                    for name, attempts in (('one', 1), ('two', 3))}
         with patch.dict(os.environ, {'FAKE_RUNNER_FAILURES': json.dumps(failures)}):
             first = experiment.run(self.root / 'E1', only=['one'], max_new_attempts=2,
                                    include_request_preview=False)
@@ -251,11 +251,16 @@ class HierarchyExecutionTests(unittest.TestCase):
                 experiment.run(self.root / 'E1', only=['two'], max_new_attempts=2,
                                include_request_preview=False)
             saved = (self.root / 'E1/run/results.jsonl').read_bytes()
-            with self.assertRaises(RunnerError):
-                experiment.run(self.root / 'E1', only=['two'], max_new_attempts=2,
-                               include_request_preview=False)
-            self.assertEqual((self.root / 'E1/run/results.jsonl').read_bytes(), saved)
-        self.assertEqual(len(json.loads((self.root / 'calls.json').read_text())), 4)
+            resumed = experiment.run(self.root / 'E1', only=['two'], max_new_attempts=2,
+                                     include_request_preview=False)
+            receipts = (self.root / 'E1/run/results.jsonl').read_bytes()
+            self.assertTrue(receipts.startswith(saved))
+            self.assertEqual(resumed['summary']['valid'], 2)
+            self.assertEqual(resumed['summary']['unrun'], 1)
+            attempts = [json.loads(row)['attempt'] for row in receipts.splitlines()
+                        if json.loads(row)['note_id'] == 'two']
+            self.assertEqual(attempts, [1, 2, 3, 4])
+        self.assertEqual(len(json.loads((self.root / 'calls.json').read_text())), 6)
 
     def test_selected_run_keeps_native_parallel_dispatch_with_internal_capacity(self):
         self.prepare()

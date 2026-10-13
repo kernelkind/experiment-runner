@@ -222,7 +222,7 @@ class SharedProviderBackoff:
                         value['until'] = max(value['until'], now + max(
                             value['seconds'], _provider_retry_after_delay(record) or 0))
                         value['limit'], value['successes'] = 1, 0
-                    elif metadata.get('retry_after') is not None:
+                    elif any(metadata.get(key) is not None for key in ('retry_after', 'retry_after_ms')):
                         # Older requests belong to an already counted outage.
                         # Only an explicit server deadline can extend its wait;
                         # they cannot undo capacity recovered by newer requests.

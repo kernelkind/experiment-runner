@@ -14,11 +14,31 @@ CLI = ROOT / 'bin/experiment-runner'
 
 
 class UpdateTests(unittest.TestCase):
-    def test_pause_stops_overload_retries_and_resume_preserves_the_counter(self):
+    def test_verified_error_observation_update_preserves_saved_answers_and_budget(self):
+        previous = '15429b548cf904622a33bdad86c20d523da097c1956cc736ebbb2a513ded9018'
+        following = '633e80636537f433fee2a578825fedf0d126a03d898cf33cc16fdbc26b6e5e99'
+        self.worker.write_text(self.worker.read_text().replace('"b" * 64', repr(previous)))
+        self.prepare()
+        self.cli('run', 'E1', '--only', '0', '--attempt-budget', str(self.budget))
+        receipts = self.root / 'E1/run/results.jsonl'
+        prefix = receipts.read_bytes()
+        frozen = (self.root / 'E1/experiment.json').read_bytes()
+        self.worker.write_text(self.worker.read_text().replace('"e" * 64', '"a" * 64')
+                               .replace(repr(previous), repr(following)))
+        self.cli('run', 'E1', '--attempt-budget', str(self.budget))
+        self.assertTrue(receipts.read_bytes().startswith(prefix))
+        self.assertEqual((self.root / 'E1/experiment.json').read_bytes(), frozen)
+        self.assertEqual(json.loads(self.budget.read_text())['used'], 2)
+        self.assertEqual(len(self.calls()), 2)
+        self.cli('prepare', 'E2', '--from', 'E1')
+        self.cli('run', 'E2', '--attempt-budget', str(self.budget))
+        self.assertEqual(len(self.calls()), 2, 'verified observation update lost exact reuse')
+
+    def test_pause_stops_transient_retries_and_resume_preserves_the_counter(self):
         self.prepare(count=1)
         self.budget.write_text(json.dumps({'schema_version': 1, 'limit': 3, 'used': 0}))
         self.env['FAKE_RUNNER_FAILURES'] = json.dumps({'E1-0': {'attempts': 100,
-            'metadata': {'http_status': 200, 'error': {'code': 'server_is_overloaded'}}}})
+            'metadata': {'http_status': 503}}})
         process = subprocess.Popen([str(CLI), 'run', 'E1', '--attempt-budget', str(self.budget)],
             cwd=self.root, env=self.env, text=True, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, start_new_session=True)
