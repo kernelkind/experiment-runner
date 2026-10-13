@@ -420,6 +420,12 @@ saved receipt prefixes in chunks of at most 1 MiB. Completed successful prompt
 receipts are released after scheduler accounting; responses needed for the
 batch output remain, and saved receipts are validated again on resume.
 
+Receipt remembering indexes first line numbers and byte offsets by hash, then
+rereads the chosen line to compare its exact bytes. Confirmed local appends
+advance this compact index; an unexpected file stamp, replacement, truncation
+or incomplete tail rebuilds it. Receipt bodies are not cached, and ordinary
+completions do not repeatedly scan the growing ledger.
+
 Atomic JSON documents use incremental UTF-8 encoding with the same property
 order, compact separators and final newline. Sorted native outputs keep sorted
 keys. Serialization retains at most an encoded scalar rather than another copy

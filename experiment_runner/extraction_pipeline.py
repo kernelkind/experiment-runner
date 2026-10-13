@@ -597,12 +597,16 @@ def _atomic_write_json(path: Path, value: object, *, sort_keys=False) -> None:
     _atomic_write(path, chunks())
 
 
-def _append_json_line(path: Path, value: object) -> None:
+def _append_json_line(path: Path, value: object, *, receipt_files=None) -> None:
     payload = _canonical_json_bytes(value)
     with RESULTS_WRITE_LOCK, path.open("ab") as destination:
+        before = receipt_files._stamp(path) if receipt_files is not None else None
+        offset = destination.tell()
         destination.write(payload)
         destination.flush()
         os.fsync(destination.fileno())
+        if receipt_files is not None:
+            receipt_files.appended(path, payload, offset, before, receipt_files._stamp(path))
 
 
 def _is_within(path: Path, parent: Path) -> bool:
@@ -2395,6 +2399,7 @@ class ReceiptFiles:
         self._json_bytes = 0
         self._manifest_path = Path(manifest_path) if manifest_path is not None else None
         self._offsets = {}
+        self._first_lines = {}
         self._upgrades = {}
         self._worker_upgrades = {}
         self._lock = threading.RLock()
@@ -2479,6 +2484,61 @@ class ReceiptFiles:
                 with path.open('rb') as stream:
                     return next(line for i, line in enumerate(stream, 1) if i == number)
             return line
+
+    def _first_line_index(self, path):
+        stamp = self._stamp(path)
+        entry = self._first_lines.get(path)
+        if entry is not None and entry['stamp'] == stamp:
+            return entry
+        first, offset, count, terminated = {}, 0, 0, True
+        with path.open('rb') as stream:
+            for count, line in enumerate(stream, 1):
+                first.setdefault(_sha256_bytes(line), (count, offset))
+                offset += len(line)
+                terminated = line.endswith(b'\n')
+        if self._stamp(path) != stamp:
+            raise RunnerError(f'source changed while indexing: {path}')
+        entry = dict(stamp=stamp, first=first, count=count, terminated=terminated)
+        self._first_lines[path] = entry
+        return entry
+
+    def appended(self, path, payload, offset, before, after):
+        """Advance only a verified own append; unknown changes rebuild the index."""
+        path = Path(path)
+        with self._lock:
+            entry = self._first_lines.get(path)
+            if (entry is None or entry['stamp'] != before or not entry['terminated']
+                    or offset != before[2] or after[:2] != before[:2]
+                    or after[2] != before[2] + len(payload)):
+                self._first_line_index(path)
+                return
+            entry['count'] += 1
+            entry['first'].setdefault(_sha256_bytes(payload), (entry['count'], offset))
+            entry['stamp'] = after
+            entry['terminated'] = payload.endswith(b'\n')
+
+    def first_line(self, path, expected):
+        """Find the first exact saved bytes, retaining only hashes and positions."""
+        path = Path(path)
+        with self._lock:
+            entry = self._first_line_index(path)
+            number, offset = entry['first'].get(_sha256_bytes(expected), (None, None))
+            if number is None:
+                raise StopIteration
+            with path.open('rb') as stream:
+                stream.seek(offset)
+                line = stream.readline()
+            if self._stamp(path) != entry['stamp']:
+                raise RunnerError(f'source changed while reading: {path}')
+            if line == expected:
+                return number
+            # A hash candidate is not an equality verdict. Preserve first-exact
+            # semantics even if distinct lines ever share the same digest.
+            with path.open('rb') as stream:
+                number = next(i for i, line in enumerate(stream, 1) if line == expected)
+            if self._stamp(path) != entry['stamp']:
+                raise RunnerError(f'source changed while reading: {path}')
+            return number
 
     def provenance(self, directory, *, manifest_sha256, initial_wrapper_sha256):
         with self._lock:
@@ -2804,8 +2864,8 @@ class RequestHistory:
 
     def remember(self, key: str, path: Path, record: dict[str, Any]) -> None:
         expected = _canonical_json_bytes(record)
-        with RESULTS_WRITE_LOCK, path.open('rb') as stream:
-            number = next(i for i, line in enumerate(stream, 1) if line == expected)
+        with RESULTS_WRITE_LOCK:
+            number = self.files.first_line(path, expected)
         reference = {"results_path": str(path.resolve()), "result_line": number,
                      "result_sha256": _sha256_bytes(expected),
                      "manifest_sha256": record["manifest_sha256"]}
@@ -3033,7 +3093,8 @@ def _run_job(
     if retry_reason is not None:
         record["retry_reason"] = retry_reason
     try:
-        _append_json_line(results_path, record)
+        _append_json_line(results_path, record,
+                          receipt_files=receipt_files if stage_name == 'prompt' else None)
         latest[job_key] = record
     finally:
         if new_job_budget is not None and new_job_budget.spend is not None:
@@ -4064,7 +4125,7 @@ def _execute_prompt_batch(
                         reference, source = reusable
                         record = _reused_prompt_record(config, manifest, prompt, reference, source, files=history.files)
                         record["wrapper_sha256"] = provenance.active_wrapper_sha256
-                        _append_json_line(results_path, record)
+                        _append_json_line(results_path, record, receipt_files=history.files)
                         latest[job_key] = record
                         response = record["response"]
         if not isinstance(response, str):

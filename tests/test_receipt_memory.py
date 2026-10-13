@@ -5,6 +5,7 @@ from pathlib import Path
 import tempfile
 import tracemalloc
 import unittest
+from unittest.mock import patch
 
 from experiment_runner import experiment
 from experiment_runner import compatibility
@@ -48,7 +49,7 @@ class ReceiptMemoryTests(unittest.TestCase):
             key = str(number)
             record = {'manifest_sha256': 'a' * 64, 'job_key': key, 'output': 'λ' * 4096}
             with history.lock(key):
-                engine._append_json_line(path, record)
+                engine._append_json_line(path, record, receipt_files=history.files)
                 history.remember(key, path, record)
             return key, record
 
@@ -60,6 +61,65 @@ class ReceiptMemoryTests(unittest.TestCase):
             raw = lines[reference['result_line'] - 1]
             self.assertEqual(raw, engine._canonical_json_bytes(record))
             self.assertEqual(reference['result_sha256'], engine._sha256_bytes(raw))
+
+    def test_first_match_index_rebuilds_after_unowned_file_changes(self):
+        path = self.root / 'results.jsonl'
+        history = engine.RequestHistory(self.root, discover=False)
+        first = {'manifest_sha256': 'a' * 64, 'job_key': 'one'}
+        second = {'manifest_sha256': 'a' * 64, 'job_key': 'two'}
+        first_raw, second_raw = map(engine._canonical_json_bytes, (first, second))
+
+        def remember(number):
+            key = str(number)
+            with history.lock(key):
+                engine._append_json_line(path, second, receipt_files=history.files)
+                history.remember(key, path, second)
+            return json.loads((history.directory / (key + '.json')).read_text())
+
+        engine._append_json_line(path, first, receipt_files=history.files)
+        self.assertEqual(remember(0)['result_line'], 2)
+        self.assertEqual(remember(1)['result_line'], 2, 'duplicate lost its first line')
+        path.write_bytes(second_raw + first_raw)
+        self.assertEqual(remember(2)['result_line'], 1, 'same-size rewrite reused stale offsets')
+        replacement = self.root / 'replacement.jsonl'
+        replacement.write_bytes(first_raw)
+        replacement.replace(path)
+        self.assertEqual(remember(3)['result_line'], 2, 'replacement reused stale offsets')
+        with path.open('r+b') as stream:
+            stream.truncate(0)
+        self.assertEqual(remember(4)['result_line'], 1, 'truncation reused stale offsets')
+        engine._append_json_line(path, first)
+        self.assertEqual(remember(5)['result_line'], 1, 'unowned append reused stale offsets')
+        with history.lock('first'):
+            history.remember('first', path, first)
+        self.assertEqual(json.loads((history.directory / 'first.json').read_text())['result_line'], 2)
+
+    def test_first_match_index_checks_exact_bytes_even_for_hash_collisions(self):
+        path = self.root / 'results.jsonl'
+        history = engine.RequestHistory(self.root, discover=False)
+        first = {'manifest_sha256': 'a' * 64, 'job_key': 'one'}
+        second = {'manifest_sha256': 'a' * 64, 'job_key': 'two'}
+        with patch.object(engine, '_sha256_bytes', return_value='c' * 64):
+            for record in (first, second, second):
+                engine._append_json_line(path, record, receipt_files=history.files)
+            with history.lock('second'):
+                history.remember('second', path, second)
+        self.assertEqual(json.loads((history.directory / 'second.json').read_text())['result_line'], 2)
+
+    def test_unterminated_tail_does_not_create_a_false_appended_line(self):
+        path = self.root / 'results.jsonl'
+        path.write_bytes(b'partial')
+        history = engine.RequestHistory(self.root, discover=False)
+        record = {'manifest_sha256': 'a' * 64, 'job_key': 'one'}
+        engine._append_json_line(path, record, receipt_files=history.files)
+        with history.lock('missing'):
+            with self.assertRaises(StopIteration):
+                history.remember('missing', path, record)
+        self.assertFalse((history.directory / 'missing.json').exists())
+        engine._append_json_line(path, record, receipt_files=history.files)
+        with history.lock('one'):
+            history.remember('one', path, record)
+        self.assertEqual(json.loads((history.directory / 'one.json').read_text())['result_line'], 2)
 
     def test_latest_results_load_streams_beyond_retained_receipt_memory(self):
         path = self.root / 'results.jsonl'

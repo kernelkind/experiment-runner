@@ -119,6 +119,60 @@ class HierarchyExecutionTests(unittest.TestCase):
         self.assertEqual((config.run_directory / 'results.jsonl').read_bytes(), before)
         self.assertEqual(len(json.loads((self.root / 'calls.json').read_text())), 3)
 
+    def test_prompt_completion_reads_ledger_bytes_linearly_as_receipts_accumulate(self):
+        from experiment_runner import extraction_pipeline as engine
+
+        (self.root / 'cases.json').write_text(json.dumps({'cases': [
+            {'id': str(number), 'inputs': {'TASK': str(number)}} for number in range(48)]}))
+        self.prepare()
+        config = engine.PromptRunnerConfig.load(self.root / 'E1/runner-config.json')
+        manifest = json.loads((config.run_directory / 'manifest.json').read_text())
+        results = config.run_directory / 'results.jsonl'
+        scanned = 0
+        open_path = Path.open
+
+        class Counted:
+            def __init__(self, stream):
+                self.stream = stream
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return self.stream.__exit__(*args)
+
+            def __getattr__(self, name):
+                return getattr(self.stream, name)
+
+            def read(self, *args):
+                nonlocal scanned
+                value = self.stream.read(*args)
+                scanned += len(value)
+                return value
+
+            def readline(self, *args):
+                nonlocal scanned
+                value = self.stream.readline(*args)
+                scanned += len(value)
+                return value
+
+            def __iter__(self):
+                for line in self.stream:
+                    nonlocal scanned
+                    scanned += len(line)
+                    yield line
+
+        def counted(path, *args, **kwargs):
+            stream = open_path(path, *args, **kwargs)
+            return Counted(stream) if path == results and args and args[0] == 'rb' else stream
+
+        with patch.object(Path, 'open', counted), patch.dict(os.environ, {
+                'FAKE_RUNNER_PROMPT_RESPONSE': json.dumps({'answer': 'x' * (32 * 1024)})}):
+            output = engine._execute_prompt_batch(config, manifest, retry_failed=False)
+        self.assertEqual(len(output['responses']), 48)
+        self.assertLessEqual(scanned, results.stat().st_size * 3,
+                             'completion repeatedly scanned the growing ledger')
+
     def test_history_discovery_retains_references_without_historical_prompt_bodies(self):
         from experiment_runner import extraction_pipeline as engine
 
