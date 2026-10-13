@@ -3768,11 +3768,18 @@ def _provider_retry_after_delay(record: dict[str, Any]) -> float | None:
     return max(2.0, delay)
 
 
-def provider_retry_delay(record: dict[str, Any]) -> float | None:
-    """At most one retry per case, with a bounded delay honoring Retry-After."""
-    if prompt_failure_kind(record) != "provider_transient" or record["attempt"] >= 2:
+def provider_retry_delay(record: dict[str, Any], *, keep_retrying: bool = False) -> float | None:
+    """Retry temporary provider failures, retaining their lifetime attempt count."""
+    if prompt_failure_kind(record) != "provider_transient":
+        return None
+    if not keep_retrying and record["attempt"] >= 2:
         return None
     delay = _provider_retry_after_delay(record)
+    if keep_retrying:
+        # Bound the exponent before calculating it; a long-lived case can have
+        # an arbitrarily large saved counter. Explicit server deadlines win.
+        backoff = min(60.0, 2.0 ** min(6, record["attempt"]))
+        return max(backoff, delay) if delay is not None else None
     return delay if delay is not None and delay <= 60 else None
 
 
@@ -3789,6 +3796,7 @@ def _execute_prompt_batch(
     new_job_budget: NewJobBudget | None = None,
     before_new_attempt: Callable[[NewJobBudget], None] | None = None,
     request_queue=None,
+    keep_retrying_provider_errors: bool = False,
 ) -> dict[str, object]:
     from experiment_runner import scheduling
     # Historical concurrency stays in frozen plans; dispatch capacity is internal.
@@ -3962,7 +3970,7 @@ def _execute_prompt_batch(
             now = time.monotonic()
             # Resume retains the actual shared cooldown. An old receipt is not
             # evidence of a new outage starting when this coordinator restarts.
-            delay = provider_retry_delay(previous)
+            delay = provider_retry_delay(previous, keep_retrying=keep_retrying_provider_errors)
             if delay is not None:
                 retry_at = now + delay
                 heapq.heappush(ready, (retry_at, index, prompt))
@@ -3973,8 +3981,8 @@ def _execute_prompt_batch(
         else:
             fresh.append((index, prompt))
     # A due retry takes priority; while it waits, fresh cases can use free slots.
-    # Only shared-pressure evidence delays the batch. Each case still has two
-    # lifetime attempts, including attempts retained across resume.
+    # Only shared-pressure evidence delays the batch. Default retries retain
+    # their two-attempt lifetime bound; the explicit opt-in keeps backing off.
     try:
         with ThreadPoolExecutor(max_workers=concurrency) as pool:
             try:
@@ -4036,7 +4044,7 @@ def _execute_prompt_batch(
                             now = time.monotonic()
                             if provider_cooldown_required(record) and not fatal:
                                 backoff(record, now, submitted_at)
-                            delay = provider_retry_delay(record)
+                            delay = provider_retry_delay(record, keep_retrying=keep_retrying_provider_errors)
                             if delay is not None and not fatal:
                                 retry_at = now + delay
                                 heapq.heappush(ready, (retry_at, index, prompt))

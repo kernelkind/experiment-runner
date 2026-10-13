@@ -164,6 +164,17 @@ most two lifetime attempts, with a minimum two-second retry delay honoring
 retry. Observe successful completions per minute alongside failure counts,
 retry usage/cost and admission history when assessing actual throughput.
 
+When explicitly authorized to keep retrying temporary provider failures, use
+`run EXPERIMENT --keep-retrying-provider-errors`. This removes the two-attempt
+lifetime bound for recognized transient provider errors, with per-case
+2/4/8/.../60-second exponential backoff. Longer valid `Retry-After` values are
+honored; malformed headers prevent retry. The same experiment, exact request,
+saved receipts and lifetime attempt counter are retained on resume. Successful
+answers are never redrawn. Warmups use the same retry policy. Local crashes,
+timeouts, invalid outputs, source changes, unknown errors and fatal provider
+errors are not retried by this option. Attempt and spending caps still apply,
+and every failed attempt counts. The default two-attempt policy is unchanged.
+
 Queued work consumes no attempt reservation;
 once admitted, existing conservative accounting remains in force. Failed or
 interrupted reservations are never refunded. Exact-answer reuse consumes no

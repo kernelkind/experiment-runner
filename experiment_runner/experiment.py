@@ -1139,11 +1139,11 @@ def reconcile_costs(directory):
 def run(directory, max_new_attempts=None, runner_upgrade_reason=None, *,
         max_cost_usd=None, max_request_cost_usd=None, attempt_budget_path=None,
         additional_attempt_budget_paths=(), include_request_preview=True,
-        only=None, warm_cache=True):
+        only=None, warm_cache=True, keep_retrying_provider_errors=False):
     directory = directory.resolve()
     if (directory / 'bounded-build.json').exists():
         if (any(x is not None for x in (max_cost_usd, max_request_cost_usd, attempt_budget_path, only))
-                or additional_attempt_budget_paths or not warm_cache):
+                or additional_attempt_budget_paths or not warm_cache or keep_retrying_provider_errors):
             raise ValueError('bounded builds use their frozen shared attempt budget and subscription route')
         run_build = project.import_module('bounded_hierarchy_build').run_build
         return run_build(directory, max_new_attempts, runner_upgrade_reason)
@@ -1176,6 +1176,7 @@ def run(directory, max_new_attempts=None, runner_upgrade_reason=None, *,
             manifest_sha256=inputs.digest(manifest), concurrency=scheduling.LIMIT,
             scheduling='shared-fair-queue-v1',
             prepared_concurrency=config.concurrency, only=only, warm_cache=warm_cache,
+            keep_retrying_provider_errors=keep_retrying_provider_errors,
             started_at_utc=datetime.now(timezone.utc).isoformat()))
         provenance = engine._load_runner_upgrades(
             config.run_directory, manifest_sha256=inputs.digest(manifest),
@@ -1228,6 +1229,7 @@ def run(directory, max_new_attempts=None, runner_upgrade_reason=None, *,
                         engine._execute_prompt_batch(warm_config, warm_manifest, retry_failed=False,
                             new_job_budget=budget,
                             request_queue=queue,
+                            keep_retrying_provider_errors=keep_retrying_provider_errors,
                             validate_output=lambda job, raw: inputs.validate(
                                 {'adapter': 'generic'}, warm_plan['cases'][0], raw, config.output_schema))
                     finally:
@@ -1255,6 +1257,7 @@ def run(directory, max_new_attempts=None, runner_upgrade_reason=None, *,
                 max_request_cost_usd=max_request_cost_usd,
                 attempt_budget_path=attempt_budget_path,
                 additional_attempt_budget_paths=additional_attempt_budget_paths,
+                keep_retrying_provider_errors=keep_retrying_provider_errors,
                 runner_upgrade_reason=runner_upgrade_reason if wrapper_changed else None,
                 before_new_attempt=(warm_before_dispatch if warm_cache and plan.get('cache_warmup', {}).get('eligible') else None),
             )
@@ -1424,7 +1427,11 @@ Internal request queue:
   request and doubles after successful completions; new pressure can slow it.
   Cases keep at most two lifetime attempts, including saved attempts on resume.
   Old receipts do not recreate an outage. Invalid or >60s Retry-After prevents
-  automatic retry. Measure successful completions/minute, failures and retry cost.
+  default automatic retry. Explicit run --keep-retrying-provider-errors retries
+  temporary provider failures with per-case 2/4/8/.../60s exponential backoff,
+  honoring longer valid Retry-After values. Saved attempt counters survive resume.
+  Attempt/spending caps still apply. Local, validation and fatal errors stop.
+  Measure successful completions/minute, failures and retry cost.
   Workers launch only after admission; queued cases consume no attempt budget.
   Warmups and retries share the same slots/budget. Reused answers need neither.
   Eligible prefixes warm before comparisons, within the run's fair share.
@@ -1624,6 +1631,8 @@ Example from your project checkout (replace the spec and destination):
     p.add_argument("experiment", type=Path)
     p.add_argument('--only', action='append', metavar='CASE_ID',
                    help='dispatch only these frozen cases; the full report retains unselected cases')
+    p.add_argument('--keep-retrying-provider-errors', action='store_true',
+                   help='keep retrying temporary provider failures with exponential backoff; preserve attempts and spending limits')
     p.add_argument("--max-new-attempts", type=int,
                    help="cap newly sent attempts, including provider retries; reserve spending for this allowance")
     p.add_argument("--attempt-budget", type=Path,
@@ -1718,7 +1727,7 @@ def main(argv=None):
                 raise ValueError('--max-new-attempts must be positive')
             if args.runner_upgrade_reason is not None and (not args.runner_upgrade_reason.strip()):
                 raise ValueError('--runner-upgrade-reason must not be blank')
-            result = run(args.experiment, args.max_new_attempts, args.runner_upgrade_reason, max_cost_usd=args.max_cost_usd, max_request_cost_usd=args.max_request_cost_usd, attempt_budget_path=args.attempt_budget, only=args.only)
+            result = run(args.experiment, args.max_new_attempts, args.runner_upgrade_reason, max_cost_usd=args.max_cost_usd, max_request_cost_usd=args.max_request_cost_usd, attempt_budget_path=args.attempt_budget, only=args.only, keep_retrying_provider_errors=args.keep_retrying_provider_errors)
             if (args.experiment / 'bounded-build.json').exists():
                 print(json.dumps(result, indent=2))
                 return int(result.get('status') != 'finished')

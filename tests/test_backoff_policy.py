@@ -44,6 +44,21 @@ class BackoffPolicyTests(unittest.TestCase):
         self.assertIn('ticket', self.acquire(), 'an individual stream error blocked unrelated work')
         self.assertIn('ticket', self.acquire(), 'stream recovery serialized unrelated work')
 
+    def test_provider_retry_opt_in_uses_saved_attempt_number_and_honors_server_delay(self):
+        failed = self.failure({'http_status': 503})
+        for attempt, delay in ((1, 2), (2, 4), (3, 8), (6, 60), (10000, 60)):
+            with self.subTest(attempt=attempt):
+                failed['attempt'] = attempt
+                self.assertEqual(provider_retry_delay(failed, keep_retrying=True), delay)
+                if attempt >= 2:
+                    self.assertIsNone(provider_retry_delay(failed))
+        failed['model_result']['response_metadata']['retry_after'] = '120'
+        self.assertEqual(provider_retry_delay(failed, keep_retrying=True), 120)
+        failed['model_result']['response_metadata']['retry_after'] = 'invalid'
+        self.assertIsNone(provider_retry_delay(failed, keep_retrying=True))
+        failed['model_result']['response_metadata'] = {'http_status': 401}
+        self.assertIsNone(provider_retry_delay(failed, keep_retrying=True))
+
     def test_generic_server_error_is_retryable_without_account_recovery(self):
         for status in (408, 500, 502, 503, 504):
             with self.subTest(status=status):

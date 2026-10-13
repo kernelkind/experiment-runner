@@ -314,6 +314,56 @@ class SharedRunnerTests(unittest.TestCase):
 
 
 class NativePrefixTests(unittest.TestCase):
+    def test_provider_retry_opt_in_resumes_same_cases_beyond_two_attempts(self):
+        self.prepare('retry')
+        environment = {'FAKE_RUNNER_FAILURES': json.dumps({
+            'Tea {POST}': {'attempts': 3, 'metadata': {'http_status': 503}}})}
+        self.cli('run', 'retry', ok=False, env=environment)
+        before = self.show('retry')
+        self.assertEqual(before['summary']['attempts'], 3)
+        self.assertEqual(before['summary']['failed'], 1)
+        self.cli('run', 'retry', ok=False, env=environment)
+        self.assertEqual(len(self.calls()), 3, 'default resume exceeded two lifetime attempts')
+        self.cli('run', 'retry', '--keep-retrying-provider-errors', env=environment)
+        after = self.show('retry')
+        self.assertEqual(after['summary']['valid'], 2)
+        self.assertEqual(after['summary']['attempts'], 5)
+        receipts = [json.loads(row) for row in
+                    (self.root / 'retry/run/results.jsonl').read_text().splitlines()]
+        retries = [row for row in receipts if row['note_id'] == 'one']
+        self.assertEqual([row['attempt'] for row in retries], [1, 2, 3, 4])
+        self.assertEqual(len({row['prompt_sha256'] for row in retries}), 1)
+        self.assertTrue(all(row['model_result']['http_attempts'] == 1 for row in retries))
+        settings = [json.loads(row) for row in
+                    (self.root / 'retry/execution-settings.jsonl').read_text().splitlines()]
+        self.assertTrue(settings[-1]['keep_retrying_provider_errors'])
+        self.cli('run', 'retry', '--keep-retrying-provider-errors', env=environment)
+        self.assertEqual(len(self.calls()), 5, 'resume redrew a successful answer')
+
+    def test_provider_retry_opt_in_keeps_attempt_budget_and_local_failure_final(self):
+        self.prepare('limited')
+        environment = {'FAKE_RUNNER_FAILURES': json.dumps({
+            'Tea {POST}': {'attempts': 100, 'metadata': {'http_status': 503}}})}
+        self.cli('run', 'limited', '--only', 'one', '--max-new-attempts', '3',
+                 '--keep-retrying-provider-errors', ok=False, env=environment)
+        self.assertEqual(self.show('limited')['summary']['attempts'], 3)
+        self.prepare('local', '--repeat')
+        self.cli('run', 'local', '--only', 'one', '--keep-retrying-provider-errors',
+                 ok=False, env={'FAKE_RUNNER_FAIL_STAGE': 'prompt'})
+        self.assertEqual(self.show('local')['summary']['attempts'], 1)
+        self.prepare('invalid', '--repeat')
+        invalid = {'FAKE_RUNNER_RESULT_OVERRIDE': json.dumps({
+            'valid': False, 'validation_error': 'fixture schema validation failed'})}
+        self.cli('run', 'invalid', '--only', 'one', '--keep-retrying-provider-errors',
+                 ok=False, env=invalid)
+        self.assertEqual(self.show('invalid')['summary']['attempts'], 1)
+        self.cli('run', 'invalid', '--only', 'one', '--keep-retrying-provider-errors',
+                 ok=False, env=invalid)
+        self.assertEqual(self.show('invalid')['summary']['attempts'], 1)
+        self.cli('run', 'local', '--only', 'one', '--keep-retrying-provider-errors',
+                 ok=False, env={'FAKE_RUNNER_FAIL_STAGE': 'prompt'})
+        self.assertEqual(self.show('local')['summary']['attempts'], 1)
+
     def test_run_only_dispatches_selected_cases_and_keeps_the_full_frozen_report(self):
         self.prepare()
         directory = self.root / 'E1'
