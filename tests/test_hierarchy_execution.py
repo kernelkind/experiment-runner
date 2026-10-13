@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import tracemalloc
 import unittest
 from unittest.mock import patch
 
@@ -94,6 +95,71 @@ class HierarchyExecutionTests(unittest.TestCase):
             record = next(row for row in records if row['note_id'] == prompt.prompt_id)
             self.assertEqual(record['request_sha256'], engine._prompt_request_key(manifest, prompt.text))
             engine.validate_prompt_receipt(replace(config, prompts=(prompt,)), manifest, record)
+
+    def test_history_discovery_retains_references_without_historical_prompt_bodies(self):
+        from experiment_runner import extraction_pipeline as engine
+
+        self.prepare()
+        experiment.run(self.root / 'E1', include_request_preview=False)
+        for number in range(16):
+            directory = self.root / f'unrelated-{number}'
+            directory.mkdir()
+            (directory / 'manifest.json').write_text(json.dumps({
+                'mode': 'prompt', 'prompts': [], 'padding': 'x' * (256 * 1024)}))
+            (directory / 'results.jsonl').write_text('')
+        tracemalloc.start()
+        try:
+            history = engine.RequestHistory(self.root)
+            retained, _ = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertLess(retained, 1024 * 1024, 'history retained unrelated prompt bodies')
+        config = engine.PromptRunnerConfig.load(self.root / 'E1/runner-config.json')
+        manifest = json.loads((config.run_directory / 'manifest.json').read_text())
+        for prompt in config.prompts:
+            key = engine._prompt_request_key(manifest, prompt.text)
+            matches = list(history.matches(key))
+            self.assertEqual(len(matches), 1)
+            self.assertEqual(matches[0][1]['final_output_raw'], '{"answer":"local fixture"}')
+
+    def test_history_discovery_streams_receipt_bodies(self):
+        from experiment_runner import extraction_pipeline as engine
+
+        directory = self.root / 'historical'
+        directory.mkdir()
+        (directory / 'manifest.json').write_text(json.dumps({'mode': 'prompt', 'prompts': []}))
+        with (directory / 'results.jsonl').open('w') as output:
+            for number in range(32):
+                output.write(json.dumps({'job_key': str(number), 'status': 'failed',
+                                         'padding': 'x' * (256 * 1024)}) + '\n')
+        tracemalloc.start()
+        try:
+            history = engine.RequestHistory(self.root)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(history.sources, {})
+        self.assertLess(peak, 4 * 1024 * 1024, 'history retained full historical receipts')
+
+    def test_verified_file_cache_bounds_historical_json_and_reloads_evicted_files(self):
+        from experiment_runner import extraction_pipeline as engine
+
+        paths = []
+        for number in range(20):
+            path = self.root / f'source-{number}.json'
+            path.write_text(json.dumps({'value': str(number) * (1024 * 1024 // len(str(number)))}))
+            paths.append(path)
+        tracemalloc.start()
+        try:
+            files = engine.ReceiptFiles()
+            for number, path in enumerate(paths):
+                self.assertTrue(files.json(path)['value'].startswith(str(number)))
+            retained, _ = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertLess(retained, 17 * 1024 * 1024, 'verification retained unbounded source JSON')
+        paths[0].write_text('{"value":"changed"}')
+        self.assertEqual(files.json(paths[0]), {'value': 'changed'})
 
     def test_invocation_manifest_cache_still_checks_changes_before_sending(self):
         from experiment_runner import extraction_pipeline as engine

@@ -56,6 +56,21 @@ when the native source-change check requires the reviewed upgrade reason.
 Stopping the group releases only its own processes; unrelated workloads remain
 outside it.
 
+History discovery keeps request keys and original receipt references, then
+releases each historical manifest and receipt body. Source verification lazily
+loads matching evidence through a cache limited to 16 MiB of source-file bytes,
+plus the executing batch's manifest. Evicted and changed files are read and
+verified again. This is a cache bound, not a resident-memory guarantee; keep the
+workload cgroup limit in place.
+
+The October 13 model-free full-grading check loaded all 128 prepared batches
+and their shared history concurrently under that 32 GiB limit. It completed in
+14.84 seconds, peaked at 21.94 GiB of cgroup memory and held 14.16 GiB after all
+loads, with zero OOM events and zero swap. This verifies input/history startup
+at full batch fanout; model workers and subsequent collection still require
+runtime measurement. All ready batches continue to use the shared request
+queue without an outer batch concurrency cap.
+
 ## Use
 
 Use the shared launcher at

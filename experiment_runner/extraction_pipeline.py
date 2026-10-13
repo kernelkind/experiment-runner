@@ -2367,13 +2367,16 @@ def _invoke_model(
 class ReceiptFiles:
     """Operation-scoped file reads and provenance, never receipt verdicts.
 
-    JSON files are parsed/hashed once until changed. JSONL files retain only
+    Keep the executing manifest and at most 16 MiB of other JSON source bytes.
+    Evicted files are verified again when needed. JSONL files retain only
     line offsets, not every receipt body. Every requested line is read and
     verified normally. A new operation starts with an empty cache.
     """
 
-    def __init__(self):
+    def __init__(self, *, manifest_path=None):
         self._json = {}
+        self._json_bytes = 0
+        self._manifest_path = Path(manifest_path) if manifest_path is not None else None
         self._offsets = {}
         self._upgrades = {}
         self._worker_upgrades = {}
@@ -2387,12 +2390,21 @@ class ReceiptFiles:
     def _entry(self, path):
         path = Path(path)
         stamp = self._stamp(path)
-        entry = self._json.get(path)
+        entry = self._json.pop(path, None)
+        if entry is not None and path != self._manifest_path:
+            self._json_bytes -= entry['stamp'][2]
         if entry is None or entry['stamp'] != stamp:
             raw = path.read_bytes()
             if self._stamp(path) != stamp:
                 raise RunnerError(f'source changed while reading: {path}')
             entry = dict(stamp=stamp, value=json.loads(raw), sha256=_sha256_bytes(raw))
+        if path == self._manifest_path or stamp[2] <= 16 * 1024 * 1024:
+            if path != self._manifest_path:
+                while self._json_bytes + stamp[2] > 16 * 1024 * 1024:
+                    oldest = next(key for key in self._json if key != self._manifest_path)
+                    removed = self._json.pop(oldest)
+                    self._json_bytes -= removed['stamp'][2]
+                self._json_bytes += stamp[2]
             self._json[path] = entry
         return entry
 
@@ -2710,7 +2722,7 @@ class RequestHistory:
 
     def __init__(self, root: Path, *, exclude_run: Path | None = None):
         self.directory = root / ".model-request-history"
-        self.files = ReceiptFiles()
+        self.files = ReceiptFiles(manifest_path=exclude_run / 'manifest.json' if exclude_run else None)
         self.sources: dict[str, list[dict[str, Any]]] = {}
         ignored = {".git", "node_modules", "target", ".direnv", ".venv", "__pycache__",
                    self.directory.name}
@@ -2722,26 +2734,32 @@ class RequestHistory:
                 continue
             path = Path(directory) / "results.jsonl"
             try:
-                manifest = self.files.json(path.parent / "manifest.json")
+                # Discovery needs only compact receipt references. Do not keep
+                # every historical rendered prompt in each running batch.
+                discovery_files = ReceiptFiles()
+                manifest = discovery_files.json(path.parent / "manifest.json")
                 if manifest.get("mode") not in {"prompt", "mask_generation"}:
                     continue
                 prompts = {p["prompt_id"]: p["text"] for p in manifest["prompts"]}
                 latest = {}
-                for number, line in enumerate(self.files.lines(path), 1):
+                for number, line in enumerate(discovery_files.lines(path), 1):
                     # Another run may still be appending its last record.
                     if not line.endswith(b"\n"):
                         continue
                     record = json.loads(line)
-                    latest[record["job_key"]] = (number, line, record)
-                for number, line, record in latest.values():
-                    if (record.get("status") != "succeeded" or record.get("execution") is not None
-                            or record.get("stage") != "prompt" or not record.get("model_result")):
+                    candidate = ((record.get('note_id'), record.get('manifest_sha256'))
+                        if record.get('status') == 'succeeded' and record.get('execution') is None
+                        and record.get('stage') == 'prompt' and record.get('model_result') else None)
+                    latest[record["job_key"]] = (number, _sha256_bytes(line), candidate)
+                for number, digest, candidate in latest.values():
+                    if candidate is None:
                         continue
-                    key = _prompt_request_key(manifest, prompts[record["note_id"]])
+                    note_id, manifest_sha256 = candidate
+                    key = _prompt_request_key(manifest, prompts[note_id])
                     self.sources.setdefault(key, []).append({
                         "results_path": str(path.resolve()), "result_line": number,
-                        "result_sha256": _sha256_bytes(line),
-                        "manifest_sha256": record["manifest_sha256"],
+                        "result_sha256": digest,
+                        "manifest_sha256": manifest_sha256,
                     })
             except (OSError, ValueError, KeyError, TypeError, AttributeError, RunnerError):
                 # Unrelated legacy or incomplete runs are not reusable evidence.
