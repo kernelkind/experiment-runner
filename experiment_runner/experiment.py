@@ -98,7 +98,7 @@ def read(path):
 
 def write(path, value):
     # Schema property order is part of request identity; do not sort nested keys.
-    engine._atomic_write(Path(path), engine._ordered_json_bytes(value))
+    engine._atomic_write_json(Path(path), value)
 
 
 def resolve(path, base):

@@ -29,7 +29,7 @@ from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from email.utils import parsedate_to_datetime
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 
 if not __package__:
@@ -565,12 +565,16 @@ def _load_json(path: Path, name: str) -> object:
         raise RunnerError(f"could not read `{name}` at {path}: {error}") from error
 
 
-def _atomic_write(path: Path, payload: bytes) -> None:
+def _atomic_write(path: Path, payload: bytes | Iterable[bytes]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
         with temporary.open("xb") as destination:
-            destination.write(payload)
+            if isinstance(payload, bytes):
+                destination.write(payload)
+            else:
+                for chunk in payload:
+                    destination.write(chunk)
             destination.flush()
             os.fsync(destination.fileno())
         os.replace(temporary, path)
@@ -579,6 +583,18 @@ def _atomic_write(path: Path, payload: bytes) -> None:
             temporary.unlink()
         except FileNotFoundError:
             pass
+
+
+def _atomic_write_json(path: Path, value: object, *, sort_keys=False) -> None:
+    """Preserve the JSON byte contract without materializing the whole document."""
+    encoder = json.JSONEncoder(ensure_ascii=False, sort_keys=sort_keys, separators=(",", ":"))
+
+    def chunks():
+        for chunk in encoder.iterencode(value):
+            yield chunk.encode('utf-8')
+        yield b'\n'
+
+    _atomic_write(path, chunks())
 
 
 def _append_json_line(path: Path, value: object) -> None:
@@ -1216,9 +1232,7 @@ def _load_runner_upgrades(
         ) from error
     current_wrapper = initial_wrapper_sha256
     previous_first_result_line = 0
-    result_path = run_directory / "results.jsonl"
-    result_bytes = result_path.read_bytes() if result_path.exists() else b""
-    result_line_count = len(result_bytes.splitlines())
+    result_size, _, result_line_count, _ = compatibility._results_prefix(run_directory)
     boundaries: list[tuple[int, str]] = []
     for line_number, line in enumerate(lines, start=1):
         try:
@@ -1273,20 +1287,21 @@ def _load_runner_upgrades(
             or isinstance(prefix_bytes, bool)
             or not isinstance(prefix_bytes, int)
             or prefix_bytes < 0
-            or prefix_bytes > len(result_bytes)
+            or prefix_bytes > result_size
         ):
             raise RunnerError(
                 f"runner upgrade ledger line {line_number} has invalid first_result_line"
             )
-        prefix = result_bytes[:prefix_bytes]
+        _, prefix_sha256, prefix_line_count, prefix_terminated = compatibility._results_prefix(
+            run_directory, prefix_bytes)
         if (
             _expect_sha256(
                 record["results_prefix_sha256"],
                 f"runner upgrade ledger line {line_number}.results_prefix_sha256",
             )
-            != _sha256_bytes(prefix)
-            or len(prefix.splitlines()) != first_result_line - 1
-            or (prefix and not prefix.endswith(b"\n"))
+            != prefix_sha256
+            or prefix_line_count != first_result_line - 1
+            or (prefix_bytes and not prefix_terminated)
         ):
             raise RunnerError(
                 f"runner upgrade ledger line {line_number} does not match its results prefix"
@@ -1449,13 +1464,16 @@ def _load_latest_results(
     if not path.exists():
         return {}
     latest: dict[str, dict[str, Any]] = {}
-    try:
-        lines = path.read_bytes().splitlines(keepends=True) if evidence is None else None
-    except (OSError, UnicodeError) as error:
-        raise RunnerError(f"could not read results ledger {path}: {error}") from error
+    def stream_rows():
+        try:
+            with path.open('rb') as stream:
+                yield from ((line, None) for line in stream)
+        except (OSError, UnicodeError) as error:
+            raise RunnerError(f"could not read results ledger {path}: {error}") from error
+
     active_wrapper = provenance.initial_wrapper_sha256
     boundary_index = 0
-    rows = ((line, None) for line in lines) if evidence is None else evidence
+    rows = stream_rows() if evidence is None else evidence
     for line_number, (line, parsed) in enumerate(rows, start=1):
         while (
             boundary_index < len(provenance.boundaries)
@@ -1868,9 +1886,8 @@ def _append_runner_upgrade(
         return prepared.provenance
     if prepared.pending_reason is None:
         raise AssertionError("pending runner upgrade has no audit reason")
-    results_path = run_directory / "results.jsonl"
-    result_bytes = results_path.read_bytes() if results_path.exists() else b""
-    first_result_line = len(result_bytes.splitlines()) + 1
+    result_size, result_sha256, result_line_count, _ = compatibility._results_prefix(run_directory)
+    first_result_line = result_line_count + 1
     _append_json_line(
         run_directory / "runner-upgrades.jsonl",
         {
@@ -1879,8 +1896,8 @@ def _append_runner_upgrade(
             "from_wrapper_sha256": prepared.provenance.active_wrapper_sha256,
             "to_wrapper_sha256": prepared.pending_wrapper_sha256,
             "first_result_line": first_result_line,
-            "results_prefix_bytes": len(result_bytes),
-            "results_prefix_sha256": _sha256_bytes(result_bytes),
+            "results_prefix_bytes": result_size,
+            "results_prefix_sha256": result_sha256,
             "reason": prepared.pending_reason,
         },
     )
@@ -2786,10 +2803,9 @@ class RequestHistory:
                 yield reference, _read_request_source(reference, key, files=self.files)
 
     def remember(self, key: str, path: Path, record: dict[str, Any]) -> None:
-        with RESULTS_WRITE_LOCK:
-            lines = path.read_bytes().splitlines(keepends=True)
         expected = _canonical_json_bytes(record)
-        number = next(i for i, line in enumerate(lines, 1) if line == expected)
+        with RESULTS_WRITE_LOCK, path.open('rb') as stream:
+            number = next(i for i, line in enumerate(stream, 1) if line == expected)
         reference = {"results_path": str(path.resolve()), "result_line": number,
                      "result_sha256": _sha256_bytes(expected),
                      "manifest_sha256": record["manifest_sha256"]}
@@ -4146,6 +4162,10 @@ def _execute_prompt_batch(
                             if (submitted_at >= backoff_until and record is not previous
                                     and record.get("execution") != "cross_run_reuse"):
                                 backoff_seconds = 0.0
+                            # This prompt is complete and cannot be retried in
+                            # this batch. Its validated response is sufficient
+                            # for output; the immutable ledger keeps its receipt.
+                            latest.pop("prompt:" + prompt.prompt_id)
                         except ExperimentPaused:
                             paused = fatal = True
                         except NewJobLimitReached as limit:
@@ -4191,7 +4211,7 @@ def _execute_prompt_batch(
         "manifest_sha256": manifest_sha256,
         "responses": [responses[i] for i in sorted(responses)],
     }
-    _atomic_write(config.run_directory / "output.json", _canonical_json_bytes(output))
+    _atomic_write_json(config.run_directory / "output.json", output, sort_keys=True)
     return output
 
 

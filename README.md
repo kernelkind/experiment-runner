@@ -413,6 +413,20 @@ so a long hierarchy advancement does not retain the whole experiment history
 in memory. `result_records(path)` supplies the receipt-digest index used by
 project failed-call and reused-producer review checks.
 
+Receipt history discovery, history reference lookup and resume ledger loading
+read one JSONL line at a time. Remembering a completed call keeps the first
+exact matching line and its original hash. Worker and wrapper upgrade verification hash
+saved receipt prefixes in chunks of at most 1 MiB. Completed successful prompt
+receipts are released after scheduler accounting; responses needed for the
+batch output remain, and saved receipts are validated again on resume.
+
+Atomic JSON documents use incremental UTF-8 encoding with the same property
+order, compact separators and final newline. Sorted native outputs keep sorted
+keys. Serialization retains at most an encoded scalar rather than another copy
+of the entire document; file flush, fsync and atomic replacement still precede
+publication. Parsed inputs and report evidence still require memory, so these
+changes do not replace a workload memory limit.
+
 ## Update the shared binary after code merges
 
 After **every code change merged into local `main`**, verify that the shared

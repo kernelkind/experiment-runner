@@ -96,6 +96,29 @@ class HierarchyExecutionTests(unittest.TestCase):
             self.assertEqual(record['request_sha256'], engine._prompt_request_key(manifest, prompt.text))
             engine.validate_prompt_receipt(replace(config, prompts=(prompt,)), manifest, record)
 
+    def test_completed_prompt_receipts_are_released_after_accounting_and_resume_reuses_them(self):
+        from experiment_runner import extraction_pipeline as engine
+
+        self.prepare()
+        config = engine.PromptRunnerConfig.load(self.root / 'E1/runner-config.json')
+        manifest = json.loads((config.run_directory / 'manifest.json').read_text())
+        retained = []
+        load = engine._load_latest_results
+
+        def observed(*args, **kwargs):
+            latest = load(*args, **kwargs)
+            retained.append(latest)
+            return latest
+
+        with patch.object(engine, '_load_latest_results', side_effect=observed):
+            first = engine._execute_prompt_batch(config, manifest, retry_failed=False)
+            before = (config.run_directory / 'results.jsonl').read_bytes()
+            second = engine._execute_prompt_batch(config, manifest, retry_failed=False)
+        self.assertEqual(first, second)
+        self.assertEqual(retained, [{}, {}])
+        self.assertEqual((config.run_directory / 'results.jsonl').read_bytes(), before)
+        self.assertEqual(len(json.loads((self.root / 'calls.json').read_text())), 3)
+
     def test_history_discovery_retains_references_without_historical_prompt_bodies(self):
         from experiment_runner import extraction_pipeline as engine
 

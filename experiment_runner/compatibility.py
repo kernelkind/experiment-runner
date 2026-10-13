@@ -33,6 +33,33 @@ def compatible(original, current):
             or previous is not None and previous == following)
 
 
+def _results_prefix(directory, size=None):
+    """Hash exactly the saved byte prefix without retaining receipt bodies."""
+    path = Path(directory) / 'results.jsonl'
+    digest = hashlib.sha256()
+    length = 0
+    line_breaks = 0
+    last = b''
+    if path.exists():
+        with path.open('rb') as stream:
+            while size is None or length < size:
+                chunk = stream.read(1024 * 1024 if size is None else min(1024 * 1024, size - length))
+                if not chunk:
+                    break
+                digest.update(chunk)
+                length += len(chunk)
+                line_breaks += chunk.count(b'\n') + chunk.count(b'\r') - chunk.count(b'\r\n')
+                if last == b'\r' and chunk.startswith(b'\n'):
+                    line_breaks -= 1
+                last = chunk[-1:]
+    if size is not None and length != size:
+        raise ValueError('invalid worker upgrade history')
+    # Match bytes.splitlines(), including a final line without a terminator
+    # and CRLF pairs crossing read boundaries.
+    lines = line_breaks + int(bool(last) and last not in (b'\r', b'\n'))
+    return length, digest.hexdigest(), lines, last == b'\n'
+
+
 def worker_history(directory, manifest):
     """Verify transitions against the immutable manifest and prior receipt prefix."""
     directory = Path(directory)
@@ -43,15 +70,14 @@ def worker_history(directory, manifest):
     identities = [original]
     if not path.exists():
         return identities
-    results = (directory / 'results.jsonl').read_bytes() if (directory / 'results.jsonl').exists() else b''
     digest = hashlib.sha256((directory / 'manifest.json').read_bytes()).hexdigest()
     last_size = 0
     for line in path.read_text().splitlines():
         row = json.loads(line)
         size = row['results_prefix_bytes']
         if (row['manifest_sha256'] != digest or row['from'] != identities[-1]
-                or type(size) is not int or not last_size <= size <= len(results)
-                or hashlib.sha256(results[:size]).hexdigest() != row['results_prefix_sha256']
+                or type(size) is not int or size < last_size
+                or _results_prefix(directory, size)[1] != row['results_prefix_sha256']
                 or not compatible(original, row['to'])):
             raise ValueError('invalid worker upgrade history')
         identities.append(row['to'])
@@ -69,11 +95,11 @@ def upgrade_worker(directory, manifest, identity):
     if current['runner_sha256'] == identities[-1]['runner_sha256']:
         return
     directory = Path(directory)
-    results = (directory / 'results.jsonl').read_bytes() if (directory / 'results.jsonl').exists() else b''
+    size, prefix_sha256, _, _ = _results_prefix(directory)
     row = dict(manifest_sha256=hashlib.sha256((directory / 'manifest.json').read_bytes()).hexdigest(),
                **{'from': identities[-1], 'to': current},
                reason='compatible request-producing code; runner provenance update',
-               results_prefix_bytes=len(results), results_prefix_sha256=hashlib.sha256(results).hexdigest())
+               results_prefix_bytes=size, results_prefix_sha256=prefix_sha256)
     with (directory / 'worker-upgrades.jsonl').open('a') as stream:
         stream.write(json.dumps(row, sort_keys=True, separators=(',', ':')) + '\n')
 
