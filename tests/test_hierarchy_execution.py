@@ -173,6 +173,51 @@ class HierarchyExecutionTests(unittest.TestCase):
         self.assertLessEqual(scanned, results.stat().st_size * 3,
                              'completion repeatedly scanned the growing ledger')
 
+    def test_large_manifest_report_hashes_without_reparsing_per_receipt(self):
+        from experiment_runner import extraction_pipeline as engine
+
+        context = 'word ' * (72 * 1024)
+        (self.root / 'cases.json').write_text(json.dumps({'cases': [
+            {'id': str(number), 'inputs': {'TASK': context + str(number)}} for number in range(48)]}))
+        self.prepare()
+        experiment.run(self.root / 'E1', include_request_preview=False)
+        manifest_path = self.root / 'E1/run/manifest.json'
+        self.assertGreater(manifest_path.stat().st_size, 16 * 1024 * 1024)
+        read_bytes = Path.read_bytes
+        reads = 0
+
+        def counted(path, *args, **kwargs):
+            nonlocal reads
+            if path == manifest_path:
+                reads += 1
+            return read_bytes(path, *args, **kwargs)
+
+        tracemalloc.start()
+        try:
+            with patch.object(Path, 'read_bytes', counted):
+                result = experiment.report(self.root / 'E1', include_request_preview=False)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(result['summary']['valid'], 48)
+        self.assertLessEqual(reads, 2, 'report reread the large manifest for each receipt')
+        self.assertLess(peak, 512 * 1024 * 1024, 'report retained repeated manifest copies')
+        results_path = self.root / 'E1/run/results.jsonl'
+        with results_path.open('rb') as stream:
+            raw = stream.readline()
+        record = json.loads(raw)
+        manifest = json.loads(manifest_path.read_text())
+        prompt = next(p for p in manifest['prompts'] if p['prompt_id'] == record['note_id'])
+        reference = {'results_path': str(results_path), 'result_line': 1,
+                     'result_sha256': engine._sha256_bytes(raw),
+                     'manifest_sha256': record['manifest_sha256']}
+        reads = 0
+        with patch.object(Path, 'read_bytes', counted):
+            original = engine._read_request_source(reference,
+                engine._prompt_request_key(manifest, prompt['text']), files=engine.ReceiptFiles())
+        self.assertEqual(original, record)
+        self.assertEqual(reads, 1, 'source verification parsed its large manifest twice')
+
     def test_history_discovery_retains_references_without_historical_prompt_bodies(self):
         from experiment_runner import extraction_pipeline as engine
 

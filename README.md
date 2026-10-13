@@ -59,8 +59,12 @@ outside it.
 History discovery keeps request keys and original receipt references, then
 releases each historical manifest and receipt body. Source verification lazily
 loads matching evidence through a cache limited to 16 MiB of source-file bytes,
-plus the executing batch's manifest. Evicted and changed files are read and
-verified again. This is a cache bound, not a resident-memory guarantee; keep the
+plus the executing batch's manifest. Evicted JSON is read and parsed again when
+needed. Digest checks keep only file identity, size, timestamps and SHA-256;
+unchanged files need no repeated parsing or hashing, even above the JSON cache
+limit. Changed files are hashed in 1 MiB chunks and checked for changes during
+that read. Verified JSON reads populate the same digest metadata. This is a
+cache bound, not a resident-memory guarantee; keep the
 workload cgroup limit in place.
 
 Intentional repeats, including prefix warmups, skip history discovery because

@@ -2389,7 +2389,8 @@ class ReceiptFiles:
     """Operation-scoped file reads and provenance, never receipt verdicts.
 
     Keep the executing manifest and at most 16 MiB of other JSON source bytes.
-    Evicted files are verified again when needed. JSONL files retain only
+    Evicted JSON is parsed again when needed. File digests retain only a stamp
+    and hash; unchanged files need no repeat parsing or hashing. JSONL retains only
     line offsets, not every receipt body. Every requested line is read and
     verified normally. A new operation starts with an empty cache.
     """
@@ -2397,6 +2398,7 @@ class ReceiptFiles:
     def __init__(self, *, manifest_path=None):
         self._json = {}
         self._json_bytes = 0
+        self._hashes = {}
         self._manifest_path = Path(manifest_path) if manifest_path is not None else None
         self._offsets = {}
         self._first_lines = {}
@@ -2420,6 +2422,7 @@ class ReceiptFiles:
             if self._stamp(path) != stamp:
                 raise RunnerError(f'source changed while reading: {path}')
             entry = dict(stamp=stamp, value=json.loads(raw), sha256=_sha256_bytes(raw))
+        self._hashes[path] = (entry['stamp'], entry['sha256'])
         if path == self._manifest_path or stamp[2] <= 16 * 1024 * 1024:
             if path != self._manifest_path:
                 while self._json_bytes + stamp[2] > 16 * 1024 * 1024:
@@ -2435,8 +2438,17 @@ class ReceiptFiles:
             return self._entry(path)['value']
 
     def sha256(self, path):
+        path = Path(path)
         with self._lock:
-            return self._entry(path)['sha256']
+            stamp = self._stamp(path)
+            cached = self._hashes.get(path)
+            if cached is not None and cached[0] == stamp:
+                return cached[1]
+            digest = _sha256_file(path)
+            if self._stamp(path) != stamp:
+                raise RunnerError(f'source changed while hashing: {path}')
+            self._hashes[path] = (stamp, digest)
+            return digest
 
     def prompt(self, path, identifier):
         with self._lock:
@@ -2745,7 +2757,7 @@ def _read_request_source(reference: object, request_key: str, *,
             # Recover its original property order; immutable receipt hashes below
             # still reject a changed schema instead of trusting the config file.
             schema = files.json(Path(manifest["config_path"])).get("output_schema")
-        prompt = files.prompt(path.parent / "manifest.json", record["note_id"])
+        prompt = next(p for p in manifest['prompts'] if p['prompt_id'] == record['note_id'])
         config = PromptRunnerConfig(
             config_path=Path(manifest["config_path"]),
             runner_binary=Path(manifest["runner_binary"]),

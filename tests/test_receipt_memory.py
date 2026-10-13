@@ -1,6 +1,7 @@
 """Memory bounds and immutable bytes on the production receipt paths."""
 from concurrent.futures import ThreadPoolExecutor
 import json
+import os
 from pathlib import Path
 import tempfile
 import tracemalloc
@@ -93,6 +94,64 @@ class ReceiptMemoryTests(unittest.TestCase):
         with history.lock('first'):
             history.remember('first', path, first)
         self.assertEqual(json.loads((history.directory / 'first.json').read_text())['result_line'], 2)
+
+    def test_large_file_digest_streams_once_without_parsing_json(self):
+        path = self.root / 'large.json'
+        path.write_text(json.dumps({'padding': 'x' * (17 * 1024 * 1024)}))
+        expected = engine._sha256_file(path)
+        files = engine.ReceiptFiles()
+        tracemalloc.start()
+        try:
+            with patch.object(engine.json, 'loads', side_effect=AssertionError('digest parsed JSON')), \
+                    patch.object(engine, '_sha256_file', wraps=engine._sha256_file) as hashed:
+                for _ in range(5):
+                    self.assertEqual(files.sha256(path), expected)
+                self.assertEqual(hashed.call_count, 1)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertLess(peak, 3 * 1024 * 1024, 'digest retained the whole source file')
+
+    def test_digest_cache_invalidates_after_rewrite_and_replacement(self):
+        path = self.root / 'source.json'
+        path.write_bytes(b'{"value":"old"}\n')
+        files = engine.ReceiptFiles()
+        before = files.sha256(path)
+        stamp = path.stat()
+        path.write_bytes(b'{"value":"new"}\n')
+        os.utime(path, ns=(stamp.st_atime_ns, stamp.st_mtime_ns + 1_000_000))
+        self.assertNotEqual(files.sha256(path), before)
+        self.assertEqual(files.sha256(path), engine._sha256_file(path))
+        replacement = self.root / 'replacement.json'
+        replacement.write_bytes(b'{"value":"old"}\n')
+        replacement.replace(path)
+        self.assertEqual(files.sha256(path), before)
+
+    def test_digest_rejects_source_changed_during_hashing_and_recovers(self):
+        path = self.root / 'source.json'
+        path.write_bytes(b'{"value":"old"}\n')
+        files = engine.ReceiptFiles()
+        hash_file = engine._sha256_file
+
+        def changed(source):
+            digest = hash_file(source)
+            source.write_bytes(b'{"value":"changed"}\n')
+            return digest
+
+        with patch.object(engine, '_sha256_file', side_effect=changed):
+            with self.assertRaisesRegex(engine.RunnerError, 'source changed while hashing'):
+                files.sha256(path)
+        self.assertEqual(files.sha256(path), hash_file(path))
+
+    def test_verified_json_read_populates_digest_even_when_large_json_is_evicted(self):
+        path = self.root / 'large.json'
+        path.write_text(json.dumps({'padding': 'x' * (17 * 1024 * 1024)}))
+        files = engine.ReceiptFiles()
+        self.assertEqual(len(files.json(path)['padding']), 17 * 1024 * 1024)
+        expected = engine._sha256_file(path)
+        with patch.object(engine, '_sha256_file', side_effect=AssertionError('verified JSON was hashed again')), \
+                patch.object(engine.json, 'loads', side_effect=AssertionError('verified JSON was parsed again')):
+            self.assertEqual(files.sha256(path), expected)
 
     def test_first_match_index_checks_exact_bytes_even_for_hash_collisions(self):
         path = self.root / 'results.jsonl'
