@@ -62,6 +62,56 @@ class HierarchyExecutionTests(unittest.TestCase):
             self.assertEqual(candidate['summary']['cases'], 3)
             self.assertIsNone(candidate['requests'])
 
+    def test_workers_reuse_one_operation_manifest_for_calls_and_receipt_digests(self):
+        from dataclasses import replace
+        from experiment_runner import extraction_pipeline as engine
+
+        self.prepare()
+        config = engine.PromptRunnerConfig.load(self.root / 'E1/runner-config.json')
+        manifest_path = config.run_directory / 'manifest.json'
+        manifest = json.loads(manifest_path.read_text())
+        reads = []
+        read_text, read_bytes = Path.read_text, Path.read_bytes
+
+        def counted_text(path, *args, **kwargs):
+            if path == manifest_path:
+                reads.append('text')
+            return read_text(path, *args, **kwargs)
+
+        def counted_bytes(path, *args, **kwargs):
+            if path == manifest_path:
+                reads.append('bytes')
+            return read_bytes(path, *args, **kwargs)
+
+        with patch.object(Path, 'read_text', counted_text), \
+                patch.object(Path, 'read_bytes', counted_bytes):
+            engine._execute_prompt_batch(config, manifest, retry_failed=False)
+        self.assertLessEqual(len(reads), 3, reads)
+        records = [json.loads(line) for line in
+                   (config.run_directory / 'results.jsonl').read_text().splitlines()]
+        self.assertEqual(len(records), 3)
+        for prompt in config.prompts:
+            record = next(row for row in records if row['note_id'] == prompt.prompt_id)
+            self.assertEqual(record['request_sha256'], engine._prompt_request_key(manifest, prompt.text))
+            engine.validate_prompt_receipt(replace(config, prompts=(prompt,)), manifest, record)
+
+    def test_invocation_manifest_cache_still_checks_changes_before_sending(self):
+        from experiment_runner import extraction_pipeline as engine
+
+        self.prepare()
+        config = engine.PromptRunnerConfig.load(self.root / 'E1/runner-config.json')
+        prompt = config.prompts[0].text
+        files = engine.ReceiptFiles()
+        first = engine._invoke_model(config, config, prompt, config.output_schema, receipt_files=files)
+        self.assertIsNone(first['error'])
+        manifest_path = config.run_directory / 'manifest.json'
+        manifest = json.loads(manifest_path.read_text())
+        manifest['runner_version'] = 'changed'
+        manifest_path.write_text(json.dumps(manifest))
+        rejected = engine._invoke_model(config, config, prompt, config.output_schema, receipt_files=files)
+        self.assertIn('model runner changed', rejected['error'])
+        self.assertEqual(len(json.loads((self.root / 'calls.json').read_text())), 1)
+
     def test_selected_run_keeps_lifetime_budgets_and_reuses_without_new_allowance(self):
         self.prepare()
         stage = PersistentAttemptBudget(self.root / 'stage.json')

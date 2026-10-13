@@ -2266,8 +2266,10 @@ def _invoke_prompt_worker(config, argv, request, directory, *, worker_identity):
 
 
 def _invoke_model(
-    config: Any, stage: Any, prompt: str, schema: object
+    config: Any, stage: Any, prompt: str, schema: object,
+    *, receipt_files: ReceiptFiles | None = None,
 ) -> dict[str, Any]:
+    receipt_files = receipt_files or ReceiptFiles()
     _validate_auth_file(config.auth_file)
     identity = _runner_identity(config)
     from experiment_runner.scheduling import current_slot
@@ -2299,7 +2301,7 @@ def _invoke_model(
     error_message = None
     try:
         manifest = _expect_object(
-            _load_json(config.run_directory / "manifest.json", "run manifest"),
+            receipt_files.json(config.run_directory / "manifest.json"),
             "run manifest",
         )
         if not compatibility.compatible(manifest, identity):
@@ -2794,6 +2796,7 @@ def _run_job(
     reuse_source: LoadedReuseSource | None = None,
     receipt_files: ReceiptFiles | None = None,
 ) -> list[str] | int | str:
+    receipt_files = receipt_files or ReceiptFiles()
     job_key = _job_key(stage_name, note.note_id, takeaway_index)
     previous = latest.get(job_key)
     prompt_sha256 = _sha256_bytes(prompt.encode("utf-8"))
@@ -2831,8 +2834,7 @@ def _run_job(
                 saved_prompt,
                 schema,
                 _expect_object(
-                    (receipt_files.json(config.run_directory / "manifest.json") if receipt_files
-                     else _load_json(config.run_directory / "manifest.json", "run manifest")),
+                    receipt_files.json(config.run_directory / "manifest.json"),
                     "run manifest",
                 ),
                 previous, files=receipt_files,
@@ -2938,7 +2940,7 @@ def _run_job(
             new_job_budget.claim(job_key)
         attempt = 1 if previous is None else previous["attempt"] + 1
         try:
-            attempt_result = _invoke_model(config, stage, prompt, schema)
+            attempt_result = _invoke_model(config, stage, prompt, schema, receipt_files=receipt_files)
         except BaseException:
             if new_job_budget is not None and new_job_budget.spend is not None:
                 new_job_budget.spend.settle(None)
@@ -2990,7 +2992,7 @@ def _run_job(
         record["takeaway_index"] = takeaway_index
     if stage_name == "prompt":
         record["request_sha256"] = _prompt_request_key(
-            _load_json(config.run_directory / "manifest.json", "run manifest"), prompt
+            receipt_files.json(config.run_directory / "manifest.json"), prompt
         )
     if retry_reason is not None:
         record["retry_reason"] = retry_reason
@@ -3862,6 +3864,9 @@ def _execute_prompt_batch(
     (config.run_directory / "output.json").unlink(missing_ok=True)
     options = manifest["request_reuse"]
     history = RequestHistory(Path(options["history_root"]), exclude_run=config.run_directory)
+    # Parse frozen inputs before provider slots are held, then share the existing
+    # operation cache across invocation checks and receipt request digests.
+    history.files.json(config.run_directory / "manifest.json")
     mask_notes = {item["item_id"]: item["note"] for item in manifest.get("items", [])}
 
     def valid_for_reuse(prompt: PromptJob, raw: str) -> bool:
