@@ -291,6 +291,40 @@ class HierarchyExecutionTests(unittest.TestCase):
         self.assertEqual(len(json.loads((self.root / 'calls.json').read_text())), 3)
         self.assertEqual((self.root / 'E1/run/manifest.json').read_bytes(), frozen)
 
+    def test_warmup_preparation_reuses_frozen_prefix_without_reporting_the_parent(self):
+        (self.root / 'prompt.txt').write_text('GENERIC PROMPT' + ' word' * 1100 + '{TASK}')
+        args = experiment.parser().parse_args([
+            'prepare', str(self.root / 'E1'), '--spec', str(self.root / 'spec.json'),
+            '--model', 'gpt-6.1-sol', '--prompt-cache'])
+        experiment.prepare(args, include_request_preview=False)
+        args = experiment.parser().parse_args([
+            'prepare', str(self.root / 'warm'), '--from', str(self.root / 'E1'), '--cache-warmup'])
+        with patch.object(experiment, 'report', wraps=experiment.report) as reported, \
+                patch.object(experiment, 'prefix_policy', side_effect=AssertionError('prefix was recounted')):
+            result = experiment.prepare(args, include_request_preview=False)
+        self.assertNotIn(self.root / 'E1', [call.args[0] for call in reported.call_args_list])
+        self.assertEqual(result['summary']['cases'], 1)
+        plan, config, manifest = experiment.load(self.root / 'warm')
+        self.assertIsNone(plan['baseline'])
+        self.assertTrue(manifest['cache_warmup'])
+        self.assertTrue(manifest['request_reuse']['intentional_repeat'])
+        self.assertEqual(config.prompts[0].text, config.prompt_cache_prefix)
+
+    def test_native_warmed_execution_discovers_history_only_for_the_comparisons(self):
+        from experiment_runner import extraction_pipeline as engine
+
+        (self.root / 'prompt.txt').write_text('GENERIC PROMPT' + ' word' * 1100 + '{TASK}')
+        args = experiment.parser().parse_args([
+            'prepare', str(self.root / 'E1'), '--spec', str(self.root / 'spec.json'),
+            '--model', 'gpt-6.1-sol', '--prompt-cache'])
+        experiment.prepare(args, include_request_preview=False)
+        with patch.object(engine.os, 'walk', wraps=engine.os.walk) as walked:
+            result = experiment.run(self.root / 'E1', include_request_preview=False)
+        self.assertEqual(walked.call_count, 1, 'warmup discovered historical receipts it cannot reuse')
+        self.assertEqual(result['summary']['valid'], 3)
+        self.assertEqual(result['cache_warmup']['attempts'], 1)
+        self.assertEqual(len(json.loads((self.root / 'calls.json').read_text())), 4)
+
     def test_programmatic_warm_cache_false_suppresses_only_the_warmup(self):
         (self.root / 'prompt.txt').write_text('GENERIC PROMPT' + ' word' * 1100 + '{TASK}')
         args = experiment.parser().parse_args([

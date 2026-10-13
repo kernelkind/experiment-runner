@@ -63,6 +63,11 @@ plus the executing batch's manifest. Evicted and changed files are read and
 verified again. This is a cache bound, not a resident-memory guarantee; keep the
 workload cgroup limit in place.
 
+Intentional repeats, including prefix warmups, skip history discovery because
+they always send a fresh request. They still preserve request locks and original
+receipt references. Warmup preparation reuses the frozen prefix eligibility and
+loads the parent settings without building a parent report that it cannot use.
+
 The October 13 model-free full-grading check loaded all 128 prepared batches
 and their shared history concurrently under that 32 GiB limit. It completed in
 14.84 seconds, peaked at 21.94 GiB of cgroup memory and held 14.16 GiB after all

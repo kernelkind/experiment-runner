@@ -2720,10 +2720,12 @@ def _reused_prompt_record(
 class RequestHistory:
     """Index saved prompt receipts once per batch; serialize only identical requests."""
 
-    def __init__(self, root: Path, *, exclude_run: Path | None = None):
+    def __init__(self, root: Path, *, exclude_run: Path | None = None, discover=True):
         self.directory = root / ".model-request-history"
         self.files = ReceiptFiles(manifest_path=exclude_run / 'manifest.json' if exclude_run else None)
         self.sources: dict[str, list[dict[str, Any]]] = {}
+        if not discover:
+            return
         ignored = {".git", "node_modules", "target", ".direnv", ".venv", "__pycache__",
                    self.directory.name}
         for directory, children, files in os.walk(root):
@@ -3969,7 +3971,8 @@ def _execute_prompt_batch(
         queue.extend(len(config.prompts))
     (config.run_directory / "output.json").unlink(missing_ok=True)
     options = manifest["request_reuse"]
-    history = RequestHistory(Path(options["history_root"]), exclude_run=config.run_directory)
+    history = RequestHistory(Path(options["history_root"]), exclude_run=config.run_directory,
+                             discover=not options['intentional_repeat'])
     # Parse frozen inputs before provider slots are held, then share the existing
     # operation cache across invocation checks and receipt request digests.
     history.files.json(config.run_directory / "manifest.json")

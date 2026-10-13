@@ -281,6 +281,7 @@ def prepare(args, *, preparation_context=None, include_request_preview=True):
     destination = args.destination.expanduser().resolve()
     if destination.exists():
         raise ValueError("experiment destination already exists")
+    warmup = getattr(args, "cache_warmup", False)
     inherited_history = None
     if args.from_experiment:
         old, _, old_manifest = load(args.from_experiment)
@@ -289,7 +290,8 @@ def prepare(args, *, preparation_context=None, include_request_preview=True):
         setup['preparation'] = old.get('preparation')
         if 'cache_warmup' in old:
             setup['cache_warmup'] = old['cache_warmup']
-        baseline = report(Path(args.from_experiment).resolve(), include_request_preview=include_request_preview)
+        baseline = (None if warmup else report(Path(args.from_experiment).resolve(),
+                                               include_request_preview=include_request_preview))
     else:
         setup = spec_setup(args.spec, preparation_context=preparation_context,
                            include_request_preview=include_request_preview)
@@ -328,7 +330,6 @@ def prepare(args, *, preparation_context=None, include_request_preview=True):
         if specified_cache and any(name in setup['runner'] for name in ('prompt_cache_prefix', 'prompt_cache_key')):
             raise ValueError('runner.prompt_cache cannot be combined with manual cache settings')
         cache_requested = cache_requested or specified_cache
-    warmup = getattr(args, "cache_warmup", False)
     prefix_path = getattr(args, "prompt_cache_prefix", None)
     if cache_requested and (args.import_config or warmup or prefix_path is not None
                             or getattr(args, 'prompt_cache_key', None) is not None):
