@@ -3807,8 +3807,12 @@ def prompt_failure_kind(record: dict[str, Any]) -> str:
             or isinstance(proxy, dict) and (proxy.get("terminal_event") == "completed"
                                             or proxy.get("state") == "complete")):
         return "local"
-    if isinstance(proxy, dict) and (proxy.get('state') in ('canceled', 'deadline_exceeded')
-            or proxy.get('request_context') in ('canceled', 'deadline_exceeded')):
+    # Proxy cleanup can cancel its context after an upstream terminal failure.
+    # That failure still needs the provider-code checks below; cancellation
+    # without an upstream failure remains local.
+    if (metadata.get('terminal_event') != 'response.failed' and isinstance(proxy, dict)
+            and (proxy.get('state') in ('canceled', 'deadline_exceeded')
+                 or proxy.get('request_context') in ('canceled', 'deadline_exceeded'))):
         return "local"
     error = metadata.get("error") or {}
     code = error.get("code") if isinstance(error, dict) else None

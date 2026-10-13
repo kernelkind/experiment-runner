@@ -10,6 +10,49 @@ from experiment_runner.provider_backoff import SharedProviderBackoff
 
 
 class BackoffPolicyTests(unittest.TestCase):
+    def test_terminal_server_error_retries_after_proxy_context_cleanup(self):
+        # Saved grading failure: the provider failed before proxy cleanup
+        # canceled the stream context. It was not a caller cancellation.
+        failed = self.failure({
+            'http_status': 200, 'terminal_event': 'response.failed',
+            'error': {'code': 'server_error'},
+            'proxy_status': {
+                'error_phase': 'body', 'http_status': 200,
+                'read_error_kind': 'context_canceled', 'request_context': 'canceled',
+                'state': 'failed', 'terminal_event': 'failed',
+            },
+        })
+        failed['model_result']['valid'] = False
+        self.assertEqual(prompt_failure_kind(failed), 'provider_transient')
+        for attempt, delay in ((1, 2), (2, 4), (3, 8), (6, 60), (10000, 60)):
+            with self.subTest(attempt=attempt):
+                failed['attempt'] = attempt
+                self.assertEqual(provider_retry_delay(failed), delay)
+
+    def test_terminal_proxy_cleanup_does_not_override_nonretryable_causes(self):
+        for changes in (
+                {'abort_reason': 'request_timeout'},
+                {'terminal_event': 'response.completed'},
+                {'terminal_event': None},
+                {'should_retry': False},
+                {'error': {'code': 'insufficient_quota'}},
+                {'error': {'code': 'invalid_api_key'}},
+                {'error': {'code': 'unsupported_parameter'}},
+                {'error': {'code': 'context_length_exceeded'}},
+                {'error': {'code': 'unknown'}},
+                {'http_status': 400}, {'http_status': 401},
+                {'http_status': 402}, {'http_status': 403},
+        ):
+            with self.subTest(changes=changes):
+                failed = self.failure({
+                    'http_status': 200, 'terminal_event': 'response.failed',
+                    'error': {'code': 'server_error'},
+                    'proxy_status': {'state': 'failed', 'terminal_event': 'failed',
+                        'request_context': 'canceled', 'read_error_kind': 'context_canceled'},
+                    **changes,
+                })
+                self.assertIsNone(provider_retry_delay(failed))
+
     def test_all_verified_transient_failures_keep_retrying_by_default(self):
         for status in (408, 409, 429, 500, 502, 503, 504, 529):
             for attempt, expected in ((1, 2), (2, 4), (3, 8), (6, 60), (10000, 60)):
