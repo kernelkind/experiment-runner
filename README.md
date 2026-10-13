@@ -17,6 +17,45 @@ The shared runner retains the same input, schema, worker-identity, receipt,
 reuse and retry checks. Saved case reports expose the worker's
 `response_metadata`, `usage` and `stop_reason` without inventing missing values.
 
+## Contain a large workload's memory
+
+On a host with a systemd user manager and delegated memory controller, launch
+the whole coordinating command as one transient user service. Its Python and
+Node children inherit the same cgroup limit. The following example bounds the
+full distillation grading workload to 32 GiB with no swap, while every ready
+native batch remains free to enter the existing 30-request queue:
+
+```bash
+systemd-run --user --wait --pipe --collect \
+  --unit=distillation-full-1800 \
+  --working-directory=/home/dev/src/notedeck_worktrees/algos/oracle-mvp-grading \
+  --property=MemoryMax=32G --property=MemorySwapMax=0 \
+  --property=OOMPolicy=kill --property=KillMode=control-group \
+  --property=Restart=no --expand-environment=no --setenv=PATH \
+  /etc/profiles/per-user/dev/bin/uv run --no-project --with tiktoken==0.14.0 \
+  /home/dev/src/notedeck_worktrees/algos/experiment-runner/bin/experiment-runner \
+  run-distillation-automatic-grading \
+  target/distillation-review-v1/grading/full-1800/automatic \
+  >> target/distillation-review-v1/grading/full-1800/run-automatic.log 2>&1
+```
+
+Run this from that task worktree so the output path also resolves there. Select
+an explicit workload memory allowance for the host; 32 GiB is the approved
+allowance for this grading run on Anvil. Use the installed absolute `uv` path
+on another host. The service inherits the user manager's environment; pass any
+required task-specific environment explicitly with `--setenv`. This changes no
+host-wide memory settings and adds no concurrency limit.
+
+If the cgroup exhausts its memory allowance, `OOMPolicy=kill` stops the whole
+workload, including its children. `systemd-run --wait` returns failure and
+reports `oom-kill`; `Restart=no` prevents an automatic OOM restart loop. Treat
+that as a failed run. Inspect and fix the cause, then explicitly resume the
+same saved automatic directory with this command. Existing model receipts and
+attempt budgets stay in that directory. Supply `--runner-upgrade-reason` only
+when the native source-change check requires the reviewed upgrade reason.
+Stopping the group releases only its own processes; unrelated workloads remain
+outside it.
+
 ## Use
 
 Use the shared launcher at
