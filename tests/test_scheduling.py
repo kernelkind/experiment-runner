@@ -512,6 +512,17 @@ class SchedulingTests(unittest.TestCase):
                              'observed_at_utc', 'global_ready', 'global_eligible_ready', 'boot_id'):
                     self.assertIn(name, value)
 
+    def test_help_tells_workflows_to_start_all_ready_batches_before_waiting(self):
+        for command in (['--help'], ['run', '--help'], ['show', '--help']):
+            with self.subTest(command=command):
+                value = self.cli(*command).stdout
+                self.assertIn('Launch all ready, authorized model batches', value)
+                self.assertIn('not run processes', value)
+                self.assertIn('outer batch caps', value)
+                self.assertIn('before waiting', value)
+                self.assertIn('input dependencies', value)
+        self.assertFalse((self.root / 'calls.json').exists(), 'help must not launch work')
+
 
 if __name__ == '__main__':
     unittest.main()

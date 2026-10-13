@@ -1380,7 +1380,32 @@ def score_review(args):
 
 
 def parser():
-    queue_help = """Internal request queue:
+    submission_help = """Model batch submission:
+  Launch all ready, authorized model batches immediately.
+  Start their run processes concurrently, before waiting for completion.
+  The shared cap limits active model requests, not run processes.
+  Do not add outer batch caps, semaphores, fixed-size thread pools, or waves.
+  A cap on batch coordinators is also an outer batch cap: it hides ready work.
+  The queue cannot schedule a batch until its run process has started.
+  run blocks until its own batch finishes; prepare alone does not submit work.
+  Wait for genuine input dependencies and validate the required results.
+  Start newly ready batches without waiting for unrelated batches to finish.
+  Keep local CPU/GPU encoding limits separate from provider-batch submission.
+"""
+    queue_help = submission_help + """
+  Concurrent submission example (two prepared, authorized independent batches):
+    ../experiment-runner/bin/experiment-runner run target/a-v1 > target/a-v1/run.log 2>&1 &
+    batch_a_pid=$!
+    ../experiment-runner/bin/experiment-runner run target/b-v1 > target/b-v1/run.log 2>&1 &
+    batch_b_pid=$!
+    batch_a_status=0
+    wait "$batch_a_pid" || batch_a_status=$?
+    batch_b_status=0
+    wait "$batch_b_pid" || batch_b_status=$?
+  Both run processes start before either wait. Check both statuses and reports
+  before starting dependent work. Use your authorized attempt/spending limits.
+
+Internal request queue:
   All experiments by this user on this host share at most 30 active requests.
   Capacity is automatic: no concurrency flag or runner.concurrency in new specs.
   Historical concurrency fields stay frozen but do not control dispatch.
@@ -1450,7 +1475,7 @@ def parser():
   finish/restart before updating their bound source; no global idle is required.
 """
     root = argparse.ArgumentParser(
-        prog="experiment-runner", description=__doc__ + "\n"
+        prog="experiment-runner", description=__doc__ + "\n" + submission_help + "\n"
         "SSE prefix caching: Recommended for large experiments sharing fixed instructions\n"
         "or context on openai-codex / gpt-6.1-sol / SSE. Use --prompt-cache during prepare.\n"
         "A template's <!-- prompt-cache-end --> marker can include shared input data;\n"
