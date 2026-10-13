@@ -96,6 +96,61 @@ def _clean(state, now):
     return queue
 
 
+def _fill_slots(gate, state, now):
+    """Any coordinator can reserve the next fair registered waiters' slots."""
+    queue = state['queue']
+    counts = {owner: 0 for owner in queue['experiments']}
+    for job in queue['running'].values():
+        counts[job['owner']] += 1
+    while gate.occupancy(state, now) < LIMIT:
+        eligible = {}
+        heads = {job['owner']: identifier for identifier, job in queue['waiting'].items()}
+        for owner, run in queue['experiments'].items():
+            if not run.get('ready') or run.get('pause_reason'):
+                continue
+            identifier = heads.get(owner)
+            job = queue['waiting'].get(identifier)
+            blocked, until = _blocked(state, run, now)
+            if job is not None:
+                job['cooldown_until'] = until
+            if blocked:
+                if job is not None:
+                    job['wait_reason'] = blocked
+            else:
+                eligible[owner] = identifier
+        if not eligible:
+            return
+        owner = min(eligible, key=lambda value: (counts[value], queue['experiments'][value]['last_grant']))
+        identifier = eligible[owner]
+        if identifier is None:
+            # A ready owner may be handing its local admission lock to its next
+            # waiter. Preserve its fair turn while that waiter registers.
+            return
+        job, run = queue['waiting'][identifier], queue['experiments'][owner]
+        timeout = job.get('timeout_seconds')
+        if timeout is None:
+            # Older coordinators only recognize admission performed by their
+            # own polling thread. Preserve their fair turn until they claim it.
+            return
+        if type(timeout) is not int or not 1 <= timeout <= 3600:
+            raise ValueError('invalid experiment waiter timeout')
+        ticket = None
+        if job['scopes'] is not None:
+            result = gate._acquire(state, now, gate._keys(job['scopes']), LIMIT,
+                                   timeout, run['pid'], run['process_start'])
+            ticket = result.get('ticket')
+            if ticket is None:
+                job['wait_reason'] = result['wait_reason']
+                return
+        del queue['waiting'][identifier]
+        queue['running'][identifier] = {**job, 'started': now,
+            'expires': now + timeout + 30, 'provider_ticket': ticket}
+        queue['sequence'] += 1
+        run['last_grant'] = queue['sequence']
+        run['endpoint_ready' if 'endpoint_ready' in run else 'ready'] -= 1
+        counts[owner] += 1
+
+
 def _snapshot(state, now, saved):
     """Capture counts and constraints together while holding the shared state lock."""
     queue = _clean(state, now)
@@ -341,6 +396,7 @@ class ExperimentQueue:
         token = None
         provider_ticket = None
         pending = False
+        registered = False
         admitted = False
         ready_key = 'ready'
         try:
@@ -361,60 +417,43 @@ class ExperimentQueue:
             with self.admission_lock:
                 with self.gate._state() as (state, now):
                     queue = _clean(state, now)
-                    queue['waiting'][identifier] = {'owner': self.owner, 'case': case, 'queued_at': queued_at,
+                    waiter = {'owner': self.owner, 'case': case, 'queued_at': queued_at,
                                                     'scopes': self.scopes, 'wait_reason': 'capacity',
+                                                    'timeout_seconds': timeout_seconds,
                                                     **({'endpoint_admission': self.endpoint_admission}
                                                        if self.endpoint_admission is not None else {})}
+                    queue['waiting'][identifier] = waiter
+                    registered = True
                 while True:
-                    self.check_pause()
-                    if self.stopped.is_set():
-                        from .extraction_pipeline import NewJobLimitReached
-                        raise NewJobLimitReached('experiment stopped before queued request dispatch')
                     admitted = False
                     with self.gate._state() as (state, now):
                         queue = _clean(state, now)
-                        job = queue['waiting'][identifier]
-                        active = list(queue['running'].values())
-                        counts = {owner: sum(j['owner'] == owner for j in active) for owner in queue['experiments']}
-                        eligible = {}
-                        heads = {candidate['owner']: key for key, candidate in queue['waiting'].items()}
-                        for owner, run in queue['experiments'].items():
-                            if not run.get('ready') or run.get('pause_reason'):
-                                continue
-                            key = heads.get(owner)
-                            candidate = queue['waiting'].get(key)
-                            blocked, until = _blocked(state, run, now)
-                            if candidate is not None:
-                                candidate['cooldown_until'] = until
-                            if blocked:
-                                if candidate is not None:
-                                    candidate['wait_reason'] = blocked
-                                continue
-                            eligible[owner] = key
-                        preferred = min(eligible, key=lambda owner: (counts[owner], queue['experiments'][owner]['last_grant'])) if eligible else None
-                        if self.gate.occupancy(state, now) >= LIMIT:
-                            if self.owner in eligible:
-                                job['wait_reason'] = 'capacity'
-                        elif preferred != self.owner or eligible.get(self.owner) != identifier:
-                            if self.owner in eligible:
-                                job['wait_reason'] = 'fair_share'
+                        if self.stopped.is_set():
+                            from .extraction_pipeline import NewJobLimitReached
+                            raise NewJobLimitReached('experiment stopped before queued request dispatch')
+                        self.pause_reason = queue['experiments'][self.owner].get('pause_reason')
+                        if self.pause_reason:
+                            self.stopped.set()
+                            from .extraction_pipeline import ExperimentPaused
+                            raise ExperimentPaused('experiment paused: ' + self.pause_reason)
+                        if identifier not in queue['waiting'] and identifier not in queue['running']:
+                            # An unadopted peer grant expired while this live
+                            # coordinator was delayed. Register the same request
+                            # again; no model attempt has been claimed or sent.
+                            queue['waiting'][identifier] = dict(waiter)
+                            queue['experiments'][self.owner][ready_key] += 1
+                        _fill_slots(self.gate, state, now)
+                        reservation = queue['running'].get(identifier)
+                        if reservation is not None:
+                            provider_ticket = reservation['provider_ticket']
+                            pending = False
+                            admitted = True
+                            observation = _snapshot(state, now, self.saved)
                         else:
-                            if self.scopes is not None:
-                                result = self.gate._acquire(state, now, self.gate._keys(self.scopes), LIMIT,
-                                    timeout_seconds, os.getpid(), process_start(os.getpid()))
-                                provider_ticket = result.get('ticket')
-                                if provider_ticket is None:
-                                    job['wait_reason'] = result['wait_reason']
-                            if self.scopes is None or provider_ticket is not None:
-                                del queue['waiting'][identifier]
-                                queue['running'][identifier] = {**job, 'started': now,
-                                    'expires': now + timeout_seconds + 30, 'provider_ticket': provider_ticket}
-                                queue['sequence'] += 1
-                                queue['experiments'][self.owner]['last_grant'] = queue['sequence']
-                                queue['experiments'][self.owner][ready_key] -= 1
-                                pending = False
-                                admitted = True
-                                observation = _snapshot(state, now, self.saved)
+                            job = queue['waiting'][identifier]
+                            blocked, _ = _blocked(state, queue['experiments'][self.owner], now)
+                            if not blocked:
+                                job['wait_reason'] = 'capacity' if self.gate.occupancy(state, now) >= LIMIT else 'fair_share'
                     if admitted:
                         break
                     self.progress()
@@ -435,8 +474,11 @@ class ExperimentQueue:
                 self.gate.report(provider_ticket, {})
             with self.gate._state() as (state, now):
                 queue = _clean(state, now)
-                if pending:
+                reservation = queue['running'].get(identifier)
+                if pending and (not registered or identifier in queue['waiting']):
                     queue['experiments'][self.owner][ready_key] -= 1
+                if reservation is not None and reservation.get('provider_ticket'):
+                    state['tickets'].pop(reservation['provider_ticket'], None)
                 queue['waiting'].pop(identifier, None)
                 queue['running'].pop(identifier, None)
                 observation = _snapshot(state, now, self.saved)

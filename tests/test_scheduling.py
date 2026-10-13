@@ -4,6 +4,7 @@ import io
 import os
 import signal
 from pathlib import Path
+from contextlib import contextmanager
 import subprocess
 import tempfile
 import tarfile
@@ -85,6 +86,136 @@ class SchedulingTests(unittest.TestCase):
             name = row['prompt'].splitlines()[-1].split('-')[0]
             groups[name] = groups.get(name, 0) + 1
         self.fail(f'expected scheduling transition did not occur; worker starts={groups}')
+
+    @contextmanager
+    def stalled_first_waiter(self):
+        from experiment_runner import scheduling
+
+        with patch.dict(os.environ, self.env):
+            for name in ('first', 'second'):
+                (self.root / name).mkdir()
+            scopes = {'account': 'a' * 64, 'transport': 'b' * 64}
+            first = scheduling.ExperimentQueue(self.root / 'first', 1, scopes=scopes)
+            second = scheduling.ExperimentQueue(self.root / 'second', 1, scopes=scopes)
+            stalled, resume, release = threading.Event(), threading.Event(), threading.Event()
+            entered = [threading.Event(), threading.Event()]
+            errors = []
+            original = first.gate._state
+            held = False
+
+            @contextmanager
+            def held_poll():
+                nonlocal held
+                registered = False
+                with original() as value:
+                    yield value
+                    state, _ = value
+                    registered = any(job['owner'] == first.owner
+                                     for job in state.get('queue', {}).get('waiting', {}).values())
+                if registered and not held:
+                    # Stop after the real waiter registration is persisted,
+                    # outside the host lock and before its admission poll.
+                    held = True
+                    stalled.set()
+                    if not resume.wait(3):
+                        raise AssertionError('test did not release the first coordinator')
+
+            def run(queue, index):
+                try:
+                    with queue.slot(str(index), 30):
+                        entered[index].set()
+                        release.wait(3)
+                except BaseException as error:
+                    errors.append(error)
+
+            threads = [threading.Thread(target=run, args=(queue, index))
+                       for index, queue in enumerate((first, second))]
+            try:
+                with patch.object(first.gate, '_state', held_poll):
+                    threads[0].start()
+                    self.assertTrue(stalled.wait(1))
+                    threads[1].start()
+                    self.assertTrue(entered[1].wait(1), 'free slots waited for the preferred owner to poll')
+                    self.assertFalse(entered[0].is_set())
+                    history = [json.loads(line) for line in
+                               first.path.with_suffix('.jsonl').read_text().splitlines()]
+                    self.assertFalse(any(row['event'] == 'admitted' for row in history))
+                    yield first, second, resume, entered, errors
+            finally:
+                resume.set()
+                release.set()
+                for thread in threads:
+                    if thread.ident is not None:
+                        thread.join(timeout=3)
+                first.close()
+                second.close()
+            self.assertTrue(all(not thread.is_alive() for thread in threads))
+            with first.gate._state() as (state, _):
+                self.assertEqual(state['tickets'], {})
+                self.assertEqual(state['queue']['running'], {})
+                self.assertEqual(state['queue']['waiting'], {})
+
+    def test_waiter_fills_free_slots_when_the_first_fair_owner_is_not_polling(self):
+        from experiment_runner import scheduling
+
+        with self.stalled_first_waiter() as (first, second, resume, entered, errors):
+            status = scheduling.snapshot(self.root / 'second')
+            self.assertEqual(status['global_running'], 2)
+            self.assertEqual(status['experiments'][first.owner]['running'], 1)
+            self.assertEqual(status['experiments'][first.owner]['ready'], 0)
+            resume.set()
+            self.assertTrue(entered[0].wait(1))
+        self.assertEqual(errors, [])
+
+    def test_pause_releases_a_peer_reservation_before_its_waiter_adopts_it(self):
+        from experiment_runner import scheduling
+        from experiment_runner.extraction_pipeline import ExperimentPaused
+
+        with self.stalled_first_waiter() as (first, second, resume, entered, errors):
+            scheduling.pause(first.path.parent, 'test pause')
+            resume.set()
+        self.assertFalse(entered[0].is_set())
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], ExperimentPaused)
+
+    def test_stopped_waiter_releases_a_peer_reservation_before_adopting_it(self):
+        from experiment_runner.extraction_pipeline import NewJobLimitReached
+
+        with self.stalled_first_waiter() as (first, second, resume, entered, errors):
+            first.stopped.set()
+            resume.set()
+        self.assertFalse(entered[0].is_set())
+        self.assertEqual(len(errors), 1)
+        self.assertIsInstance(errors[0], NewJobLimitReached)
+
+    def test_expired_peer_reservation_does_not_decrement_ready_again_on_stop(self):
+        from experiment_runner import scheduling
+
+        with self.stalled_first_waiter() as (first, second, resume, entered, errors):
+            future = time.monotonic() + 61
+            with patch.object(time, 'monotonic', return_value=future):
+                first.stopped.set()
+                resume.set()
+                for _ in range(100):
+                    if errors:
+                        break
+                    threading.Event().wait(0.01)
+                self.assertEqual(len(errors), 1)
+                self.assertEqual(scheduling.snapshot(first.path.parent)['ready'], 0)
+
+    def test_expired_peer_reservation_is_readmitted_without_losing_its_waiter(self):
+        from experiment_runner import scheduling
+
+        with self.stalled_first_waiter() as (first, second, resume, entered, errors):
+            future = time.monotonic() + 61
+            with patch.object(time, 'monotonic', return_value=future):
+                resume.set()
+                self.assertTrue(entered[0].wait(1), errors)
+                status = scheduling.snapshot(first.path.parent)
+                self.assertEqual(status['ready'], 0)
+                self.assertEqual(status['running'], 1)
+                self.assertEqual(set(status['cases']), {'0'})
+        self.assertEqual(errors, [])
 
     def test_same_local_endpoint_serializes_before_launch_across_experiments(self):
         endpoint = {'scope': 'a' * 64, 'capacity': 1}
