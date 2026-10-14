@@ -246,20 +246,26 @@ counts and the existing `capacity` wait reason. There is no public capacity or
 concurrency override.
 
 Existing account/transport cooldowns and gradual recovery can reduce the
-effective capacity below 30 when there is explicit rate-limit/overload evidence,
-a valid `Retry-After`, or a verified connection failure. HTTP/2 stream
-`INTERNAL_ERROR` and generic server errors without those signals delay only
-the failed request's retry. Fresh cases keep using free slots, and active
-requests finish normally. Unknown transport errors do not establish shared
-pressure or automatic retry eligibility.
+effective capacity below 30 for explicit rate limits (including `slow_down`),
+usage or connection limits, or verified connection failures. The documented OpenRouter in-flight
+budget condition also holds its account. Temporary server overload, generic
+server errors, and HTTP/2 stream `INTERNAL_ERROR` delay only the failed request's
+retry, using exponential backoff and any longer valid `Retry-After`. A retry
+deadline alone does not establish shared pressure. Fresh cases keep using free
+slots, and active requests finish normally. Unknown transport errors do not
+establish shared pressure or automatic retry eligibility.
+
+This shared-scope policy deliberately distinguishes account rate pressure from
+temporary model overload, following [OpenAI's error recovery guidance](https://developers.openai.com/api/docs/guides/error-codes).
+The fixed 30-request limit is the runner's own policy.
 
 Shared pressure keeps the bounded 2/4/8/.../60-second backoff and gradual
 recovery: start with one new request, then double the admission limit after
 that many successful completions. Failures from requests already in flight
-share one backoff generation; a late failure does not restart recovery or
-extend the wait unless it carries an explicit `Retry-After`. A new failure
-during recovery can increase backoff. Resume does not recreate a new outage
-from an old receipt. **Every verified temporary provider failure retries
+share one backoff generation; a late shared-pressure failure does not restart
+recovery or extend the wait unless it carries an explicit `Retry-After`. A new
+shared-pressure failure during recovery can increase backoff. Resume does not
+recreate a new outage from an old receipt. **Every verified temporary provider failure retries
 automatically until success or an authorized limit, pause or cancellation.**
 Per-case delays are 2/4/8/16/32/60/60... seconds, using the saved lifetime
 attempt counter. There is no two-attempt cutoff, including on resume. Warmups
@@ -273,7 +279,7 @@ The production classifier covers these recorded errors:
 | Evidence | Retry behavior |
 | --- | --- |
 | HTTP 408, 409, 425, 429 or 5xx; numeric equivalents inside an error stream | Retry, unless a structured permanent error or explicit no-retry header takes precedence. Symbolic body codes do not hide the actual HTTP status. |
-| `server_error`, `server_is_overloaded`, rate-limit/temporary usage-limit codes, `websocket_connection_limit_reached`, service-unavailable/overloaded types | Retry for SSE and WebSocket error responses. |
+| `server_error`, `server_is_overloaded`, `slow_down`, rate-limit/temporary usage-limit codes, `websocket_connection_limit_reached`, service-unavailable/overloaded types | Retry for SSE and WebSocket error responses. |
 | OpenRouter `provider_overloaded`, `provider_unavailable`, `server`, `timeout` | Retry; canonical request, output-limit and refusal types take precedence over generic numeric codes. |
 | Verified active proxy interruption; structured socket/connect/reset/timeout/temporary-DNS cause codes | Retry the failed request. Arbitrary exception prose is insufficient. Local aborts and canceled/deadline-expired request contexts stop. |
 | WebSocket closes before a terminal response: 1000, 1001, 1006, 1011–1014 | Retry after a completed upgrade and recorded body interruption. Protocol, unsupported-data, policy and size failures are not retryable. |

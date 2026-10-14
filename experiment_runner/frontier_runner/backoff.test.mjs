@@ -140,7 +140,12 @@ test('native rejection metadata distinguishes credit, retry instructions and tem
     { name: 'server-do-not-retry', provider: 'openai-codex', status: 503,
       error: { code: 'server_error' }, headers: { 'x-should-retry': 'false' }, pressure: false },
     { name: 'server-retry-ms', provider: 'openai-codex', status: 503,
-      error: { code: 'provider_error' }, headers: { 'retry-after-ms': '120000' }, pressure: true },
+      error: { code: 'provider_error' }, headers: { 'retry-after-ms': '120000' }, pressure: false },
+    { name: 'model-overload', provider: 'openai-codex', status: 503, error: {
+      code: 'server_is_overloaded', type: 'service_unavailable_error' },
+      headers: { 'retry-after': '120' }, pressure: false },
+    { name: 'slow-down', provider: 'openai-codex', status: 429, error: {
+      code: 'slow_down', type: 'rate_limit_error' }, headers: { 'retry-after': '120' }, pressure: true },
     { name: 'temporary-payment', provider: 'openrouter', status: 402, error: {
       code: 402, metadata: { limit_source: 'openrouter_in_flight_budget', private_value: 'PRIVATE' } },
       headers: { 'retry-after': '120' }, pressure: true },

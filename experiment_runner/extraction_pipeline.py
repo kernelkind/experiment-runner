@@ -3780,7 +3780,7 @@ def run_prompts(
 
 
 _PROVIDER_TRANSIENT_CODES = frozenset({
-    'server_error', 'server_is_overloaded', 'rate_limit_exceeded',
+    'server_error', 'server_is_overloaded', 'rate_limit_exceeded', 'slow_down',
     'usage_limit_reached', 'websocket_connection_limit_reached',
     'service_unavailable_error', 'rate_limit_error', 'overloaded_error',
 })
@@ -3930,7 +3930,7 @@ def prompt_failure_kind(record: dict[str, Any]) -> str:
 
 
 def provider_cooldown_scope(record: dict[str, Any]) -> str | None:
-    """Shared pressure requires explicit rate/overload or connection evidence."""
+    """Shared pressure requires explicit rate, usage, or connection evidence."""
     kind = prompt_failure_kind(record)
     if kind != "provider_transient":
         return None
@@ -3942,12 +3942,15 @@ def provider_cooldown_scope(record: dict[str, Any]) -> str | None:
         return None
     error = metadata.get("error") or {}
     code = error.get("code") if isinstance(error, dict) else None
-    pressure = {'rate_limit_exceeded', 'usage_limit_reached', 'server_is_overloaded',
-                'websocket_connection_limit_reached', 'rate_limit_error',
-                'overloaded_error', 'provider_overloaded'}
+    pressure = {'rate_limit_exceeded', 'usage_limit_reached', 'slow_down',
+                'websocket_connection_limit_reached', 'rate_limit_error'}
     if (metadata.get("http_status") in (429, "429") or code in (429, "429")
             or isinstance(error, dict) and any(isinstance(error.get(key), str)
                 and error[key] in pressure for key in ('code', 'type', 'error_type'))):
+        return "account"
+    if (result.get('provider') == 'openrouter' and isinstance(error, dict)
+            and error.get('limit_source') == 'openrouter_in_flight_budget'
+            and (metadata.get('http_status') in (402, '402') or code in (402, '402'))):
         return "account"
     proxy = metadata.get("proxy_status") or {}
     if (kind == "provider_transient" and isinstance(proxy, dict)
@@ -3961,10 +3964,6 @@ def provider_cooldown_scope(record: dict[str, Any]) -> str | None:
         if (proxy.get("read_error_kind") == "http2_stream_error"
                 and proxy.get("read_error_code") == "enhance_your_calm"):
             return "account"
-    if (kind == "provider_transient" and any(metadata.get(key) is not None
-            for key in ('retry_after', 'retry_after_ms'))
-            and _provider_retry_after_delay(record) is not None):
-        return "account"
     return None
 
 

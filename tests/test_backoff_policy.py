@@ -287,15 +287,28 @@ class BackoffPolicyTests(unittest.TestCase):
         self.assertIn('ticket', self.acquire(), 'an individual stream error blocked unrelated work')
         self.assertIn('ticket', self.acquire(), 'stream recovery serialized unrelated work')
 
-    def test_typed_overload_has_shared_pressure_but_generic_unavailability_does_not(self):
-        ticket = self.acquire()['ticket']
-        failed = self.failure({'http_status': 200, 'error': {'type': 'overloaded_error'}})
-        self.gate.report(ticket, failed)
-        self.assertEqual(self.acquire()['wait_reason'], 'account_backoff')
-        other = {'account': 'c' * 64, 'transport': self.scopes['transport']}
-        ticket = self.acquire(other)['ticket']
-        self.gate.report(ticket, self.failure({'http_status': 200, 'error': {'code': 'server_error'}}))
-        self.assertIn('ticket', self.acquire(other))
+    def test_typed_overload_and_retry_headers_delay_only_the_failed_request(self):
+        cases = [
+            ('openai-codex', {'http_status': 200, 'error': {'type': 'overloaded_error'}}),
+            ('openai-codex', {'http_status': 200, 'error': {'code': 'server_is_overloaded'}}),
+            ('openai-codex', {'http_status': 503, 'error': {'code': 'server_is_overloaded',
+                                                        'type': 'service_unavailable_error'}}),
+            ('openai-codex', {'http_status': 503}),
+            ('openrouter', {'http_status': 200, 'error': {'code': 'upstream',
+                                                        'error_type': 'provider_overloaded'}}),
+        ]
+        for index, (provider, metadata) in enumerate(cases):
+            for header in ({}, {'retry_after': '120'}, {'retry_after_ms': '120000'}):
+                with self.subTest(provider=provider, metadata=metadata, header=header):
+                    scopes = {**self.scopes, 'account': f'{100 + index:064x}'}
+                    failed = self.failure({**metadata, **header})
+                    failed['model_result']['provider'] = provider
+                    failed['attempt'] = 3
+                    self.assertEqual(provider_retry_delay(failed), 120 if header else 8)
+                    self.gate.report(self.acquire(scopes)['ticket'], failed)
+                    next_ticket = self.acquire(scopes)
+                    self.assertIn('ticket', next_ticket, 'server overload blocked unrelated work')
+                    self.gate.report(next_ticket['ticket'], {})
 
     def test_legacy_retry_option_matches_the_automatic_policy(self):
         failed = self.failure({'http_status': 503})
@@ -351,9 +364,9 @@ class BackoffPolicyTests(unittest.TestCase):
         self.assertIn('ticket', self.acquire())
         self.assertIn('ticket', self.acquire(), 'successful recovery did not restore two slots')
 
-    def test_retry_after_still_applies_to_other_requests_on_the_same_account(self):
+    def test_rate_limit_retry_after_applies_to_other_requests_on_the_same_account(self):
         first = self.acquire()['ticket']
-        self.gate.report(first, self.failure({'http_status': 503, 'retry_after': '5'}))
+        self.gate.report(first, self.failure({'http_status': 429, 'retry_after': '5'}))
         self.assertEqual(self.acquire()['wait_reason'], 'account_backoff')
         self.now += 4.9
         self.assertEqual(self.acquire()['wait_reason'], 'account_backoff')
@@ -399,7 +412,7 @@ class BackoffPolicyTests(unittest.TestCase):
         first, old = self.acquire()['ticket'], self.acquire()['ticket']
         self.gate.report(first, self.failure({'http_status': 429}))
         self.now += 1
-        self.gate.report(old, self.failure({'http_status': 503, 'retry_after_ms': '5000'}))
+        self.gate.report(old, self.failure({'http_status': 429, 'retry_after_ms': '5000'}))
         self.now += 4.9
         self.assertEqual(self.acquire()['wait_reason'], 'account_backoff')
         self.now += .2
@@ -416,6 +429,45 @@ class BackoffPolicyTests(unittest.TestCase):
         self.assertEqual(self.acquire()['wait_reason'], 'account_backoff')
         self.now += .2
         self.assertIn('ticket', self.acquire())
+
+    def test_server_overload_preserves_account_recovery_and_individual_retry_deadline(self):
+        ticket = self.acquire()['ticket']
+        self.gate.report(ticket, self.failure({'http_status': 429}))
+        self.now += 2.1
+        recovery = self.acquire()['ticket']
+        self.gate.report(recovery, {'exit_code': 0, 'model_result': {'stop_reason': 'stop'}})
+        account = 'account:' + self.scopes['account']
+        before = self.gate._read_state()['scopes'][account]
+        self.assertEqual(before['limit'], 2)
+        failed = self.failure({'http_status': 503, 'retry_after': '120',
+            'error': {'code': 'server_is_overloaded', 'type': 'service_unavailable_error'}})
+        failed['attempt'] = 3
+        self.assertEqual(provider_retry_delay(failed), 120)
+        self.gate.report(self.acquire()['ticket'], failed)
+        self.assertEqual(self.gate._read_state()['scopes'][account], before,
+                         'server overload reset recovered account capacity')
+        self.assertIn('ticket', self.acquire())
+        self.assertIn('ticket', self.acquire())
+        self.assertEqual(self.acquire()['wait_reason'], 'recovery_limit')
+
+    def test_streamed_rate_usage_and_connection_limits_keep_account_pressure(self):
+        for index, code in enumerate(('slow_down', 'rate_limit_exceeded', 'usage_limit_reached',
+                                      'websocket_connection_limit_reached')):
+            with self.subTest(code=code):
+                scopes = {**self.scopes, 'account': f'{500 + index:064x}'}
+                failed = self.failure({'http_status': 200, 'error': {'code': code}})
+                self.assertEqual(provider_retry_delay(failed), 2)
+                self.gate.report(self.acquire(scopes)['ticket'], failed)
+                self.assertEqual(self.acquire(scopes)['wait_reason'], 'account_backoff')
+
+    def test_documented_openrouter_in_flight_budget_keeps_account_pressure(self):
+        failed = self.failure({'http_status': 402, 'retry_after': '120',
+            'error': {'code': 402, 'limit_source': 'openrouter_in_flight_budget'}})
+        failed['model_result']['provider'] = 'openrouter'
+        self.gate.report(self.acquire()['ticket'], failed)
+        self.assertEqual(self.acquire()['wait_reason'], 'account_backoff')
+        self.assertIn('ticket', self.acquire({'account': 'c' * 64,
+                                            'transport': self.scopes['transport']}))
 
     def test_local_abort_and_unknown_transport_error_do_not_throttle_other_work(self):
         for index, metadata in enumerate([
