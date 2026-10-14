@@ -10,6 +10,28 @@ from experiment_runner.provider_backoff import SharedProviderBackoff
 
 
 class BackoffPolicyTests(unittest.TestCase):
+    def test_nested_terminal_overload_retries_after_proxy_context_cleanup(self):
+        # Saved grading receipt: the proxy recorded the upstream failed event,
+        # but the model metadata did not repeat it at the top level.
+        failed = self.failure({
+            'http_status': 200,
+            'error': {'code': 'server_is_overloaded',
+                      'type': 'service_unavailable_error'},
+            'proxy_status': {
+                'error_phase': 'body', 'http_status': 200,
+                'read_error_kind': 'context_canceled', 'request_context': 'canceled',
+                'state': 'failed', 'terminal_event': 'failed',
+            },
+        })
+        failed['model_result']['valid'] = False
+        failed['model_result']['error'] = (
+            'Codex error: Our servers are currently overloaded. Please try again later.')
+        self.assertEqual(prompt_failure_kind(failed), 'provider_transient')
+        for attempt, delay in ((1, 2), (2, 4), (3, 8), (6, 60), (10000, 60)):
+            with self.subTest(attempt=attempt):
+                failed['attempt'] = attempt
+                self.assertEqual(provider_retry_delay(failed), delay)
+
     def test_terminal_server_error_retries_after_proxy_context_cleanup(self):
         # Saved grading failure: the provider failed before proxy cleanup
         # canceled the stream context. It was not a caller cancellation.
@@ -33,7 +55,8 @@ class BackoffPolicyTests(unittest.TestCase):
         for changes in (
                 {'abort_reason': 'request_timeout'},
                 {'terminal_event': 'response.completed'},
-                {'terminal_event': None},
+                {'terminal_event': None,
+                 'proxy_status': {'request_context': 'canceled'}},
                 {'should_retry': False},
                 {'error': {'code': 'insufficient_quota'}},
                 {'error': {'code': 'invalid_api_key'}},
@@ -51,6 +74,34 @@ class BackoffPolicyTests(unittest.TestCase):
                         'request_context': 'canceled', 'read_error_kind': 'context_canceled'},
                     **changes,
                 })
+                self.assertIsNone(provider_retry_delay(failed))
+
+    def test_nested_failed_events_preserve_provider_and_local_classification(self):
+        proxy = {'state': 'failed', 'terminal_event': 'failed',
+                 'request_context': 'canceled', 'read_error_kind': 'context_canceled'}
+        for code in ('server_error', 'server_is_overloaded', 'rate_limit_exceeded'):
+            for terminal in ({}, {'terminal_event': None}):
+                with self.subTest(code=code, terminal=terminal):
+                    failed = self.failure({'http_status': 200, 'error': {'code': code},
+                                           'proxy_status': proxy, **terminal})
+                    self.assertEqual(prompt_failure_kind(failed), 'provider_transient')
+                    self.assertEqual(provider_retry_delay(failed), 2)
+        for changes, expected in (
+                ({'abort_reason': 'request_timeout'}, 'local'),
+                ({'terminal_event': 'response.completed'}, 'local'),
+                ({'should_retry': False}, 'unknown'),
+                ({'error': {'code': 'insufficient_quota'}}, 'provider_fatal'),
+                ({'error': {'code': 'invalid_api_key'}}, 'provider_fatal'),
+                ({'error': {'code': 'unsupported_parameter'}}, 'unknown'),
+                ({'error': {'code': 'context_length_exceeded'}}, 'unknown'),
+                ({'error': {'code': 'unknown'}}, 'unknown'),
+                ({'proxy_status': {'request_context': 'canceled'}}, 'local'),
+                ({'proxy_status': {'request_context': 'deadline_exceeded'}}, 'local'),
+        ):
+            with self.subTest(changes=changes):
+                failed = self.failure({'http_status': 200, 'error': {'code': 'server_error'},
+                                       'proxy_status': proxy, **changes})
+                self.assertEqual(prompt_failure_kind(failed), expected)
                 self.assertIsNone(provider_retry_delay(failed))
 
     def test_all_verified_transient_failures_keep_retrying_by_default(self):

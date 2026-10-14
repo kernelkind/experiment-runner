@@ -3825,9 +3825,10 @@ def prompt_failure_kind(record: dict[str, Any]) -> str:
                                             or proxy.get("state") == "complete")):
         return "local"
     # Proxy cleanup can cancel its context after an upstream terminal failure.
-    # That failure still needs the provider-code checks below; cancellation
-    # without an upstream failure remains local.
+    # Either receipt layer can record the upstream failed event. It still needs
+    # the provider-code checks below; cancellation without that event is local.
     if (metadata.get('terminal_event') != 'response.failed' and isinstance(proxy, dict)
+            and proxy.get('terminal_event') != 'failed'
             and (proxy.get('state') in ('canceled', 'deadline_exceeded')
                  or proxy.get('request_context') in ('canceled', 'deadline_exceeded'))):
         return "local"

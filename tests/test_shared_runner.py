@@ -365,7 +365,10 @@ class NativePrefixTests(unittest.TestCase):
     def test_explicit_overload_continues_within_one_run_until_third_attempt_succeeds(self):
         self.prepare('overload-live')
         env = {'FAKE_RUNNER_FAILURES': json.dumps({'Tea': {'attempts': 2,
-            'metadata': {'http_status': 200, 'error': {'code': 'server_is_overloaded'}}}})}
+            'metadata': {'http_status': 200,
+                'error': {'code': 'server_is_overloaded', 'type': 'service_unavailable_error'},
+                'proxy_status': {'state': 'failed', 'terminal_event': 'failed',
+                    'request_context': 'canceled', 'read_error_kind': 'context_canceled'}}}})}
         self.cli('run', 'overload-live', '--only', 'one', '--max-new-attempts', '3', env=env)
         records = [json.loads(line) for line in
                    (self.root / 'overload-live/run/results.jsonl').read_text().splitlines()]
