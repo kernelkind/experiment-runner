@@ -350,7 +350,7 @@ class ExperimentQueue:
 
     def _append_history(self, value, event):
         # The caller holds the experiment lock, never the host-wide state lock.
-        observation = {key: item for key, item in value.items() if key != 'cases'}
+        observation = {key: item for key, item in value.items() if key not in {'cases', 'experiments'}}
         with self.path.with_suffix('.jsonl').open('a') as output:
             output.write(json.dumps({**observation, 'schema_version': 1, 'event': event}) + '\n')
 

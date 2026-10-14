@@ -792,12 +792,43 @@ class SchedulingTests(unittest.TestCase):
             self.assertGreater(row['monotonic_seconds'], 0)
             self.assertTrue(row['boot_id'])
             self.assertEqual(row['global_ready'],
-                             sum(run['ready'] for run in row['experiments'].values()))
+                             sum(group['ready'] for group in row['groups'].values()))
             self.assertEqual(row['global_eligible_ready'],
-                             sum(run['eligible_ready'] for run in row['experiments'].values()))
+                             sum(group['eligible_ready'] for group in row['groups'].values()))
+            self.assertNotIn('experiments', row, 'the complete owner inventory belongs to live snapshots')
             self.assertNotIn('cases', row, 'history records counts, not case input or outputs')
         self.assertIn('observed_at_utc=', stderr)
         self.assertIn('ready=', stderr)
+
+    def test_history_keeps_counts_without_repeating_the_live_experiment_inventory(self):
+        from experiment_runner import scheduling
+
+        with patch.dict(os.environ, self.env):
+            queues = []
+            try:
+                for number in range(80):
+                    path = self.root / str(number)
+                    path.mkdir()
+                    queues.append(scheduling.ExperimentQueue(path, 1, scheduling_group='distillation'))
+                queue = queues[-1]
+                queue.progress(force=True)
+                live = scheduling.snapshot(queue.path.parent)
+                self.assertEqual(len(live['experiments']), 80)
+                history = queue.path.with_suffix('.jsonl')
+                for line in history.read_text().splitlines():
+                    row = json.loads(line)
+                    self.assertNotIn('experiments', row, 'history copied every active experiment')
+                    self.assertEqual(row['owner'], queue.owner)
+                    self.assertEqual(row['global_limit'], 30)
+                    self.assertEqual(row['groups']['distillation']['batches'], 80)
+                    self.assertEqual(row['global_ready'], sum(g['ready'] for g in row['groups'].values()))
+                    self.assertEqual(row['global_eligible_ready'],
+                                     sum(g['eligible_ready'] for g in row['groups'].values()))
+                    self.assertLess(len(line.encode('utf-8')), 2048,
+                                    'history storage grew with each experiment inventory')
+            finally:
+                for queue in queues:
+                    queue.close()
 
     def test_stream_retry_waits_without_holding_fresh_or_active_cases(self):
         self.prepare('retry', 31)
@@ -876,9 +907,8 @@ class SchedulingTests(unittest.TestCase):
                         history = [json.loads(line) for line in
                                    (self.root / 'healthy' / 'scheduling.jsonl').read_text().splitlines()]
                         admitted = next(row for row in history if row['event'] == 'admitted')
-                        blocked = admitted['experiments'][recovering.owner]
+                        blocked = admitted['groups'][recovering.saved['group']]
                         self.assertEqual((blocked['ready'], blocked['eligible_ready']), (1, 0))
-                        self.assertEqual(blocked['wait_reason'], 'recovery_limit')
                         self.assertEqual(admitted['global_running'], 2)
                         self.assertEqual(admitted['global_eligible_ready'], 0)
                 finally:
