@@ -2809,12 +2809,17 @@ def _reused_prompt_record(
 class RequestHistory:
     """Index saved prompt receipts once per batch; serialize only identical requests."""
 
-    def __init__(self, root: Path, *, exclude_run: Path | None = None, discover=True):
+    def __init__(self, root: Path, *, exclude_run: Path | None = None, discover=True,
+                 request_keys: dict[str, str] | None = None):
+        # Optional current request identities mapped to their prompt digests.
+        # Receipt hashes only select discovery candidates; manifests and receipt
+        # provenance still establish their identities before reuse.
         self.directory = root / ".model-request-history"
         self.files = ReceiptFiles(manifest_path=exclude_run / 'manifest.json' if exclude_run else None)
         self.sources: dict[str, list[dict[str, Any]]] = {}
-        if not discover:
+        if not discover or request_keys == {}:
             return
+        prompt_hashes = set(request_keys.values()) if request_keys is not None else None
         ignored = {".git", "node_modules", "target", ".direnv", ".venv", "__pycache__",
                    self.directory.name}
         for directory, children, files in os.walk(root):
@@ -2828,10 +2833,6 @@ class RequestHistory:
                 # Discovery needs only compact receipt references. Do not keep
                 # every historical rendered prompt in each running batch.
                 discovery_files = ReceiptFiles()
-                manifest = discovery_files.json(path.parent / "manifest.json")
-                if manifest.get("mode") not in {"prompt", "mask_generation"}:
-                    continue
-                prompts = {p["prompt_id"]: p["text"] for p in manifest["prompts"]}
                 latest = {}
                 for number, line in enumerate(discovery_files.lines(path), 1):
                     # Another run may still be appending its last record.
@@ -2841,12 +2842,28 @@ class RequestHistory:
                     candidate = ((record.get('note_id'), record.get('manifest_sha256'))
                         if record.get('status') == 'succeeded' and record.get('execution') is None
                         and record.get('stage') == 'prompt' and record.get('model_result') else None)
+                    if (candidate is not None and request_keys is not None
+                            and record.get('request_sha256') is not None
+                            and record.get('prompt_sha256') is not None
+                            and record['request_sha256'] not in request_keys
+                            and record['prompt_sha256'] not in prompt_hashes):
+                        candidate = None
+                    # Failed, reused and nonmatching later records must replace
+                    # any earlier original success for the same job.
                     latest[record["job_key"]] = (number, _sha256_bytes(line), candidate)
+                if not any(candidate for _, _, candidate in latest.values()):
+                    continue
+                manifest = discovery_files.json(path.parent / "manifest.json")
+                if manifest.get("mode") not in {"prompt", "mask_generation"}:
+                    continue
+                prompts = {p["prompt_id"]: p["text"] for p in manifest["prompts"]}
                 for number, digest, candidate in latest.values():
                     if candidate is None:
                         continue
                     note_id, manifest_sha256 = candidate
                     key = _prompt_request_key(manifest, prompts[note_id])
+                    if request_keys is not None and key not in request_keys:
+                        continue
                     self.sources.setdefault(key, []).append({
                         "results_path": str(path.resolve()), "result_line": number,
                         "result_sha256": digest,
@@ -4067,7 +4084,9 @@ def _execute_prompt_batch(
     (config.run_directory / "output.json").unlink(missing_ok=True)
     options = manifest["request_reuse"]
     history = RequestHistory(Path(options["history_root"]), exclude_run=config.run_directory,
-                             discover=not options['intentional_repeat'])
+        discover=not options['intentional_repeat'], request_keys={
+            _prompt_request_key(manifest, prompt.text): _sha256_bytes(prompt.text.encode('utf-8'))
+            for prompt in config.prompts if "prompt:" + prompt.prompt_id not in latest})
     # Parse frozen inputs before provider slots are held, then share the existing
     # operation cache across invocation checks and receipt request digests.
     history.files.json(config.run_directory / "manifest.json")

@@ -197,6 +197,65 @@ class ReceiptMemoryTests(unittest.TestCase):
         self.assertEqual(len(latest), 32)
         self.assertLess(peak - retained, 2 * 1024 * 1024, 'resume copied the whole ledger')
 
+    def test_scoped_history_keeps_only_requested_latest_original_candidates(self):
+        manifest = {'mode': 'prompt', 'provider': 'openai-codex', 'model': 'fixture/model',
+                    'reasoning_effort': 'low', 'runner_version': 'fixture',
+                    'runner_sha256': 'a' * 64, 'request_code_sha256': 'b' * 64,
+                    'timeout_seconds': 30, 'prompts': [
+                        {'prompt_id': 'selected', 'text': 'selected prompt'},
+                        {'prompt_id': 'other', 'text': 'different prompt'}]}
+        key = engine._prompt_request_key(manifest, 'selected prompt')
+        wanted = {key: engine._sha256_bytes(b'selected prompt')}
+        selected = {'job_key': 'prompt:selected', 'note_id': 'selected', 'status': 'succeeded',
+                    'stage': 'prompt', 'model_result': {'valid': True},
+                    'manifest_sha256': 'c' * 64, 'request_sha256': key,
+                    'request_code_sha256': 'b' * 64,
+                    'prompt_sha256': wanted[key]}
+        other = {**selected, 'job_key': 'prompt:other', 'note_id': 'other',
+                 'request_sha256': engine._prompt_request_key(manifest, 'different prompt'),
+                 'prompt_sha256': engine._sha256_bytes(b'different prompt')}
+        directory = self.root / 'saved'
+        directory.mkdir()
+        manifest_path = directory / 'manifest.json'
+        manifest_path.write_text(json.dumps(manifest))
+        results = directory / 'results.jsonl'
+        results.write_bytes(b''.join(map(engine._canonical_json_bytes, (selected, other))))
+        history = engine.RequestHistory(self.root, request_keys=wanted)
+        self.assertEqual(set(history.sources), {key})
+        self.assertEqual(history.sources[key][0]['result_line'], 1)
+        target = {**manifest, 'runner_sha256': 'd' * 64}
+        self.assertEqual(engine._prompt_request_key(target, 'selected prompt'), key)
+        source_legacy = engine._prompt_request_key(manifest, 'selected prompt', legacy=True)
+        self.assertNotEqual(source_legacy,
+                            engine._prompt_request_key(target, 'selected prompt', legacy=True))
+        # The source worker's legacy hash differs from either target hash, so
+        # the selected prompt digest must preserve discovery of its canonical key.
+        results.write_bytes(engine._canonical_json_bytes({**selected, 'request_sha256': source_legacy}))
+        self.assertEqual(set(engine.RequestHistory(self.root, request_keys=wanted).sources), {key})
+        for replacement in ({**selected, 'status': 'failed'},
+                            {**selected, 'execution': 'cross_run_reuse'},
+                            {**other, 'job_key': selected['job_key']}):
+            results.write_bytes(b''.join(map(engine._canonical_json_bytes, (selected, replacement))))
+            self.assertEqual(engine.RequestHistory(self.root, request_keys=wanted).sources, {})
+        # An incomplete append cannot displace the last complete receipt.
+        results.write_bytes(engine._canonical_json_bytes(selected) + b'{"partial":')
+        self.assertEqual(set(engine.RequestHistory(self.root, request_keys=wanted).sources), {key})
+        # A malformed complete line still invalidates discovery of that source.
+        results.write_bytes(engine._canonical_json_bytes(selected) + b'invalid\n')
+        self.assertEqual(engine.RequestHistory(self.root, request_keys=wanted).sources, {})
+        results.write_bytes(engine._canonical_json_bytes(selected))
+        manifest_path.write_text(json.dumps({**manifest, 'mode': 'different'}))
+        self.assertEqual(engine.RequestHistory(self.root, request_keys=wanted).sources, {})
+        # A matching receipt hint cannot override the frozen source's actual settings.
+        manifest_path.write_text(json.dumps({**manifest, 'reasoning_effort': 'high'}))
+        self.assertEqual(engine.RequestHistory(self.root, request_keys=wanted).sources, {})
+        with patch.object(engine.os, 'walk', side_effect=AssertionError('empty selection scanned history')):
+            self.assertEqual(engine.RequestHistory(self.root, request_keys={}).sources, {})
+        manifest_path.write_text(json.dumps(manifest))
+        self.assertEqual(set(engine.RequestHistory(self.root, request_keys=wanted).sources), {key})
+        self.assertEqual(engine.RequestHistory(self.root, exclude_run=directory,
+                                             request_keys=wanted).sources, {})
+
     def test_ordered_atomic_write_preserves_bytes_and_bounds_serialization(self):
         path = self.root / 'report.json'
         value = {'z': [{'b': 'λ\\\n"', 'a': None}, True, 1.25], 'a': '最後'}

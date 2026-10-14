@@ -113,7 +113,8 @@ class HierarchyExecutionTests(unittest.TestCase):
         with patch.object(engine, '_load_latest_results', side_effect=observed):
             first = engine._execute_prompt_batch(config, manifest, retry_failed=False)
             before = (config.run_directory / 'results.jsonl').read_bytes()
-            second = engine._execute_prompt_batch(config, manifest, retry_failed=False)
+            with patch.object(engine.os, 'walk', side_effect=AssertionError('completed resume scanned history')):
+                second = engine._execute_prompt_batch(config, manifest, retry_failed=False)
         self.assertEqual(first, second)
         self.assertEqual(retained, [{}, {}])
         self.assertEqual((config.run_directory / 'results.jsonl').read_bytes(), before)
@@ -262,6 +263,76 @@ class HierarchyExecutionTests(unittest.TestCase):
             tracemalloc.stop()
         self.assertEqual(history.sources, {})
         self.assertLess(peak, 4 * 1024 * 1024, 'history retained full historical receipts')
+
+    def test_native_execution_and_preview_do_not_parse_unrequested_history_manifests(self):
+        from experiment_runner import extraction_pipeline as engine
+
+        self.prepare()
+        plan, config, manifest = experiment.load(self.root / 'E1')
+        foreign = self.root / 'unrequested'
+        foreign.mkdir()
+        foreign_manifest = foreign / 'manifest.json'
+        foreign_manifest.write_text(json.dumps({'mode': 'prompt', 'prompts': [],
+                                               'padding': 'x' * (4 * 1024 * 1024)}))
+        (foreign / 'results.jsonl').write_bytes(engine._canonical_json_bytes({
+            'job_key': 'prompt:foreign', 'note_id': 'foreign', 'status': 'succeeded',
+            'stage': 'prompt', 'model_result': {'valid': True},
+            'manifest_sha256': 'a' * 64, 'request_sha256': 'b' * 64,
+            'request_code_sha256': 'c' * 64, 'prompt_sha256': 'd' * 64}))
+        read = engine.ReceiptFiles.json
+
+        def requested_only(files, path):
+            if Path(path) == foreign_manifest:
+                raise AssertionError('unrequested history manifest was parsed')
+            return read(files, path)
+
+        with patch.object(engine.ReceiptFiles, 'json', requested_only):
+            preview = experiment.request_preview(plan, manifest, plan['cases'])
+            self.assertEqual(preview['reusable'], 0)
+            completed = engine._execute_prompt_batch(config, manifest, retry_failed=False)
+        self.assertEqual(len(completed['responses']), 3)
+
+    def test_scoped_discovery_preserves_legacy_identity_and_verifies_selected_receipts(self):
+        from experiment_runner import extraction_pipeline as engine
+
+        self.prepare()
+        experiment.run(self.root / 'E1', include_request_preview=False)
+        _, config, manifest = experiment.load(self.root / 'E1')
+        prompt = config.prompts[0]
+        current = engine._prompt_request_key(manifest, prompt.text)
+        wanted = {current: engine._sha256_bytes(prompt.text.encode('utf-8'))}
+        results = config.run_directory / 'results.jsonl'
+        original = [json.loads(line) for line in results.read_bytes().splitlines()]
+        # Exercise discovery of legacy receipts without a remembered modern reference.
+        (engine.RequestHistory(self.root, discover=False).directory /
+         (current + '.json')).unlink(missing_ok=True)
+        for variant in ('legacy_hash', 'keyless', 'modern'):
+            records = [dict(record) for record in original]
+            row = next(record for record in records if record['note_id'] == prompt.prompt_id)
+            if variant == 'legacy_hash':
+                row['request_sha256'] = engine._prompt_request_key(manifest, prompt.text, legacy=True)
+            elif variant == 'keyless':
+                row.pop('request_sha256')
+                row.pop('request_code_sha256', None)
+            results.write_bytes(b''.join(map(engine._canonical_json_bytes, records)))
+            history = engine.RequestHistory(self.root, request_keys=wanted)
+            self.assertEqual(set(history.sources), {current})
+            matches = list(history.matches(current))
+            self.assertEqual(len(matches), 1)
+            self.assertEqual(matches[0][1]['final_output_raw'], '{"answer":"local fixture"}')
+        records = [dict(record) for record in original]
+        next(record for record in records if record['note_id'] == prompt.prompt_id)['request_sha256'] = 'f' * 64
+        results.write_bytes(b''.join(map(engine._canonical_json_bytes, records)))
+        history = engine.RequestHistory(self.root, request_keys=wanted)
+        with self.assertRaisesRegex(RunnerError, 'request history source settings differ'):
+            list(history.matches(current))
+        results.write_bytes(b''.join(map(engine._canonical_json_bytes, original)))
+        history = engine.RequestHistory(self.root, request_keys=wanted)
+        changed = [dict(record) for record in original]
+        next(record for record in changed if record['note_id'] == prompt.prompt_id)['final_output_raw'] = '{"answer":"changed"}'
+        results.write_bytes(b''.join(map(engine._canonical_json_bytes, changed)))
+        with self.assertRaisesRegex(RunnerError, 'request history source receipt hash differs'):
+            list(history.matches(current))
 
     def test_verified_file_cache_bounds_historical_json_and_reloads_evicted_files(self):
         from experiment_runner import extraction_pipeline as engine

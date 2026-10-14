@@ -251,6 +251,8 @@ def request_preview(plan, manifest, cases, *, include_reusable_case_ids=False):
         history = engine.RequestHistory(
             Path(manifest["request_reuse"]["history_root"]),
             exclude_run=Path(plan["run_directory"]),
+            request_keys={engine._prompt_request_key(manifest, case['prompt']):
+                          engine._sha256_bytes(case['prompt'].encode('utf-8')) for case in pending},
         )
         for case in pending:
             for _, source in history.matches(
