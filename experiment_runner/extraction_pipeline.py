@@ -3996,9 +3996,11 @@ def _provider_retry_after_delay(record: dict[str, Any]) -> float | None:
     return None if supplied else 2.0
 
 
-def provider_retry_delay(record: dict[str, Any], *, keep_retrying: bool = False) -> float | None:
-    """Every verified temporary failure retries; the old opt-in is compatible."""
-    if prompt_failure_kind(record) != "provider_transient":
+def provider_retry_delay(record: dict[str, Any], *, keep_retrying: bool = False,
+                         max_provider_attempts: int | None = None) -> float | None:
+    """Retry verified temporary failures within an optional lifetime case limit."""
+    if (prompt_failure_kind(record) != "provider_transient"
+            or max_provider_attempts is not None and record["attempt"] >= max_provider_attempts):
         return None
     # Bound before exponentiation, since saved lifetime counts can be arbitrarily
     # large. A malformed header cannot negate verified temporary failure evidence.
@@ -4020,6 +4022,7 @@ def _execute_prompt_batch(
     before_new_attempt: Callable[[NewJobBudget], None] | None = None,
     request_queue=None,
     keep_retrying_provider_errors: bool = False,
+    max_provider_attempts: int | None = None,
     scheduling_group: str | None = None,
 ) -> dict[str, object]:
     from experiment_runner import scheduling
@@ -4202,7 +4205,8 @@ def _execute_prompt_batch(
             now = time.monotonic()
             # Resume retains the actual shared cooldown. An old receipt is not
             # evidence of a new outage starting when this coordinator restarts.
-            delay = provider_retry_delay(previous, keep_retrying=keep_retrying_provider_errors)
+            delay = provider_retry_delay(previous, keep_retrying=keep_retrying_provider_errors,
+                                         max_provider_attempts=max_provider_attempts)
             if delay is not None:
                 retry_at = now + delay
                 heapq.heappush(ready, (retry_at, index, prompt))
@@ -4280,7 +4284,8 @@ def _execute_prompt_batch(
                             now = time.monotonic()
                             if provider_cooldown_required(record) and not fatal:
                                 backoff(record, now, submitted_at)
-                            delay = provider_retry_delay(record, keep_retrying=keep_retrying_provider_errors)
+                            delay = provider_retry_delay(record, keep_retrying=keep_retrying_provider_errors,
+                                                         max_provider_attempts=max_provider_attempts)
                             if delay is not None and not fatal:
                                 retry_at = now + delay
                                 heapq.heappush(ready, (retry_at, index, prompt))

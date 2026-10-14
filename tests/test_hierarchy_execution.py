@@ -45,6 +45,32 @@ class HierarchyExecutionTests(unittest.TestCase):
             'prepare', str(self.root / name), '--spec', str(self.root / 'spec.json')])
         return experiment.prepare(args, include_request_preview=False)
 
+    def test_explicit_provider_attempt_limit_survives_resume(self):
+        self.prepare()
+        with patch.dict(os.environ, {'FAKE_RUNNER_FAILURES': json.dumps({
+                'GENERIC PROMPT\none': {'attempts': 100, 'metadata': {'http_status': 503}}})}):
+            with self.assertRaisesRegex(RunnerError, 'unresolved prompt cases'):
+                experiment.run(self.root / 'E1', max_provider_attempts=2)
+            first = experiment.report(self.root / 'E1')
+            self.assertEqual(first['summary']['valid'], 2)
+            self.assertEqual(first['summary']['attempts'], 4)
+            before = (self.root / 'E1/run/results.jsonl').read_bytes()
+            with self.assertRaisesRegex(RunnerError, 'unresolved prompt cases'):
+                experiment.run(self.root / 'E1', max_provider_attempts=2)
+            second = experiment.report(self.root / 'E1')
+            self.assertEqual(second['summary']['attempts'], 4)
+            self.assertEqual((self.root / 'E1/run/results.jsonl').read_bytes(), before)
+        settings = [json.loads(line) for line in
+                    (self.root / 'E1/execution-settings.jsonl').read_text().splitlines()]
+        self.assertTrue(all(row['max_provider_attempts'] == 2 for row in settings))
+
+    def test_invalid_provider_attempt_limit_is_rejected_before_inference(self):
+        self.prepare()
+        for value in (0, -1, True, 1.5):
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, 'positive integer'):
+                experiment.run(self.root / 'E1', max_provider_attempts=value)
+        self.assertFalse((self.root / 'calls.json').exists())
+
     def test_prepare_report_and_run_can_skip_request_preview(self):
         # Preview is optional work, not a prerequisite for audited execution.
         with patch.object(experiment, 'request_preview', side_effect=AssertionError('preview invoked')):

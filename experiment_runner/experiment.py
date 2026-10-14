@@ -1157,10 +1157,13 @@ def reconcile_costs(directory):
 def run(directory, max_new_attempts=None, runner_upgrade_reason=None, *,
         max_cost_usd=None, max_request_cost_usd=None, attempt_budget_path=None,
         additional_attempt_budget_paths=(), include_request_preview=True,
-        only=None, warm_cache=True, keep_retrying_provider_errors=False, scheduling_group=None):
+        only=None, warm_cache=True, keep_retrying_provider_errors=False, scheduling_group=None,
+        max_provider_attempts=None):
+    if max_provider_attempts is not None and (type(max_provider_attempts) is not int or max_provider_attempts < 1):
+        raise ValueError('max_provider_attempts must be a positive integer')
     directory = directory.resolve()
     if (directory / 'bounded-build.json').exists():
-        if (any(x is not None for x in (max_cost_usd, max_request_cost_usd, attempt_budget_path, only, scheduling_group))
+        if (any(x is not None for x in (max_cost_usd, max_request_cost_usd, attempt_budget_path, only, scheduling_group, max_provider_attempts))
                 or additional_attempt_budget_paths or not warm_cache or keep_retrying_provider_errors):
             raise ValueError('bounded builds use their frozen shared attempt budget and subscription route')
         run_build = project.import_module('bounded_hierarchy_build').run_build
@@ -1199,6 +1202,7 @@ def run(directory, max_new_attempts=None, runner_upgrade_reason=None, *,
             scheduling='shared-fair-queue-v2', scheduling_group=group,
             prepared_concurrency=config.concurrency, only=only, warm_cache=warm_cache,
             keep_retrying_provider_errors=keep_retrying_provider_errors,
+            max_provider_attempts=max_provider_attempts,
             started_at_utc=datetime.now(timezone.utc).isoformat()))
         provenance = engine._load_runner_upgrades(
             config.run_directory, manifest_sha256=inputs.digest(manifest),
@@ -1252,6 +1256,7 @@ def run(directory, max_new_attempts=None, runner_upgrade_reason=None, *,
                             new_job_budget=budget,
                             request_queue=queue,
                             keep_retrying_provider_errors=keep_retrying_provider_errors,
+                            max_provider_attempts=max_provider_attempts,
                             validate_output=lambda job, raw: inputs.validate(
                                 {'adapter': 'generic'}, warm_plan['cases'][0], raw, config.output_schema))
                     finally:
@@ -1280,6 +1285,7 @@ def run(directory, max_new_attempts=None, runner_upgrade_reason=None, *,
                 attempt_budget_path=attempt_budget_path,
                 additional_attempt_budget_paths=additional_attempt_budget_paths,
                 keep_retrying_provider_errors=keep_retrying_provider_errors,
+                max_provider_attempts=max_provider_attempts,
                 runner_upgrade_reason=runner_upgrade_reason if wrapper_changed else None,
                 before_new_attempt=(warm_before_dispatch if warm_cache and plan.get('cache_warmup', {}).get('eligible') else None),
                 scheduling_group=group,
@@ -1687,6 +1693,8 @@ Example from your project checkout (replace the spec and destination):
                    help='dispatch only these frozen cases; the full report retains unselected cases')
     p.add_argument('--keep-retrying-provider-errors', action='store_true',
                    help='compatibility option; verified temporary provider errors already retry automatically')
+    p.add_argument('--max-provider-attempts', type=int,
+                   help='optional total attempts per case, including saved attempts across resumes and warmups')
     p.add_argument("--max-new-attempts", type=int,
                    help="cap newly sent attempts, including provider retries; reserve spending for this allowance")
     p.add_argument("--attempt-budget", type=Path,
@@ -1781,7 +1789,7 @@ def main(argv=None):
                 raise ValueError('--max-new-attempts must be positive')
             if args.runner_upgrade_reason is not None and (not args.runner_upgrade_reason.strip()):
                 raise ValueError('--runner-upgrade-reason must not be blank')
-            result = run(args.experiment, args.max_new_attempts, args.runner_upgrade_reason, max_cost_usd=args.max_cost_usd, max_request_cost_usd=args.max_request_cost_usd, attempt_budget_path=args.attempt_budget, only=args.only, keep_retrying_provider_errors=args.keep_retrying_provider_errors, scheduling_group=args.scheduling_group)
+            result = run(args.experiment, args.max_new_attempts, args.runner_upgrade_reason, max_cost_usd=args.max_cost_usd, max_request_cost_usd=args.max_request_cost_usd, attempt_budget_path=args.attempt_budget, only=args.only, keep_retrying_provider_errors=args.keep_retrying_provider_errors, scheduling_group=args.scheduling_group, max_provider_attempts=args.max_provider_attempts)
             if (args.experiment / 'bounded-build.json').exists():
                 print(json.dumps(result, indent=2))
                 return int(result.get('status') != 'finished')

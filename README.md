@@ -308,6 +308,13 @@ compatibility option with the same automatic behavior. Successful answers are
 never redrawn. Observe successful completions/minute alongside failure counts,
 retry usage/cost and admission history when assessing throughput.
 
+For an experiment with an explicit per-case limit, pass
+`run --max-provider-attempts N`. The limit includes the first call and saved
+attempts across resumes, and applies to prefix warmups too. It stops retrying
+after N attempts without affecting independent cases, successful answer reuse,
+or the default unlimited retry policy. The selected limit is recorded in
+`execution-settings.jsonl`; retain it when resuming.
+
 Rejected WebSocket upgrades preserve their actual HTTP status and retry headers
 through a connection-specific dispatcher observer. A 503/429 handshake can
 therefore retry; 403 stays fatal. No SSE fallback or extra handshake probe is
