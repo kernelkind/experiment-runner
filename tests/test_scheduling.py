@@ -158,7 +158,9 @@ class SchedulingTests(unittest.TestCase):
                     worker.start()
                 self.until(lambda: scheduling.snapshot(queues[-1].path.parent)['global_ready'] == 130)
                 for lease in reversed(leases[10:]):
+                    self.until_registered_heads()
                     lease.__exit__(None, None, None)
+                    self.until(lambda: scheduling.snapshot(queues[-1].path.parent)['global_running'] == 30)
                 leases = leases[:10]
                 self.until(lambda: {k: v['running'] for k, v in
                     scheduling.snapshot(queues[-1].path.parent)['groups'].items()} ==
@@ -190,16 +192,20 @@ class SchedulingTests(unittest.TestCase):
             self.until(lambda name=name: json.loads(self.cli('show', name, '--json').stdout)
                        ['scheduling'].get('ready') == 30)
         held = sorted(self.starts(), key=lambda row: row['started'])
-        for row in held[:15]:
+        for number, row in enumerate(held[:15]):
+            self.until_registered_heads()
             (self.control / f"{row['pid']}.release").touch()
+            self.until(lambda: len(self.starts()) == 31 + number)
         self.until(lambda: sum('other-' in row['prompt'] for row in self.starts()) == 15)
         self.assertEqual(sum('distb-' in row['prompt'] or 'distc-' in row['prompt']
                              for row in self.starts()), 0)
         live = json.loads(self.cli('show', 'other', '--json').stdout)['scheduling']
         self.assertEqual({name: value['running'] for name, value in live['groups'].items()},
                          {'distillation': 15, 'hierarchy': 15})
-        for row in held[15:]:
+        for number, row in enumerate(held[15:]):
+            self.until_registered_heads()
             (self.control / f"{row['pid']}.release").touch()
+            self.until(lambda: len(self.starts()) == 46 + number)
         self.until(lambda: sum('distb-' in row['prompt'] or 'distc-' in row['prompt']
                               for row in self.starts()) == 15)
         self.assertTrue(any('distb-' in row['prompt'] for row in self.starts()))
@@ -225,6 +231,22 @@ class SchedulingTests(unittest.TestCase):
 
     def starts(self):
         return [json.loads(path.read_text()) for path in self.control.glob('*.json')]
+
+    def until_registered_heads(self):
+        from experiment_runner.provider_backoff import SharedProviderBackoff
+
+        gate = SharedProviderBackoff(self.env['ORACLE_EXPERIMENT_BACKOFF_DIRECTORY'])
+
+        def registered():
+            state = gate._read_state()
+            heads = {job['owner'] for job in state['queue']['waiting'].values()}
+            return all(not run['ready'] or owner in heads
+                       for owner, run in state['queue']['experiments'].items())
+
+        # These fairness fixtures hold dispatched requests indefinitely. Wait
+        # for genuinely registered competing work before freeing each slot;
+        # production now lends capacity during a local head-registration gap.
+        self.until(registered)
 
     def until(self, predicate):
         deadline = time.monotonic() + 8
@@ -318,6 +340,146 @@ class SchedulingTests(unittest.TestCase):
             resume.set()
             self.assertTrue(entered[0].wait(1))
         self.assertEqual(errors, [])
+
+    def test_missing_owner_head_does_not_leave_free_slots_idle(self):
+        from experiment_runner import scheduling
+
+        with patch.dict(os.environ, self.env):
+            queues, workers, errors = [], [], []
+            release = threading.Event()
+            entered = [threading.Event(), threading.Event()]
+            for name in ('delayed', 'registered'):
+                path = self.root / name
+                path.mkdir()
+                queues.append(scheduling.ExperimentQueue(path, 1))
+
+            def enter(queue, index):
+                try:
+                    with queue.slot(str(index), 30):
+                        entered[index].set()
+                        release.wait()
+                except BaseException as error:
+                    errors.append(error)
+
+            queues[0].admission_lock.acquire()
+            try:
+                for index, queue in enumerate(queues):
+                    worker = threading.Thread(target=enter, args=(queue, index))
+                    workers.append(worker)
+                    worker.start()
+                    if index == 0:
+                        self.until(lambda: scheduling.snapshot(queue.path.parent)['ready'] == 1)
+                self.assertTrue(entered[1].wait(1),
+                                'a ready owner without a registered head left a free slot idle')
+                self.assertFalse(entered[0].is_set())
+                self.assertEqual(scheduling.snapshot(queues[1].path.parent)['global_running'], 1)
+            finally:
+                queues[0].admission_lock.release()
+                release.set()
+                for worker in workers:
+                    worker.join(timeout=3)
+                for queue in queues:
+                    queue.close()
+            self.assertEqual(errors, [])
+            self.assertTrue(all(not worker.is_alive() for worker in workers))
+
+    def test_delayed_head_catches_up_without_exceeding_group_fairness_or_capacity(self):
+        from experiment_runner import scheduling
+
+        with patch.dict(os.environ, self.env):
+            queues, leases, workers, errors = [], [], [], []
+            release = threading.Event()
+            entered = [threading.Event() for _ in range(3)]
+            for name, count, group in (('busy', 30, 'distillation'),
+                                       ('delayed', 1, 'hierarchy'),
+                                       ('registered', 2, 'distillation')):
+                path = self.root / name
+                path.mkdir()
+                queues.append(scheduling.ExperimentQueue(path, count, scheduling_group=group))
+
+            def enter(queue, index):
+                try:
+                    with queue.slot(str(index), 30):
+                        entered[index].set()
+                        release.wait()
+                except BaseException as error:
+                    errors.append(error)
+
+            delayed = queues[1]
+            delayed.admission_lock.acquire()
+            try:
+                for number in range(30):
+                    lease = queues[0].slot(str(number), 30)
+                    lease.__enter__()
+                    leases.append(lease)
+                for index, queue in enumerate((delayed, queues[2], queues[2])):
+                    worker = threading.Thread(target=enter, args=(queue, index))
+                    workers.append(worker)
+                    worker.start()
+                    if index == 1:
+                        self.until(lambda: any(job['owner'] == queue.owner and job['case'] == '1'
+                            for job in queue.gate._read_state()['queue']['waiting'].values()))
+                self.until(lambda: scheduling.snapshot(delayed.path.parent)['global_ready'] == 3)
+                leases.pop().__exit__(None, None, None)
+                self.assertTrue(entered[1].wait(1), 'registered work could not use freed capacity')
+                self.assertFalse(entered[2].is_set())
+                delayed.admission_lock.release()
+                self.until(lambda: any(job['owner'] == delayed.owner for job in
+                    delayed.gate._read_state()['queue']['waiting'].values()))
+                self.assertFalse(entered[0].is_set(), 'admission exceeded the shared limit of 30')
+                leases.pop().__exit__(None, None, None)
+                self.assertTrue(entered[0].wait(1), 'delayed owner lost its next fair turn')
+                self.assertFalse(entered[2].is_set())
+                status = scheduling.snapshot(delayed.path.parent)
+                self.assertEqual(status['global_running'], 30)
+                self.assertEqual({name: value['running'] for name, value in status['groups'].items()},
+                                 {'distillation': 29, 'hierarchy': 1})
+            finally:
+                if delayed.admission_lock.locked():
+                    delayed.admission_lock.release()
+                release.set()
+                for lease in reversed(leases):
+                    lease.__exit__(None, None, None)
+                for worker in workers:
+                    worker.join(timeout=3)
+                for queue in queues:
+                    queue.close()
+            self.assertEqual(errors, [])
+            self.assertTrue(all(not worker.is_alive() for worker in workers))
+
+    def test_registered_legacy_head_keeps_its_fair_turn(self):
+        from experiment_runner import scheduling
+
+        with patch.dict(os.environ, self.env):
+            queues = []
+            for name in ('legacy', 'current'):
+                path = self.root / name
+                path.mkdir()
+                queues.append(scheduling.ExperimentQueue(path, 1))
+            try:
+                with queues[0].gate._state() as (state, now):
+                    for queue in queues:
+                        state['queue']['experiments'][queue.owner]['ready'] = 1
+                        state['queue']['waiting'][queue.owner] = {
+                            'owner': queue.owner, 'case': 'one', 'queued_at': now,
+                            'scopes': None, 'wait_reason': 'capacity',
+                            **({'timeout_seconds': 30} if queue is queues[1] else {})}
+                    scheduling._fill_slots(queues[0].gate, state, now)
+                    self.assertEqual(state['queue']['running'], {})
+                    self.assertEqual(set(state['queue']['waiting']), {q.owner for q in queues})
+                    # The old coordinator claims its own fair turn. Current
+                    # peers can then reserve the remaining free capacity.
+                    legacy = state['queue']['waiting'].pop(queues[0].owner)
+                    state['queue']['running'][queues[0].owner] = {
+                        **legacy, 'started': now, 'expires': now + 60, 'provider_ticket': None}
+                    state['queue']['sequence'] += 1
+                    state['queue']['experiments'][queues[0].owner].update(
+                        ready=0, last_grant=state['queue']['sequence'])
+                    scheduling._fill_slots(queues[0].gate, state, now)
+                    self.assertEqual(set(state['queue']['running']), {q.owner for q in queues})
+            finally:
+                for queue in queues:
+                    queue.close()
 
     def test_full_capacity_waiter_observes_capacity_without_repeated_host_locks(self):
         from experiment_runner import scheduling
@@ -720,8 +882,10 @@ class SchedulingTests(unittest.TestCase):
         self.assertEqual(new_status['global_eligible_ready'], 30)
         self.assertEqual(new_status['experiments'][new_status['owner']]['wait_reason'], 'capacity')
         original = sorted(self.starts(), key=lambda row: row['started'])
-        for entry in original[:15]:
+        for number, entry in enumerate(original[:15]):
+            self.until_registered_heads()
             (self.control / f"{entry['pid']}.release").touch()
+            self.until(lambda: len(self.starts()) == 31 + number)
         self.until(lambda: len([r for r in self.starts() if 'newer-' in r['prompt']]) == 15)
         self.assertEqual(len([r for r in self.starts() if 'older-' in r['prompt']]), 30,
                          'older run must yield released slots to the newcomer')
@@ -757,8 +921,10 @@ class SchedulingTests(unittest.TestCase):
             self.until(lambda: any(case['state'] == 'queued' for case in
                        json.loads(self.cli('show', name, '--json').stdout)
                        .get('scheduling', {}).get('cases', {}).values()))
-        for entry in sorted(self.starts(), key=lambda row: row['started'])[:20]:
+        for number, entry in enumerate(sorted(self.starts(), key=lambda row: row['started'])[:20]):
+            self.until_registered_heads()
             (self.control / f"{entry['pid']}.release").touch()
+            self.until(lambda: len(self.starts()) == 31 + number)
         self.until(lambda: len(self.starts()) == 50)
         counts = {name: json.loads(self.cli('show', name, '--json').stdout)['scheduling']['running']
                   for name in ('first', 'second', 'third')}

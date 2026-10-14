@@ -166,12 +166,15 @@ def _fill_slots(gate, state, now):
                 continue
             identifier = heads.get(owner)
             job = queue['waiting'].get(identifier)
+            if job is None:
+                # Locally ready requests cannot use a slot until their owner
+                # registers a head. Its unchanged last_grant preserves priority
+                # when that head arrives without idling other ready work.
+                continue
             blocked, until = _blocked(state, run, now)
-            if job is not None:
-                job['cooldown_until'] = until
+            job['cooldown_until'] = until
             if blocked:
-                if job is not None:
-                    job['wait_reason'] = blocked
+                job['wait_reason'] = blocked
             else:
                 eligible[owner] = identifier
         if not eligible:
@@ -181,10 +184,6 @@ def _fill_slots(gate, state, now):
             group_grants[_group(queue['experiments'][value], value)],
             counts[value], queue['experiments'][value]['last_grant']))
         identifier = eligible[owner]
-        if identifier is None:
-            # A ready owner may be handing its local admission lock to its next
-            # waiter. Preserve its fair turn while that waiter registers.
-            return
         job, run = queue['waiting'][identifier], queue['experiments'][owner]
         timeout = job.get('timeout_seconds')
         if timeout is None:

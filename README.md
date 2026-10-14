@@ -183,7 +183,9 @@ against a hierarchy experiment. With sufficient ready work, two groups balance
 near 15 requests each, three near 10. A newcomer gets freed slots until it
 catches up; active requests finish normally. Groups with insufficient eligible
 work lend their unused capacity to the others. Account recovery and endpoint
-limits still apply.
+limits still apply. A batch that has published ready work but has not registered
+its next waiter does not hold other batches' free slots; its fairness priority
+is retained when the waiter arrives.
 
 Set membership once during preparation:
 
