@@ -133,13 +133,17 @@ def _clean(state, now):
                 if kind == 'running' and job.get('provider_ticket'):
                     state['tickets'].pop(job['provider_ticket'], None)
                 del queue[kind][key]
-    for run in queue['experiments'].values():
+    _refresh_endpoint_ready(state)
+    return queue
+
+
+def _refresh_endpoint_ready(state):
+    for run in state['queue']['experiments'].values():
         if 'endpoint_ready' in run:
             # Already-loaded older coordinators also read ready when choosing
             # a fair contender. Hide busy endpoints from that shared selection;
             # keep actual waiting counts for current status and observations.
             run['ready'] = 0 if _endpoint_full(state, run) else run['endpoint_ready']
-    return queue
 
 
 def _fill_slots(gate, state, now):
@@ -210,8 +214,8 @@ def _fill_slots(gate, state, now):
 
 
 def _snapshot(state, now, saved):
-    """Capture counts and constraints from one coherent decoded state."""
-    queue = _clean(state, now)
+    """Capture counts and constraints from one coherent, cleaned state."""
+    queue = _queue_state(state)
     occupied = SharedProviderBackoff.occupancy(state, now)
     epoch = time.time()
     experiments = {}
@@ -286,6 +290,7 @@ def snapshot(run_directory):
     saved = json.loads(path.read_text())
     gate = SharedProviderBackoff(directory())
     state, now = gate.observation()
+    _clean(state, now)
     return _snapshot(state, now, saved)
 
 
@@ -514,6 +519,7 @@ class ExperimentQueue:
                     ready_key = 'endpoint_ready'
                 run[ready_key] += 1
                 pending = True
+                _refresh_endpoint_ready(state)
                 observation = _snapshot(state, now, self.saved)
             self._record(observation, 'ready')
             # One shared waiter per experiment; other pending requests wait
@@ -557,6 +563,7 @@ class ExperimentQueue:
                             provider_ticket = reservation['provider_ticket']
                             pending = False
                             admitted = True
+                            _refresh_endpoint_ready(state)
                             observation = _snapshot(state, now, self.saved)
                         else:
                             job = queue['waiting'][identifier]
@@ -591,6 +598,7 @@ class ExperimentQueue:
                     state['tickets'].pop(reservation['provider_ticket'], None)
                 queue['waiting'].pop(identifier, None)
                 queue['running'].pop(identifier, None)
+                _refresh_endpoint_ready(state)
                 observation = _snapshot(state, now, self.saved)
             self._record(observation, 'released' if admitted else 'cancelled')
 

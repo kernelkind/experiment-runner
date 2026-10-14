@@ -130,10 +130,11 @@ class SchedulingTests(unittest.TestCase):
         with patch.dict(os.environ, self.env):
             queues, leases, workers, errors = [], [], [], []
             release = threading.Event()
+            previous_slot = scheduling.current_slot()
             def enter(queue, case):
                 try:
                     with queue.slot(case, 60):
-                        release.wait(10)
+                        release.wait()
                 except BaseException as error:
                     errors.append(error)
             try:
@@ -156,9 +157,9 @@ class SchedulingTests(unittest.TestCase):
                 for worker in workers:
                     worker.start()
                 self.until(lambda: scheduling.snapshot(queues[-1].path.parent)['global_ready'] == 130)
-                for lease in leases[:20]:
+                for lease in reversed(leases[10:]):
                     lease.__exit__(None, None, None)
-                leases = leases[20:]
+                leases = leases[:10]
                 self.until(lambda: {k: v['running'] for k, v in
                     scheduling.snapshot(queues[-1].path.parent)['groups'].items()} ==
                     {'distillation': 10, 'hierarchy': 10, 'review': 10})
@@ -167,7 +168,7 @@ class SchedulingTests(unittest.TestCase):
                 self.assertEqual(status['groups']['distillation']['batches'], 100)
             finally:
                 release.set()
-                for lease in leases:
+                for lease in reversed(leases):
                     lease.__exit__(None, None, None)
                 for worker in workers:
                     if worker.ident is not None:
@@ -176,6 +177,7 @@ class SchedulingTests(unittest.TestCase):
                     queue.close()
             self.assertEqual(errors, [])
             self.assertTrue(all(not worker.is_alive() for worker in workers))
+            self.assertIs(scheduling.current_slot(), previous_slot)
 
     def test_many_batches_share_one_group_without_crowding_out_another(self):
         for name in ('dista', 'distb', 'distc'):
@@ -390,6 +392,94 @@ class SchedulingTests(unittest.TestCase):
                         queue.check_pause()
             finally:
                 queue.close()
+
+    def test_queue_event_snapshots_do_not_repeat_transaction_cleanup(self):
+        from experiment_runner import scheduling
+
+        held = threading.local()
+        state = scheduling.SharedProviderBackoff._state
+        observe = scheduling._snapshot
+        observed = []
+
+        @contextmanager
+        def tracked(gate):
+            with state(gate) as value:
+                held.active = True
+                try:
+                    yield value
+                finally:
+                    held.active = False
+
+        def observe_once(*args, **kwargs):
+            if getattr(held, 'active', False):
+                observed.append(args[2]['state'])
+                with patch.object(scheduling, '_clean',
+                                  side_effect=AssertionError('status repeated transaction cleanup')):
+                    return observe(*args, **kwargs)
+            return observe(*args, **kwargs)
+
+        with patch.dict(os.environ, self.env), \
+                patch.object(scheduling.SharedProviderBackoff, '_state', tracked), \
+                patch.object(scheduling, '_snapshot', observe_once):
+            path = self.root / 'sample'
+            path.mkdir()
+            queue = scheduling.ExperimentQueue(path, 1,
+                scopes={'account': 'a' * 64, 'transport': 'b' * 64})
+            try:
+                queue.warming(True)
+                queue.warming(False)
+                queue.cooldown(time.monotonic())
+                with queue.slot('one', 30):
+                    queue.worker_started(scheduling.current_slot()['identifier'], os.getpid())
+                queue.completed()
+            finally:
+                queue.close()
+        self.assertGreaterEqual(len(observed), 8)
+
+    def test_endpoint_ready_mirror_is_published_after_grants_and_releases(self):
+        from experiment_runner import scheduling
+
+        with patch.dict(os.environ, self.env):
+            path = self.root / 'sample'
+            path.mkdir()
+            queue = scheduling.ExperimentQueue(path, 2,
+                endpoint_loader=lambda: {'scope': 'a' * 64, 'capacity': 1})
+            entered, release = threading.Event(), threading.Event()
+            errors = []
+
+            def second():
+                try:
+                    with queue.slot('second', 30):
+                        entered.set()
+                        release.wait(2)
+                except BaseException as error:
+                    errors.append(error)
+
+            first = queue.slot('first', 30)
+            first.__enter__()
+            worker = threading.Thread(target=second)
+            try:
+                # Hold only this batch's local waiter registration so no peer can
+                # adopt the newly free slot before its published mirror is checked.
+                with queue.admission_lock:
+                    worker.start()
+                    self.until(lambda: queue.gate.read_state()['queue']['experiments']
+                               [queue.owner]['endpoint_ready'] == 1)
+                    self.assertEqual(queue.gate.read_state()['queue']['experiments']
+                                     [queue.owner]['ready'], 0)
+                    first.__exit__(None, None, None)
+                    first = None
+                    self.assertEqual(queue.gate.read_state()['queue']['experiments']
+                                     [queue.owner]['ready'], 1)
+                self.assertTrue(entered.wait(1), errors)
+            finally:
+                if first is not None:
+                    first.__exit__(None, None, None)
+                release.set()
+                worker.join(timeout=3)
+                queue.close()
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(errors, [])
 
     def test_observation_cleans_expired_tickets_without_mutating_authoritative_state(self):
         from experiment_runner import scheduling
