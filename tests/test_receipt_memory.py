@@ -96,6 +96,35 @@ class ReceiptMemoryTests(unittest.TestCase):
         self.assertEqual(decode.call_count, 4)
         self.assertLessEqual(files._projected_bytes, 16 * 1024 * 1024)
 
+    def test_explicit_projected_budget_retains_views_beyond_the_default_limit(self):
+        paths = [self.root/f'projected-{i}.json' for i in range(3)]
+        for path in paths:
+            path.write_text(json.dumps({'value': 'x' * (6 * 1024 * 1024)}))
+        select = lambda value: value
+        files = engine.ReceiptFiles(projected_cache_bytes=32 * 1024 * 1024)
+        with patch.object(engine.json, 'loads', wraps=engine.json.loads) as decode:
+            for _ in range(2):
+                for path in paths:
+                    files.json(path, project=select)
+        self.assertEqual(decode.call_count, 3, 'immutable projected views were parsed again')
+        self.assertLessEqual(files._projected_bytes, 32 * 1024 * 1024)
+        self.assertGreater(files._projected_bytes, 16 * 1024 * 1024)
+        for path in paths:
+            self.assertEqual(files.sha256(path), engine._sha256_file(path))
+
+    def test_explicit_projected_budget_still_evicts_older_views(self):
+        paths = [self.root/f'bounded-{i}.json' for i in range(3)]
+        for path in paths:
+            path.write_text(json.dumps({'value': 'x' * 40}))
+        select = lambda value: value
+        files = engine.ReceiptFiles(projected_cache_bytes=128)
+        with patch.object(engine.json, 'loads', wraps=engine.json.loads) as decode:
+            for path in paths:
+                files.json(path, project=select)
+            files.json(paths[0], project=select)
+        self.assertEqual(decode.call_count, 4)
+        self.assertLessEqual(files._projected_bytes, 128)
+
     def test_ordinary_sources_do_not_evict_bounded_compact_views(self):
         selected = [self.root/f'selected-{i}.json' for i in range(2)]
         ordinary = [self.root/f'ordinary-{i}.json' for i in range(2)]

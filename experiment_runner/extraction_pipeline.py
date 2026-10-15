@@ -2389,17 +2389,22 @@ class ReceiptFiles:
     """Operation-scoped file reads and provenance, never receipt verdicts.
 
     Keep the executing manifest, one large source and at most 16 MiB of smaller
-    JSON source bytes. Evicted JSON is parsed again when needed. File digests
+    JSON source bytes. Selected JSON views have a separate retained-size limit,
+    defaulting to 16 MiB; callers handling larger immutable evidence may supply
+    an explicit bound. Evicted JSON is parsed again when needed. File digests
     retain only a stamp and hash; unchanged files need no repeat parsing or
     hashing. JSONL retains only line offsets, not every receipt body. Every requested line is read and
     verified normally. A new operation starts with an empty cache.
     """
 
-    def __init__(self, *, manifest_path=None):
+    def __init__(self, *, manifest_path=None, projected_cache_bytes=16 * 1024 * 1024):
+        if type(projected_cache_bytes) is not int or projected_cache_bytes < 1:
+            raise ValueError('projected_cache_bytes must be a positive integer')
         self._json = {}
         self._json_bytes = 0
         self._projected = {}
         self._projected_bytes = 0
+        self._projected_limit = projected_cache_bytes
         self._hashes = {}
         self._manifest_path = Path(manifest_path) if manifest_path is not None else None
         self._offsets = {}
@@ -2458,8 +2463,8 @@ class ReceiptFiles:
             entry = dict(stamp=stamp, value=value, size=len(_ordered_json_bytes(value)),
                          sha256=_sha256_bytes(raw))
         self._hashes[path] = (entry['stamp'], entry['sha256'])
-        if entry['size'] <= 16 * 1024 * 1024:
-            while self._projected_bytes + entry['size'] > 16 * 1024 * 1024:
+        if entry['size'] <= self._projected_limit:
+            while self._projected_bytes + entry['size'] > self._projected_limit:
                 oldest = next(iter(self._projected))
                 self._projected_bytes -= self._projected.pop(oldest)['size']
             self._projected[key] = entry
