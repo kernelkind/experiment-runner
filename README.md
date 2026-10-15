@@ -63,6 +63,12 @@ files, the executing batch's manifest, and one larger source file. A different
 large source evicts the previous one; small reads do not. This avoids reparsing
 one large historical manifest for every reused answer without retaining every
 historical manifest. Evicted JSON is read and parsed again when needed.
+Adapters may use `read(path, project=selector)` to retain a pure selected JSON
+view under a separate 16 MiB bound. Ordinary source reads cannot evict those
+views. Projection identity and the complete file stamp identify each entry;
+full reads and different projections stay separate. The reader parses the full
+source and retains its original SHA-256 before selecting fields. Oversized
+views are returned without retention. No validation verdict is cached.
 Digest checks keep only file identity, size, timestamps and SHA-256;
 unchanged files need no repeated parsing or hashing, even above the JSON cache
 limit. Changed files are hashed in 1 MiB chunks and checked for changes during

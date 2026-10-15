@@ -85,15 +85,16 @@ def result_records(path):
         return entry['by_digest']
 
 
-def read(path):
+def read(path, *, project=None):
     files = _REPORT_FILES.get()
     if files is not None:
         try:
-            return files.json(Path(path))
+            return files.json(Path(path), project=project)
         except (OSError, UnicodeError, ValueError):
             # Keep the established error diagnostics on malformed/missing files.
-            return engine._load_json(Path(path), str(path))
-    return engine._load_json(Path(path), str(path))
+            pass
+    value = engine._load_json(Path(path), str(path))
+    return value if project is None else project(value)
 
 
 def write(path, value):

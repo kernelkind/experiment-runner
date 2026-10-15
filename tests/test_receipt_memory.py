@@ -19,6 +19,101 @@ class ReceiptMemoryTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
 
+    def test_projected_large_sources_retain_only_selected_fields_and_exact_digests(self):
+        paths = [self.root / f'source-{i}.json' for i in range(3)]
+        for i, path in enumerate(paths):
+            path.write_text(json.dumps({'value': i, 'unused': 'x' * (17 * 1024 * 1024)}))
+        select = lambda value: {'value': value['value']}
+        reads, read_bytes = {}, Path.read_bytes
+
+        def counted(path):
+            reads[path] = reads.get(path, 0) + 1
+            return read_bytes(path)
+
+        tracemalloc.start()
+        try:
+            with patch.object(Path, 'read_bytes', counted):
+                with experiment.report_scope() as files:
+                    for _ in range(3):
+                        for i, path in enumerate(paths):
+                            self.assertEqual(experiment.read(path, project=select), {'value': i})
+                            self.assertEqual(files.sha256(path), engine._sha256_file(path))
+                    self.assertEqual(reads, dict.fromkeys(paths, 1))
+                    retained, _ = tracemalloc.get_traced_memory()
+                    self.assertLess(retained, 2 * 1024 * 1024)
+                with experiment.report_scope():
+                    experiment.read(paths[0], project=select)
+                self.assertEqual(reads[paths[0]], 2)
+        finally:
+            tracemalloc.stop()
+
+    def test_projected_reads_preserve_full_reads_and_invalidate_replaced_files(self):
+        path = self.root / 'source.json'
+        path.write_text('{"value":1,"other":2}')
+        select = lambda value: value['value']
+        other = lambda value: value['other']
+        with experiment.report_scope() as files:
+            self.assertEqual(experiment.read(path, project=select), 1)
+            self.assertEqual(experiment.read(path, project=other), 2)
+            self.assertEqual(experiment.read(path), {'value': 1, 'other': 2})
+            stamp = path.stat()
+            path.write_text('{"value":3,"other":4}')
+            os.utime(path, ns=(stamp.st_atime_ns, stamp.st_mtime_ns + 1_000_000))
+            self.assertEqual(experiment.read(path, project=select), 3)
+            self.assertEqual(files.sha256(path), engine._sha256_file(path))
+            replacement = self.root / 'replacement.json'
+            replacement.write_text('{"value":5,"other":6}')
+            replacement.replace(path)
+            self.assertEqual(experiment.read(path, project=select), 5)
+            self.assertEqual(experiment.read(path), {'value': 5, 'other': 6})
+
+    def test_projection_cannot_hide_invalid_json_or_a_changed_source(self):
+        path = self.root / 'source.json'
+        path.write_text('{"value":1,"unused":[invalid]}')
+        with experiment.report_scope(), self.assertRaises(engine.RunnerError):
+            experiment.read(path, project=lambda value: value['value'])
+        path.write_text('{"value":1}')
+
+        def changed(value):
+            stamp = path.stat()
+            path.write_text('{"value":2}')
+            os.utime(path, ns=(stamp.st_atime_ns, stamp.st_mtime_ns + 1_000_000))
+            return value['value']
+
+        with experiment.report_scope(), self.assertRaisesRegex(engine.RunnerError, 'source changed'):
+            experiment.read(path, project=changed)
+
+    def test_projected_cache_obeys_the_existing_retained_size_bound(self):
+        paths = [self.root / f'source-{i}.json' for i in range(3)]
+        for path in paths:
+            path.write_text(json.dumps({'value': 'x' * (6 * 1024 * 1024)}))
+        select = lambda value: value
+        files = engine.ReceiptFiles()
+        with patch.object(engine.json, 'loads', wraps=engine.json.loads) as decode:
+            for path in paths:
+                files.json(path, project=select)
+            files.json(paths[0], project=select)
+        self.assertEqual(decode.call_count, 4)
+        self.assertLessEqual(files._projected_bytes, 16 * 1024 * 1024)
+
+    def test_ordinary_sources_do_not_evict_bounded_compact_views(self):
+        selected = [self.root/f'selected-{i}.json' for i in range(2)]
+        ordinary = [self.root/f'ordinary-{i}.json' for i in range(2)]
+        for path in selected:
+            path.write_text(json.dumps({'value': 'x' * (6 * 1024 * 1024)}))
+        for path in ordinary:
+            path.write_text(json.dumps({'padding': 'x' * (8 * 1024 * 1024)}))
+        select = lambda value: value
+        files = engine.ReceiptFiles()
+        with patch.object(engine.json, 'loads', wraps=engine.json.loads) as decode:
+            for path in selected:
+                files.json(path, project=select)
+            for path in ordinary:
+                files.json(path)
+            for path in selected:
+                files.json(path, project=select)
+        self.assertEqual(decode.call_count, 4, 'ordinary reads evicted compact views')
+
     def test_remember_streams_large_ledger_and_keeps_first_exact_line(self):
         path = self.root / 'results.jsonl'
         record = {'manifest_sha256': 'a' * 64, 'job_key': 'target'}

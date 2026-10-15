@@ -2398,6 +2398,8 @@ class ReceiptFiles:
     def __init__(self, *, manifest_path=None):
         self._json = {}
         self._json_bytes = 0
+        self._projected = {}
+        self._projected_bytes = 0
         self._hashes = {}
         self._manifest_path = Path(manifest_path) if manifest_path is not None else None
         self._offsets = {}
@@ -2439,9 +2441,36 @@ class ReceiptFiles:
         self._json[path] = entry
         return entry
 
-    def json(self, path):
+    def _projected_entry(self, path, project):
+        path = Path(path)
+        key = (path, project)
+        stamp = self._stamp(path)
+        entry = self._projected.pop(key, None)
+        if entry is not None:
+            self._projected_bytes -= entry['size']
+        if entry is None or entry['stamp'] != stamp:
+            raw = path.read_bytes()
+            if self._stamp(path) != stamp:
+                raise RunnerError(f'source changed while reading: {path}')
+            value = project(json.loads(raw))
+            if self._stamp(path) != stamp:
+                raise RunnerError(f'source changed while reading: {path}')
+            entry = dict(stamp=stamp, value=value, size=len(_ordered_json_bytes(value)),
+                         sha256=_sha256_bytes(raw))
+        self._hashes[path] = (entry['stamp'], entry['sha256'])
+        if entry['size'] <= 16 * 1024 * 1024:
+            while self._projected_bytes + entry['size'] > 16 * 1024 * 1024:
+                oldest = next(iter(self._projected))
+                self._projected_bytes -= self._projected.pop(oldest)['size']
+            self._projected[key] = entry
+            self._projected_bytes += entry['size']
+        return entry
+
+    def json(self, path, *, project=None):
+        """Cache JSON or a pure selected view; always hash the complete source."""
         with self._lock:
-            return self._entry(path)['value']
+            entry = self._entry(path) if project is None else self._projected_entry(path, project)
+            return entry['value']
 
     def sha256(self, path):
         path = Path(path)
