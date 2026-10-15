@@ -2388,10 +2388,10 @@ def _invoke_model(
 class ReceiptFiles:
     """Operation-scoped file reads and provenance, never receipt verdicts.
 
-    Keep the executing manifest and at most 16 MiB of other JSON source bytes.
-    Evicted JSON is parsed again when needed. File digests retain only a stamp
-    and hash; unchanged files need no repeat parsing or hashing. JSONL retains only
-    line offsets, not every receipt body. Every requested line is read and
+    Keep the executing manifest, one large source and at most 16 MiB of smaller
+    JSON source bytes. Evicted JSON is parsed again when needed. File digests
+    retain only a stamp and hash; unchanged files need no repeat parsing or
+    hashing. JSONL retains only line offsets, not every receipt body. Every requested line is read and
     verified normally. A new operation starts with an empty cache.
     """
 
@@ -2415,7 +2415,8 @@ class ReceiptFiles:
         path = Path(path)
         stamp = self._stamp(path)
         entry = self._json.pop(path, None)
-        if entry is not None and path != self._manifest_path:
+        if (entry is not None and path != self._manifest_path
+                and entry['stamp'][2] <= 16 * 1024 * 1024):
             self._json_bytes -= entry['stamp'][2]
         if entry is None or entry['stamp'] != stamp:
             raw = path.read_bytes()
@@ -2423,14 +2424,19 @@ class ReceiptFiles:
                 raise RunnerError(f'source changed while reading: {path}')
             entry = dict(stamp=stamp, value=json.loads(raw), sha256=_sha256_bytes(raw))
         self._hashes[path] = (entry['stamp'], entry['sha256'])
-        if path == self._manifest_path or stamp[2] <= 16 * 1024 * 1024:
-            if path != self._manifest_path:
+        if path != self._manifest_path:
+            if stamp[2] > 16 * 1024 * 1024:
+                for key in list(self._json):
+                    if key != self._manifest_path and self._json[key]['stamp'][2] > 16 * 1024 * 1024:
+                        del self._json[key]
+            else:
                 while self._json_bytes + stamp[2] > 16 * 1024 * 1024:
-                    oldest = next(key for key in self._json if key != self._manifest_path)
+                    oldest = next(key for key in self._json if key != self._manifest_path
+                                  and self._json[key]['stamp'][2] <= 16 * 1024 * 1024)
                     removed = self._json.pop(oldest)
                     self._json_bytes -= removed['stamp'][2]
                 self._json_bytes += stamp[2]
-            self._json[path] = entry
+        self._json[path] = entry
         return entry
 
     def json(self, path):

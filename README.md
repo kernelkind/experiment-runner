@@ -58,9 +58,12 @@ outside it.
 
 History discovery keeps request keys and original receipt references, then
 releases each historical manifest and receipt body. Source verification lazily
-loads matching evidence through a cache limited to 16 MiB of source-file bytes,
-plus the executing batch's manifest. Evicted JSON is read and parsed again when
-needed. Digest checks keep only file identity, size, timestamps and SHA-256;
+loads matching evidence through a cache holding up to 16 MiB of smaller source
+files, the executing batch's manifest, and one larger source file. A different
+large source evicts the previous one; small reads do not. This avoids reparsing
+one large historical manifest for every reused answer without retaining every
+historical manifest. Evicted JSON is read and parsed again when needed.
+Digest checks keep only file identity, size, timestamps and SHA-256;
 unchanged files need no repeated parsing or hashing, even above the JSON cache
 limit. Changed files are hashed in 1 MiB chunks and checked for changes during
 that read. Verified JSON reads populate the same digest metadata. This is a

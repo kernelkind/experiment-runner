@@ -148,10 +148,52 @@ class ReceiptMemoryTests(unittest.TestCase):
         path.write_text(json.dumps({'padding': 'x' * (17 * 1024 * 1024)}))
         files = engine.ReceiptFiles()
         self.assertEqual(len(files.json(path)['padding']), 17 * 1024 * 1024)
+        other = self.root / 'other-large.json'
+        other.write_text(json.dumps({'padding': 'y' * (17 * 1024 * 1024)}))
+        files.json(other)
         expected = engine._sha256_file(path)
         with patch.object(engine, '_sha256_file', side_effect=AssertionError('verified JSON was hashed again')), \
                 patch.object(engine.json, 'loads', side_effect=AssertionError('verified JSON was parsed again')):
             self.assertEqual(files.sha256(path), expected)
+
+    def test_large_source_reuse_is_bounded_and_retains_small_sources(self):
+        paths = [self.root / name for name in ('current.json', 'first.json', 'second.json')]
+        for path in paths:
+            path.write_text(json.dumps({'padding': 'x' * (17 * 1024 * 1024)}))
+        small = self.root / 'small.json'
+        small.write_text('{"value": 1}')
+        files = engine.ReceiptFiles(manifest_path=paths[0])
+        reads = {}
+        read_bytes = Path.read_bytes
+
+        def counted(path, *args, **kwargs):
+            reads[path] = reads.get(path, 0) + 1
+            return read_bytes(path, *args, **kwargs)
+
+        tracemalloc.start()
+        try:
+            with patch.object(Path, 'read_bytes', counted):
+                files.json(paths[0])
+                for _ in range(3):
+                    self.assertEqual(files.json(paths[1])['padding'][0], 'x')
+                    self.assertEqual(files.json(small), {'value': 1})
+                self.assertEqual(reads[paths[1]], 1)
+                self.assertEqual(reads[small], 1)
+                files.json(paths[2])
+                files.json(paths[1])
+                files.json(paths[0])
+                files.json(small)
+            retained, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(reads[paths[0]], 1, 'source eviction dropped the executing manifest')
+        self.assertEqual(reads[paths[1]], 2, 'multiple large sources were retained')
+        self.assertEqual(reads[small], 1, 'large sources evicted small sources')
+        self.assertLess(retained, 40 * 1024 * 1024, 'large source retention grew without a bound')
+        self.assertLess(peak, 128 * 1024 * 1024)
+        paths[1].write_text(json.dumps({'padding': 'y' * (17 * 1024 * 1024)}))
+        self.assertEqual(files.json(paths[1])['padding'][0], 'y')
+        self.assertEqual(files.sha256(paths[1]), engine._sha256_file(paths[1]))
 
     def test_first_match_index_checks_exact_bytes_even_for_hash_collisions(self):
         path = self.root / 'results.jsonl'

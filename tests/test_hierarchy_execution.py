@@ -1,6 +1,7 @@
 """Hierarchy clients exercise the shared executor with local transport fixtures."""
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from itertools import islice
 import json
 import os
 from pathlib import Path
@@ -230,20 +231,26 @@ class HierarchyExecutionTests(unittest.TestCase):
         self.assertLessEqual(reads, 2, 'report reread the large manifest for each receipt')
         self.assertLess(peak, 512 * 1024 * 1024, 'report retained repeated manifest copies')
         results_path = self.root / 'E1/run/results.jsonl'
-        with results_path.open('rb') as stream:
-            raw = stream.readline()
-        record = json.loads(raw)
         manifest = json.loads(manifest_path.read_text())
-        prompt = next(p for p in manifest['prompts'] if p['prompt_id'] == record['note_id'])
-        reference = {'results_path': str(results_path), 'result_line': 1,
-                     'result_sha256': engine._sha256_bytes(raw),
-                     'manifest_sha256': record['manifest_sha256']}
+        with results_path.open('rb') as stream:
+            receipts = list(islice(stream, 3))
+        files = engine.ReceiptFiles()
         reads = 0
         with patch.object(Path, 'read_bytes', counted):
-            original = engine._read_request_source(reference,
-                engine._prompt_request_key(manifest, prompt['text']), files=engine.ReceiptFiles())
-        self.assertEqual(original, record)
-        self.assertEqual(reads, 1, 'source verification parsed its large manifest twice')
+            for number, raw in enumerate(receipts, 1):
+                record = json.loads(raw)
+                prompt = next(p for p in manifest['prompts'] if p['prompt_id'] == record['note_id'])
+                reference = {'results_path': str(results_path), 'result_line': number,
+                             'result_sha256': engine._sha256_bytes(raw),
+                             'manifest_sha256': record['manifest_sha256']}
+                request_key = engine._prompt_request_key(manifest, prompt['text'])
+                original = engine._read_request_source(reference, request_key, files=files)
+                self.assertEqual(original, record)
+        self.assertEqual(reads, 1, 'source verification reparsed its large manifest per receipt')
+        manifest['prompts'][0]['text'] += ' changed'
+        manifest_path.write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(engine.RunnerError, 'cannot verify request history source'):
+            engine._read_request_source(reference, request_key, files=files)
 
     def test_history_discovery_retains_references_without_historical_prompt_bodies(self):
         from experiment_runner import extraction_pipeline as engine
