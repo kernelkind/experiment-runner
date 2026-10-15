@@ -462,9 +462,10 @@ This selects the worker only for the new experiment; it does not resume or
 rewrite the previous experiment.
 
 Oracle's old Python/shell/Node entry points delegate to this package.
-`EXPERIMENT_RUNNER_ROOT` can select another checkout for compatibility callers;
-the shared `main` checkout is the standard. A project worktree itself does not
-select a runner revision.
+`EXPERIMENT_RUNNER_ROOT` can select another checkout for the source launcher and
+compatibility callers; an invalid explicit root fails without fallback. The
+shared `main` checkout is the standard. A project worktree itself does not select
+a runner revision.
 
 Related offline evidence checks can use `experiment.report_scope()` to share
 parsed files, frozen plan validation and receipt indexes. File identity, size,

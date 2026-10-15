@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """Source-checkout entry point; installed packages expose the same CLI."""
 from pathlib import Path
+import os
 import sys
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+explicit = os.environ.get('EXPERIMENT_RUNNER_ROOT')
+root = Path(explicit).expanduser().resolve() if explicit else Path(__file__).resolve().parents[1]
+if explicit and not (root / 'experiment_runner/__init__.py').is_file():
+    raise SystemExit('EXPERIMENT_RUNNER_ROOT must name an experiment-runner checkout')
+sys.path.insert(0, str(root))
 from experiment_runner.cli import main
 
 raise SystemExit(main())

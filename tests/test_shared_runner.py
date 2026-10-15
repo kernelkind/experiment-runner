@@ -23,6 +23,39 @@ class SharedRunnerTests(unittest.TestCase):
         environment.start()
         self.addCleanup(environment.stop)
 
+    def test_source_launcher_selects_explicit_runner_before_importing(self):
+        from experiment_runner import __version__
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            alternate = root / 'isolated runner'
+            shutil.copytree(ROOT / 'experiment_runner', alternate / 'experiment_runner',
+                            ignore=shutil.ignore_patterns('__pycache__'))
+            with (alternate / 'experiment_runner/__init__.py').open('a') as stream:
+                stream.write("\n__version__ = 'isolated-checkout-test'\n")
+            environment = {**os.environ, 'EXPERIMENT_RUNNER_ROOT': alternate.name}
+            selected = subprocess.run([str(CLI), '--version'], cwd=root, env=environment,
+                                      capture_output=True, text=True, timeout=30)
+            self.assertEqual(selected.returncode, 0, selected.stderr)
+            self.assertEqual(selected.stdout.strip(), 'isolated-checkout-test')
+            environment.pop('EXPERIMENT_RUNNER_ROOT')
+            default = subprocess.run([str(CLI), '--version'], cwd=root, env=environment,
+                                     capture_output=True, text=True, timeout=30)
+            self.assertEqual(default.returncode, 0, default.stderr)
+            self.assertEqual(default.stdout.strip(), __version__)
+
+    def test_source_launcher_rejects_invalid_explicit_root_without_fallback(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for explicit in (root, root / 'missing'):
+                with self.subTest(root=explicit):
+                    result = subprocess.run([str(CLI), '--version'], cwd=root,
+                        env={**os.environ, 'EXPERIMENT_RUNNER_ROOT': str(explicit)},
+                        capture_output=True, text=True, timeout=30)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(result.stdout, '')
+                    self.assertIn('EXPERIMENT_RUNNER_ROOT must name an experiment-runner checkout', result.stderr)
+                    self.assertNotIn('Traceback', result.stderr)
+
     def test_project_prompt_sources_are_frozen_and_prompt_overrides_are_checked(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
