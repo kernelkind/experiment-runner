@@ -11,4 +11,5 @@ if explicit and not (root / 'experiment_runner/__init__.py').is_file():
 sys.path.insert(0, str(root))
 from experiment_runner.cli import main
 
-raise SystemExit(main())
+if __name__ == '__main__':
+    raise SystemExit(main())

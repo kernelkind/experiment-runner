@@ -43,6 +43,28 @@ class SharedRunnerTests(unittest.TestCase):
             self.assertEqual(default.returncode, 0, default.stderr)
             self.assertEqual(default.stdout.strip(), __version__)
 
+    def test_source_launcher_allows_spawned_cpu_workers(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'adapter.py').write_text('from experiment_runner.inputs import *\n')
+            (root / 'extension.py').write_text(
+                'import json, multiprocessing\n'
+                'from concurrent.futures import ProcessPoolExecutor\n'
+                'def code_files(dataset):\n    return {}\n'
+                'def add_commands(commands):\n    commands.add_parser("cpu-fixture")\n'
+                'def handle_command(args):\n'
+                '    if args.command != "cpu-fixture":\n        return NotImplemented\n'
+                '    with ProcessPoolExecutor(max_workers=2, '
+                'mp_context=multiprocessing.get_context("spawn")) as pool:\n'
+                '        print(json.dumps(list(pool.map(abs, [-3, -4]))))\n'
+                '    return 0\n')
+            (root / 'experiment-runner.json').write_text(json.dumps(
+                {'schema_version': 1, 'inputs': 'adapter', 'extension': 'extension'}))
+            result = subprocess.run([str(CLI), '--project-root', str(root), 'cpu-fixture'],
+                                    cwd=root, capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout), [3, 4])
+
     def test_source_launcher_rejects_invalid_explicit_root_without_fallback(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
