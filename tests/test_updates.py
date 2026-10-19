@@ -14,6 +14,28 @@ CLI = ROOT / 'bin/experiment-runner'
 
 
 class UpdateTests(unittest.TestCase):
+    def test_relocated_verification_checks_worker_upgrade_prefix(self):
+        self.prepare()
+        self.cli('run', 'E1', '--only', '0', '--attempt-budget', str(self.budget))
+        self.worker.write_text(self.worker.read_text().replace('"e" * 64', '"a" * 64'))
+        self.cli('run', 'E1', '--attempt-budget', str(self.budget))
+        paths = list(self.root.iterdir())
+        extracted = self.root / 'extracted'
+        extracted.mkdir()
+        for path in paths:
+            shutil.move(path, extracted / path.name)
+        locations = self.root / 'locations.json'
+        locations.write_text(json.dumps({'schema_version': 1,
+            'roots': {str(self.root): 'extracted'}, 'files': {}}))
+        result = self.cli('verify', 'extracted/E1', '--locations', locations, '--json')
+        self.assertEqual(json.loads(result.stdout)['verified_receipts'], 2)
+        history = extracted / 'E1/run/worker-upgrades.jsonl'
+        row = json.loads(history.read_text())
+        row['results_prefix_sha256'] = '0' * 64
+        history.write_text(json.dumps(row) + '\n')
+        result = self.cli('verify', 'extracted/E1', '--locations', locations, succeeds=False)
+        self.assertIn('invalid worker upgrade history', result.stderr)
+
     def test_verified_error_observation_update_preserves_saved_answers_and_budget(self):
         previous = '15429b548cf904622a33bdad86c20d523da097c1956cc736ebbb2a513ded9018'
         following = '633e80636537f433fee2a578825fedf0d126a03d898cf33cc16fdbc26b6e5e99'
@@ -322,6 +344,8 @@ class UpdateTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         scheduler = release / 'experiment_runner/scheduling.py'
         scheduler.write_text(scheduler.read_text() + '\n# Scheduling-only maintenance.\n')
+        verifier = release / 'experiment_runner/verification.py'
+        verifier.write_text(verifier.read_text() + '\n# Read-only verification maintenance.\n')
         result = subprocess.run(command, cwd=self.root, env=self.env,
                                 text=True, capture_output=True, timeout=15)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

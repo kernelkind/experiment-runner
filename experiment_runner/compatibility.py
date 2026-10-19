@@ -6,7 +6,7 @@ from pathlib import Path
 
 OPERATIONAL_FILES = frozenset({
     '__init__.py', 'cli.py', 'experiment.py', 'extraction_pipeline.py',
-    'provider_backoff.py', 'scheduling.py', 'compatibility.py',
+    'provider_backoff.py', 'scheduling.py', 'compatibility.py', 'verification.py',
 })
 
 
@@ -33,9 +33,9 @@ def compatible(original, current):
             or previous is not None and previous == following)
 
 
-def _results_prefix(directory, size=None):
+def _results_prefix(directory, size=None, *, locate=Path):
     """Hash exactly the saved byte prefix without retaining receipt bodies."""
-    path = Path(directory) / 'results.jsonl'
+    path = locate(Path(directory) / 'results.jsonl')
     digest = hashlib.sha256()
     length = 0
     line_breaks = 0
@@ -60,24 +60,24 @@ def _results_prefix(directory, size=None):
     return length, digest.hexdigest(), lines, last == b'\n'
 
 
-def worker_history(directory, manifest):
+def worker_history(directory, manifest, *, locate=Path):
     """Verify transitions against the immutable manifest and prior receipt prefix."""
     directory = Path(directory)
-    path = directory / 'worker-upgrades.jsonl'
+    path = locate(directory / 'worker-upgrades.jsonl')
     original = {k: manifest[k] for k in ('runner_version', 'runner_sha256')}
     if 'request_code_sha256' in manifest:
         original['request_code_sha256'] = manifest['request_code_sha256']
     identities = [original]
     if not path.exists():
         return identities
-    digest = hashlib.sha256((directory / 'manifest.json').read_bytes()).hexdigest()
+    digest = hashlib.sha256(locate(directory / 'manifest.json').read_bytes()).hexdigest()
     last_size = 0
     for line in path.read_text().splitlines():
         row = json.loads(line)
         size = row['results_prefix_bytes']
         if (row['manifest_sha256'] != digest or row['from'] != identities[-1]
                 or type(size) is not int or size < last_size
-                or _results_prefix(directory, size)[1] != row['results_prefix_sha256']
+                or _results_prefix(directory, size, locate=locate)[1] != row['results_prefix_sha256']
                 or not compatible(original, row['to'])):
             raise ValueError('invalid worker upgrade history')
         identities.append(row['to'])

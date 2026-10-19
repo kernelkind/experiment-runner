@@ -657,12 +657,12 @@ def _runner_environment() -> dict[str, str]:
     }
 
 
-def _runtime_options(value: dict[str, Any], base: Path) -> dict[str, Any]:
+def _runtime_options(value: dict[str, Any], base: Path, *, resolve_path=_resolve_path) -> dict[str, Any]:
     provider = _expect_identifier(value.get("provider"), "config.provider")
     if provider not in {"openai-codex", "openrouter", "local"}:
         raise RunnerError("provider must be openai-codex, openrouter or local")
     auth = value.get("auth_file")
-    auth_file = None if auth is None else _resolve_path(auth, "auth_file", base)
+    auth_file = None if auth is None else resolve_path(auth, "auth_file", base)
     if provider == "local" and auth_file is not None:
         raise RunnerError("local model requests do not use credentials")
     if provider == "openrouter" and auth_file is not None:
@@ -951,8 +951,16 @@ class PromptRunnerConfig:
     prompt_cache_prefix: str | None = None
 
     @classmethod
-    def load(cls, path: Path, *, files=None) -> "PromptRunnerConfig":
-        config_path = path.expanduser().resolve()
+    def load(cls, path: Path, *, files=None, saved=False) -> "PromptRunnerConfig":
+        # Saved absolute paths are invocation identity, not local runtime files.
+        # Verification must neither follow old symlinks nor require the executable.
+        def saved_path(value, name, base):
+            result = Path(_expect_string(value, name))
+            if not result.is_absolute():
+                raise RunnerError(f"saved {name} must be an absolute path")
+            return result
+        resolve_path = saved_path if saved else _resolve_path
+        config_path = Path(path) if saved else path.expanduser().resolve()
         base = config_path.parent
         value = _expect_object(files.json(config_path) if files is not None
                                else _load_json(config_path, "config"), "config")
@@ -1010,11 +1018,11 @@ class PromptRunnerConfig:
             )
         config = cls(
             config_path=config_path,
-            runner_binary=_resolve_executable(
+            runner_binary=(saved_path if saved else _resolve_executable)(
                 value["runner_binary"], "runner_binary", base
             ),
-            **_runtime_options(value, base),
-            run_directory=_resolve_path(value["run_directory"], "run_directory", base),
+            **_runtime_options(value, base, resolve_path=resolve_path),
+            run_directory=resolve_path(value["run_directory"], "run_directory", base),
             model=_expect_identifier(value["model"], "config.model"),
             reasoning_effort=_expect_identifier(
                 value["reasoning_effort"], "config.reasoning_effort"
@@ -1239,8 +1247,9 @@ def _load_runner_upgrades(
     *,
     manifest_sha256: str,
     initial_wrapper_sha256: str,
+    locate=Path,
 ) -> RunnerProvenance:
-    path = run_directory / "runner-upgrades.jsonl"
+    path = locate(run_directory / "runner-upgrades.jsonl")
     if not path.exists():
         return RunnerProvenance(initial_wrapper_sha256, initial_wrapper_sha256, ())
     try:
@@ -1251,7 +1260,7 @@ def _load_runner_upgrades(
         ) from error
     current_wrapper = initial_wrapper_sha256
     previous_first_result_line = 0
-    result_size, _, result_line_count, _ = compatibility._results_prefix(run_directory)
+    result_size, _, result_line_count, _ = compatibility._results_prefix(run_directory, locate=locate)
     boundaries: list[tuple[int, str]] = []
     for line_number, line in enumerate(lines, start=1):
         try:
@@ -1312,7 +1321,7 @@ def _load_runner_upgrades(
                 f"runner upgrade ledger line {line_number} has invalid first_result_line"
             )
         _, prefix_sha256, prefix_line_count, prefix_terminated = compatibility._results_prefix(
-            run_directory, prefix_bytes)
+            run_directory, prefix_bytes, locate=locate)
         if (
             _expect_sha256(
                 record["results_prefix_sha256"],
@@ -1480,7 +1489,7 @@ def _iter_results(
     *, evidence=None,
 ):
     """Validate the complete ledger while retaining only prior attempt numbers."""
-    if not path.exists():
+    if evidence is None and not path.exists():
         return
     attempts = {}
     def stream_rows():
@@ -2429,9 +2438,10 @@ class ReceiptFiles:
     verified normally. A new operation starts with an empty cache.
     """
 
-    def __init__(self, *, manifest_path=None, projected_cache_bytes=16 * 1024 * 1024):
+    def __init__(self, *, manifest_path=None, projected_cache_bytes=16 * 1024 * 1024, locate=Path):
         if type(projected_cache_bytes) is not int or projected_cache_bytes < 1:
             raise ValueError('projected_cache_bytes must be a positive integer')
+        self.locate = locate
         self._json = {}
         self._json_bytes = 0
         self._projected = {}
@@ -2445,9 +2455,8 @@ class ReceiptFiles:
         self._worker_upgrades = {}
         self._lock = threading.RLock()
 
-    @staticmethod
-    def _stamp(path):
-        info = path.stat()
+    def _stamp(self, path):
+        info = self.locate(path).stat()
         return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
 
     def _entry(self, path):
@@ -2465,7 +2474,7 @@ class ReceiptFiles:
                 for key in list(self._json):
                     if key != self._manifest_path and self._json[key]['stamp'][2] > 16 * 1024 * 1024:
                         del self._json[key]
-            raw = path.read_bytes()
+            raw = self.locate(path).read_bytes()
             if self._stamp(path) != stamp:
                 raise RunnerError(f'source changed while reading: {path}')
             entry = dict(stamp=stamp, value=json.loads(raw), sha256=_sha256_bytes(raw))
@@ -2489,7 +2498,7 @@ class ReceiptFiles:
         if entry is not None:
             self._projected_bytes -= entry['size']
         if entry is None or entry['stamp'] != stamp:
-            raw = path.read_bytes()
+            raw = self.locate(path).read_bytes()
             if self._stamp(path) != stamp:
                 raise RunnerError(f'source changed while reading: {path}')
             value = project(json.loads(raw))
@@ -2519,7 +2528,7 @@ class ReceiptFiles:
             cached = self._hashes.get(path)
             if cached is not None and cached[0] == stamp:
                 return cached[1]
-            digest = _sha256_file(path)
+            digest = _sha256_file(self.locate(path))
             if self._stamp(path) != stamp:
                 raise RunnerError(f'source changed while hashing: {path}')
             self._hashes[path] = (stamp, digest)
@@ -2539,7 +2548,7 @@ class ReceiptFiles:
         with self._lock:
             stamp = self._stamp(path)
             offsets, offset = [], 0
-            with path.open('rb') as stream:
+            with self.locate(path).open('rb') as stream:
                 for line in stream:
                     offsets.append(offset)
                     offset += len(line)
@@ -2558,17 +2567,17 @@ class ReceiptFiles:
                     pass
             indexed = self._offsets.get(path)
             if indexed is None or indexed[0] != stamp:
-                with path.open('rb') as stream:
+                with self.locate(path).open('rb') as stream:
                     return next(line for i, line in enumerate(stream, 1) if i == number)
             if type(number) is not int or not 1 <= number <= len(indexed[1]):
                 raise RunnerError('request history source line is missing')
-            with path.open('rb') as stream:
+            with self.locate(path).open('rb') as stream:
                 stream.seek(indexed[1][number - 1])
                 line = stream.readline()
             if self._stamp(path) != stamp:
                 # A concurrently appended/replaced source must be read by line
                 # number again; the caller still verifies the exact line hash.
-                with path.open('rb') as stream:
+                with self.locate(path).open('rb') as stream:
                     return next(line for i, line in enumerate(stream, 1) if i == number)
             return line
 
@@ -2578,7 +2587,7 @@ class ReceiptFiles:
         if entry is not None and entry['stamp'] == stamp:
             return entry
         first, offset, count, terminated = {}, 0, 0, True
-        with path.open('rb') as stream:
+        with self.locate(path).open('rb') as stream:
             for count, line in enumerate(stream, 1):
                 first.setdefault(_sha256_bytes(line), (count, offset))
                 offset += len(line)
@@ -2612,7 +2621,7 @@ class ReceiptFiles:
             number, offset = entry['first'].get(_sha256_bytes(expected), (None, None))
             if number is None:
                 raise StopIteration
-            with path.open('rb') as stream:
+            with self.locate(path).open('rb') as stream:
                 stream.seek(offset)
                 line = stream.readline()
             if self._stamp(path) != entry['stamp']:
@@ -2621,7 +2630,7 @@ class ReceiptFiles:
                 return number
             # A hash candidate is not an equality verdict. Preserve first-exact
             # semantics even if distinct lines ever share the same digest.
-            with path.open('rb') as stream:
+            with self.locate(path).open('rb') as stream:
                 number = next(i for i, line in enumerate(stream, 1) if line == expected)
             if self._stamp(path) != entry['stamp']:
                 raise RunnerError(f'source changed while reading: {path}')
@@ -2630,14 +2639,14 @@ class ReceiptFiles:
     def provenance(self, directory, *, manifest_sha256, initial_wrapper_sha256):
         with self._lock:
             paths = [directory/'runner-upgrades.jsonl', directory/'results.jsonl']
-            stamps = tuple(self._stamp(p) if p.exists() else None for p in paths)
+            stamps = tuple(self._stamp(p) if self.locate(p).exists() else None for p in paths)
             key = (directory, manifest_sha256, initial_wrapper_sha256)
             saved = self._upgrades.get(key)
             if saved is None or saved[0] != stamps:
                 value = _load_runner_upgrades(directory, manifest_sha256=manifest_sha256,
-                                             initial_wrapper_sha256=initial_wrapper_sha256)
+                                             initial_wrapper_sha256=initial_wrapper_sha256, locate=self.locate)
                 saved = (stamps, value)
-                if stamps == tuple(self._stamp(p) if p.exists() else None for p in paths):
+                if stamps == tuple(self._stamp(p) if self.locate(p).exists() else None for p in paths):
                     self._upgrades[key] = saved
             return saved[1]
 
@@ -2645,11 +2654,11 @@ class ReceiptFiles:
         with self._lock:
             directory = Path(directory)
             paths = [directory / name for name in ('manifest.json', 'worker-upgrades.jsonl', 'results.jsonl')]
-            stamps = tuple(self._stamp(p) if p.exists() else None for p in paths)
+            stamps = tuple(self._stamp(p) if self.locate(p).exists() else None for p in paths)
             saved = self._worker_upgrades.get(directory)
             if saved is None or saved[0] != stamps:
-                saved = (stamps, compatibility.worker_history(directory, manifest))
-                if stamps == tuple(self._stamp(p) if p.exists() else None for p in paths):
+                saved = (stamps, compatibility.worker_history(directory, manifest, locate=self.locate))
+                if stamps == tuple(self._stamp(p) if self.locate(p).exists() else None for p in paths):
                     self._worker_upgrades[directory] = saved
             return saved[1]
 

@@ -1759,6 +1759,10 @@ Example from your project checkout (replace the spec and destination):
     p.add_argument("--max-request-cost-usd", type=float,
                    help="caller-verified maximum cost reserved for each in-flight call; required with --max-cost-usd")
     p.add_argument("--runner-upgrade-reason", help="approve project adapter/evaluator upgrades; compatible runner updates are automatic, incompatible requests remain refused")
+    p = commands.add_parser('verify', help='check saved prompt evidence; no inference or writes')
+    p.add_argument('experiment', type=Path)
+    p.add_argument('--locations', type=Path, help='JSON mapping original paths to extracted files')
+    p.add_argument('--json', action='store_true')
     p = commands.add_parser('pause', help='stop new admissions for one run; active requests finish normally',
         formatter_class=argparse.RawDescriptionHelpFormatter, epilog=queue_help)
     p.add_argument('experiment', type=Path)
@@ -1853,6 +1857,10 @@ def main(argv=None):
                 return 0
             return int(any(case['status'] in ('malformed', 'invalid_receipt', 'failed', 'unrun')
                            for case in result['cases'] if args.only is None or case['id'] in args.only))
+        elif args.command == 'verify':
+            from .verification import verify, summary
+            result = verify(args.experiment, args.locations)
+            print(json.dumps(result, indent=2) if args.json else summary(result))
         elif args.command == 'pause':
             from .scheduling import pause
             _, config, _ = load(args.experiment.resolve())

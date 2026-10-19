@@ -562,6 +562,61 @@ of the entire document; file flush, fsync and atomic replacement still precede
 publication. Parsed inputs and report evidence still require memory, so these
 changes do not replace a workload memory limit.
 
+## Verify saved experiments after moving files
+
+`verify` checks a native prompt experiment without credentials, an installed
+model worker, inference or changes to the evidence. It checks the frozen plan,
+prepared-file and source hashes, manifest, ledger sequence and provenance, and
+every successful response receipt. Reused responses are checked against their
+original producer receipts. It retains the original path strings and hashes.
+
+When the evidence has moved, create a separate `locations.json`:
+
+```json
+{
+  "schema_version": 1,
+  "roots": {"/old/project": "evidence/project"},
+  "files": {"/old/project/posts.json": "datasets/posts.json"}
+}
+```
+
+Replace these example paths with the paths recorded in the experiment and their
+extracted locations. Destinations are relative to `locations.json`, or absolute.
+An exact `files` entry overrides a `roots` entry; the longest matching root wins.
+With a locations file supplied, an unmapped path fails rather than falling back
+to the original machine. Missing extracted files and mismatched hashes also fail.
+Include the producers of reused answers and their manifests and upgrade ledgers.
+Frozen source bindings may require a historical prompt/specification, rather
+than its current version. Do not map credentials or the old runner executable;
+neither is read.
+
+From an experiment-runner checkout, with the example extraction under `release/`:
+
+```bash
+cd "$EXPERIMENT_RUNNER_ROOT"
+bin/experiment-runner verify release/evidence/project/trial \
+  --locations release/locations.json
+```
+
+Omit `--locations` when the files remain at their original locations. Add `--json`
+for the plan hash, checked-source and receipt counts, and latest case statuses.
+Exit status zero means the integrity checks passed, even if some cases failed or
+never ran. These counts distinguish failed attempts, unrun cases and saved
+mechanical decisions from verified successful receipts. Failed attempts receive
+ledger provenance/sequence checks; their payloads are not verified as successful
+responses. Mechanical decisions and answer quality are not reevaluated.
+
+First check the release archive checksums: internal hashes alone cannot establish
+the completeness or authenticity of a collection. `verify` does not check every
+file in an archive, reconstruct aggregates, verify all transitive adapter
+evidence, or recover historical code from the plan's code hashes. Review notes,
+cost reconciliation and whole hierarchy/training outputs are outside this check.
+It streams source hashes and receipt ledgers, but loads the selected plan,
+configuration and manifests as JSON; memory therefore grows with the selected
+experiment's size. Verify individual child prompt experiments for a large build.
+Path mappings apply only to `verify`; `run`, `show`, `collect` and `prepare --from`
+keep their existing path behavior.
+
 ## Update the shared binary after code merges
 
 After **every code change merged into local `main`**, verify that the shared
