@@ -564,58 +564,85 @@ changes do not replace a workload memory limit.
 
 ## Verify saved experiments after moving files
 
-`verify` checks a native prompt experiment without credentials, an installed
-model worker, inference or changes to the evidence. It checks the frozen plan,
-prepared-file and source hashes, manifest, ledger sequence and provenance, and
-every successful response receipt. Reused responses are checked against their
-original producer receipts. It retains the original path strings and hashes.
+Extract the evidence package with its directory structure intact, then pass the
+experiment directory to `verify`:
 
-When the evidence has moved, create a separate `locations.json`:
+```bash
+cd "$EXPERIMENT_RUNNER_ROOT"
+bin/experiment-runner verify release/evidence/project/trial
+```
+
+The command finds the nearest `experiment-locations.json` in the experiment's
+parent directories. Published packages supply this file; readers do not create
+or edit it. Its destinations must stay inside the extraction root. Missing or
+invalid bundled entries fail without falling back to the original machine.
+For an experiment still at its original location, no metadata is needed.
+
+`verify` checks the frozen plan, prepared-file and source hashes, manifest,
+ledger sequence and provenance, and every successful response receipt. Reused
+responses are checked against their original producer receipts. It retains the
+original path strings and hashes, makes no model calls or evidence changes, and
+requires neither credentials nor an installed model worker.
+
+Add `--json` for the plan hash, checked-source and receipt counts, and latest
+case statuses. Exit status zero means the integrity checks passed, even if some
+cases failed or never ran. Failed attempts receive ledger provenance/sequence
+checks, not successful-response checks. Mechanical decisions and answer quality
+are not reevaluated.
+
+Check archive checksums first: internal hashes do not establish a collection's
+completeness or authenticity. Verification does not reconstruct aggregates,
+verify all transitive adapter evidence, recover historical code, or evaluate
+review notes, reconciled costs or whole hierarchy/training outputs. It streams
+source hashes and receipt ledgers, but loads the selected plan, configuration
+and manifests as JSON. Verify individual child experiments for a large build.
+Bundled locations apply only to `verify`; `run`, `show`, `collect` and
+`prepare --from` keep their existing path behavior.
+
+### Prepare locations for publication
+
+Publishers stage the selected experiments and dependencies before making an
+archive. Include bound historical sources and the original receipts, manifests
+and upgrade ledgers needed by reused answers. Preserve the frozen bytes.
+
+Keep the original-to-staged locations used during copying in a private file
+outside the archive. For example, `locations-private.json` beside `release/`:
 
 ```json
 {
   "schema_version": 1,
-  "roots": {"/old/project": "evidence/project"},
-  "files": {"/old/project/posts.json": "datasets/posts.json"}
+  "roots": {"/old/project": "release/evidence/project"},
+  "files": {"/old/project/posts.json": "release/datasets/posts.json"}
 }
 ```
 
-Replace these example paths with the paths recorded in the experiment and their
-extracted locations. Destinations are relative to `locations.json`, or absolute.
-An exact `files` entry overrides a `roots` entry; the longest matching root wins.
-With a locations file supplied, an unmapped path fails rather than falling back
-to the original machine. Missing extracted files and mismatched hashes also fail.
-Include the producers of reused answers and their manifests and upgrade ledgers.
-Frozen source bindings may require a historical prompt/specification, rather
-than its current version. Do not map credentials or the old runner executable;
-neither is read.
-
-From an experiment-runner checkout, with the example extraction under `release/`:
+Destinations in this private file are relative to the file, or absolute. Exact
+file entries override roots; the longest matching root wins. This allows a
+corpus to occupy a shared dataset location. Use the actual paths from staging.
+Credentials and the old runner executable are not verification dependencies.
 
 ```bash
 cd "$EXPERIMENT_RUNNER_ROOT"
-bin/experiment-runner verify release/evidence/project/trial \
-  --locations release/locations.json
+bin/experiment-runner prepare-release release \
+  --locations locations-private.json \
+  --experiment evidence/project/trial
 ```
 
-Omit `--locations` when the files remain at their original locations. Add `--json`
-for the plan hash, checked-source and receipt counts, and latest case statuses.
-Exit status zero means the integrity checks passed, even if some cases failed or
-never ran. These counts distinguish failed attempts, unrun cases and saved
-mechanical decisions from verified successful receipts. Failed attempts receive
-ledger provenance/sequence checks; their payloads are not verified as successful
-responses. Mechanical decisions and answer quality are not reevaluated.
+Repeat `--experiment` for all selected experiments sharing the extraction root.
+The command verifies the staged evidence, sharing source hashes across those
+experiments, then writes `release/experiment-locations.json`. It includes only
+used bindings, with relative destinations inside that root. External
+dependencies and changed or missing evidence fail before metadata is written.
+Existing metadata is never overwritten. A successful check can still include
+failed and unrun cases; it does not make them successful experiments.
 
-First check the release archive checksums: internal hashes alone cannot establish
-the completeness or authenticity of a collection. `verify` does not check every
-file in an archive, reconstruct aggregates, verify all transitive adapter
-evidence, or recover historical code from the plan's code hashes. Review notes,
-cost reconciliation and whole hierarchy/training outputs are outside this check.
-It streams source hashes and receipt ledgers, but loads the selected plan,
-configuration and manifests as JSON; memory therefore grows with the selected
-experiment's size. Verify individual child prompt experiments for a large build.
-Path mappings apply only to `verify`; `run`, `show`, `collect` and `prepare --from`
-keep their existing path behavior.
+Include the generated file in the archive and its checksums; keep the private
+staging file outside it. Split archives sharing an extraction root must supply
+the same complete metadata, rather than overwriting it with partial mappings.
+Test after extraction elsewhere, without `--locations` or original storage.
+This command prepares metadata; archive selection, copying and compression
+remain publisher steps. Explicit `verify --locations FILE` remains available
+for publisher checks and overrides automatic lookup.
 
 ## Update the shared binary after code merges
 

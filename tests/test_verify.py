@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import tarfile
 import tempfile
 import unittest
 
@@ -75,6 +76,115 @@ class VerifyTests(unittest.TestCase):
             self.assertEqual(report['reused_receipts'], int(name == 'reuse'))
         self.assertEqual(self.snapshot(), before)
         self.assertEqual((self.root / 'calls.json').read_bytes(), calls)
+
+    def test_release_preparation_bundles_locations_for_extraction_elsewhere(self):
+        before = self.snapshot()
+        calls = (self.root / 'calls.json').read_bytes()
+        result = self.cli('prepare-release', self.extracted,
+                          '--locations', self.locations,
+                          '--experiment', 'source', '--experiment', 'reuse')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        metadata = self.extracted / 'experiment-locations.json'
+        self.assertTrue(metadata.is_file())
+        locations = json.loads(metadata.read_text())
+        self.assertEqual(locations['roots'], {})
+        self.assertNotIn(str(self.original / 'runner'), locations['files'])
+        self.assertTrue(all(not Path(p).is_absolute() for p in locations['files'].values()))
+        for relative, digest in before.items():
+            self.assertEqual(hashlib.sha256((self.extracted / relative).read_bytes()).hexdigest(), digest)
+        archive = self.root / 'release.tar.gz'
+        with tarfile.open(archive, 'w:gz') as stream:
+            stream.add(self.extracted, arcname='evidence')
+        downloaded = self.root / 'downloaded'
+        with tarfile.open(archive) as stream:
+            stream.extractall(downloaded, filter='data')
+        shutil.rmtree(self.extracted)
+        self.locations.unlink()
+        for name in ('source', 'reuse'):
+            result = self.cli('verify', downloaded / 'evidence' / name, '--json')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            report = json.loads(result.stdout)
+            self.assertEqual(report['verified_receipts'], 1)
+            self.assertEqual(report['reused_receipts'], int(name == 'reuse'))
+        self.assertEqual((self.root / 'calls.json').read_bytes(), calls)
+
+    def prepare_release(self, *names):
+        arguments = ['prepare-release', self.extracted, '--locations', self.locations]
+        for name in names or ('reuse',):
+            arguments.extend(('--experiment', name))
+        return self.cli(*arguments)
+
+    def test_release_preparation_rejects_external_inputs_and_local_file_symlinks(self):
+        source = self.extracted / 'cases.json'
+        outside = self.root / 'outside-cases.json'
+        shutil.move(source, outside)
+        locations = json.loads(self.locations.read_text())
+        locations['files'][str(self.original / 'cases.json')] = str(outside)
+        self.locations.write_text(json.dumps(locations))
+        result = self.prepare_release()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('outside the staging directory', result.stderr)
+        self.assertFalse((self.extracted / 'experiment-locations.json').exists())
+        shutil.move(outside, source)
+        locations['files'] = {}
+        self.locations.write_text(json.dumps(locations))
+        config = self.extracted / 'reuse/runner-config.json'
+        outside = self.root / 'outside-config.json'
+        shutil.move(config, outside)
+        config.symlink_to(outside)
+        result = self.prepare_release()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('outside the staging directory', result.stderr)
+        self.assertFalse((self.extracted / 'experiment-locations.json').exists())
+
+    def test_release_preparation_does_not_write_a_map_when_a_later_experiment_fails(self):
+        ledger = self.extracted / 'reuse/run/results.jsonl'
+        value = json.loads(ledger.read_text())
+        value['final_output_raw'] = 'Changed output'
+        ledger.write_text(json.dumps(value) + '\n')
+        result = self.prepare_release('source', 'reuse')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertFalse((self.extracted / 'experiment-locations.json').exists())
+
+    def test_bundled_map_is_not_overwritten_and_never_falls_back_to_originals(self):
+        result = self.prepare_release()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        metadata = self.extracted / 'experiment-locations.json'
+        before = metadata.read_bytes()
+        result = self.prepare_release()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('already exist', result.stderr)
+        self.assertEqual(metadata.read_bytes(), before)
+        shutil.copytree(self.extracted, self.original)
+        (self.extracted / 'cases.json').unlink()
+        result = self.cli('verify', self.extracted / 'reuse')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('extracted/cases.json', result.stderr)
+
+    def test_bundled_locations_must_be_relative_and_contained_in_the_release(self):
+        result = self.prepare_release()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        metadata = self.extracted / 'experiment-locations.json'
+        saved = json.loads(metadata.read_text())
+        for destination in (str(self.extracted / 'cases.json'), '../cases.json'):
+            with self.subTest(destination=destination):
+                saved['files'][str(self.original / 'cases.json')] = destination
+                metadata.write_text(json.dumps(saved))
+                result = self.cli('verify', self.extracted / 'reuse')
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('must stay inside the extraction root', result.stderr)
+
+    def test_bundled_root_mapping_cannot_follow_a_link_to_external_evidence(self):
+        metadata = self.extracted / 'experiment-locations.json'
+        metadata.write_text(json.dumps({'schema_version': 1,
+            'roots': {str(self.original): '.'}, 'files': {}}))
+        source = self.extracted / 'cases.json'
+        outside = self.root / 'outside-cases.json'
+        shutil.move(source, outside)
+        source.symlink_to(outside)
+        result = self.cli('verify', self.extracted / 'reuse')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('must stay inside the extraction root', result.stderr)
 
     def verify(self, name='reuse'):
         return self.cli('verify', self.extracted / name, '--locations', self.locations, '--json')

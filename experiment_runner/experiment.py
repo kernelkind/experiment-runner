@@ -1763,6 +1763,11 @@ Example from your project checkout (replace the spec and destination):
     p.add_argument('experiment', type=Path)
     p.add_argument('--locations', type=Path, help='JSON mapping original paths to extracted files')
     p.add_argument('--json', action='store_true')
+    p = commands.add_parser('prepare-release', help='verify staged evidence and bundle its locations for readers')
+    p.add_argument('directory', type=Path, help='staged archive contents')
+    p.add_argument('--experiment', type=Path, action='append', required=True,
+                   help='experiment inside the staging directory (repeatable)')
+    p.add_argument('--locations', type=Path, required=True, help="publisher's original-to-staged file locations")
     p = commands.add_parser('pause', help='stop new admissions for one run; active requests finish normally',
         formatter_class=argparse.RawDescriptionHelpFormatter, epilog=queue_help)
     p.add_argument('experiment', type=Path)
@@ -1861,6 +1866,11 @@ def main(argv=None):
             from .verification import verify, summary
             result = verify(args.experiment, args.locations)
             print(json.dumps(result, indent=2) if args.json else summary(result))
+        elif args.command == 'prepare-release':
+            from .verification import prepare_release
+            path = prepare_release(args.directory, args.experiment, args.locations)
+            print(f'Prepared {path.name}. Experiments checked: {len(args.experiment)}. '
+                  'Include it at the archive extraction root.')
         elif args.command == 'pause':
             from .scheduling import pause
             _, config, _ = load(args.experiment.resolve())

@@ -6,11 +6,13 @@ from pathlib import Path
 
 from . import extraction_pipeline as engine
 
+RELEASE_LOCATIONS = 'experiment-locations.json'
+
 
 class Locations:
     """Resolve saved paths without changing identities or falling back to originals."""
 
-    def __init__(self, path):
+    def __init__(self, path, *, contained=False):
         path = Path(path).resolve()
 
         def unique_pairs(pairs):
@@ -26,6 +28,7 @@ class Locations:
                 or set(value) != {'schema_version', 'roots', 'files'}):
             raise ValueError('locations must contain schema_version: 1, roots and files')
         self.roots, self.files = {}, {}
+        self._contained_root = path.parent if contained else None
         for name, table in (('roots', self.roots), ('files', self.files)):
             if not isinstance(value[name], dict):
                 raise ValueError(f'locations.{name} must be an object')
@@ -35,7 +38,10 @@ class Locations:
                     raise ValueError(f'duplicate location: {original}')
                 if not isinstance(destination, str) or not destination:
                     raise ValueError('location destinations must be nonempty paths')
-                table[original] = (path.parent / destination).resolve()
+                target = (path.parent / destination).resolve()
+                if contained and (Path(destination).is_absolute() or not target.is_relative_to(path.parent)):
+                    raise ValueError(f'release location must stay inside the extraction root: {destination}')
+                table[original] = target
 
     @staticmethod
     def original(value):
@@ -47,14 +53,84 @@ class Locations:
     def __call__(self, path):
         path = self.original(path)
         if path in self.files:
-            return self.files[path]
+            return self._target(self.files[path])
         for parent in (path, *path.parents):
             if parent in self.roots:
-                return self.roots[parent] / path.relative_to(parent)
-        raise ValueError(f'no extracted location for {path}; add it to the locations file')
+                return self._target(self.roots[parent] / path.relative_to(parent))
+        raise ValueError(f'no extracted location for {path}; the supplied locations are incomplete')
+
+    def _target(self, path):
+        if self._contained_root is not None:
+            path = path.resolve()
+            if not path.is_relative_to(self._contained_root):
+                raise ValueError(f'release location must stay inside the extraction root: {path}')
+        return path
 
 
 def verify(directory, locations=None):
+    """Find bundled locations automatically; explicit locations remain an override."""
+    directory = Path(directory).resolve()
+    if locations is not None:
+        locate = Locations(locations)
+    else:
+        locate = Path
+        for parent in (directory, *directory.parents):
+            bundled = parent / RELEASE_LOCATIONS
+            if bundled.exists() or bundled.is_symlink():
+                locate = Locations(bundled, contained=True)
+                break
+    return _verify(directory, engine.ReceiptFiles(locate=locate))
+
+
+def prepare_release(directory, experiments, locations):
+    """Verify staged experiments and emit only their portable location bindings.
+
+    Archive selection and staging belong to the publisher. Nothing outside the
+    staging root is copied or followed, and no evidence or existing map is edited.
+    Share receipt-file reads across experiments so common corpora are hashed once.
+    """
+    directory = Path(directory).resolve()
+    if not directory.is_dir() or not experiments:
+        raise ValueError('release preparation needs a staging directory and experiments')
+    destination = directory / RELEASE_LOCATIONS
+    if destination.exists() or destination.is_symlink():
+        raise ValueError(f'release locations already exist: {destination}')
+    source_locations = Locations(locations)
+    bindings = {}
+
+    def staged(path):
+        target = Path(path).resolve()
+        if not target.is_relative_to(directory):
+            raise ValueError(f'required evidence is outside the staging directory: {path}')
+        return target
+
+    def locate(original):
+        target = staged(source_locations(original))
+        bindings[str(original)] = target.relative_to(directory).as_posix()
+        return target
+
+    files = engine.ReceiptFiles(locate=locate)
+    local = engine.ReceiptFiles(locate=staged)
+    for experiment in experiments:
+        experiment = (directory / experiment).resolve()
+        if not experiment.is_relative_to(directory):
+            raise ValueError('selected experiment must be inside the staging directory')
+        _verify(experiment, files, local=local)
+    # An exclusive create prevents an existing release's mappings being replaced.
+    # Write only after every selected experiment has passed its integrity checks.
+    stream = destination.open('x', encoding='utf-8')
+    try:
+        with stream:
+            json.dump({'schema_version': 1, 'roots': {}, 'files': bindings},
+                      stream, sort_keys=True, indent=2)
+            stream.write('\n')
+    except BaseException:
+        destination.unlink()
+        raise
+    return destination
+
+
+def _verify(directory, files, *, local=None):
     """Check frozen bindings and every successful native receipt; never execute saved code.
 
     Receipt verification is not an evaluation of answer quality or proof that a
@@ -62,8 +138,7 @@ def verify(directory, locations=None):
     Failed attempts get the ledger's provenance/sequence checks, not success checks.
     """
     directory = Path(directory).resolve()
-    local = engine.ReceiptFiles()
-    files = engine.ReceiptFiles(locate=Locations(locations) if locations else Path)
+    local = local if local is not None else engine.ReceiptFiles()
     envelope = local.json(directory / 'experiment.json')
     plan = envelope['plan']
     if engine._sha256_json(plan) != envelope['sha256']:
