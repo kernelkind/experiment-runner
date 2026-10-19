@@ -165,8 +165,10 @@ class SharedRunnerTests(unittest.TestCase):
                         include_request_preview=False)['cases']
                     self.assertEqual(source['status'], 'valid')
                 for name in ('source', 'reuse'):
-                    for file in ('experiment.json', 'runner-config.json', 'run/manifest.json', 'run/results.jsonl'):
+                    for file in ('experiment.json', 'runner-config.json', 'run/manifest.json'):
                         self.assertEqual(reads[root / name / file], 1, (name, file, reads))
+                    self.assertEqual(reads[root / name / 'run/results.jsonl'], 0,
+                                     'receipt reporting read the complete ledger into bytes')
                 config = root / 'source/runner-config.json'
                 config.write_bytes(config.read_bytes() + b'\n')
                 with self.assertRaisesRegex(ValueError, 'prepared runner-config.json changed'):

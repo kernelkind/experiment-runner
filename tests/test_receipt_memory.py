@@ -31,6 +31,59 @@ class ReceiptMemoryTests(unittest.TestCase):
             tracemalloc.stop()
         self.assertLess(peak, 4 * 1024 * 1024, 'digest copied the whole Unicode document')
 
+    def test_usage_summary_streams_calls_without_retaining_request_bodies(self):
+        def calls(padding):
+            for i in range(64):
+                yield ({'status': 'succeeded',
+                        'usage': {'input': 3, 'output': 2, 'cacheRead': 1,
+                                  'cost': {'total': .25}},
+                        'model_result': {'request': {'padding': str(i) + 'x' * padding},
+                            'uncached_catalog_cost_estimate_usd': .5}}, None)
+        expected = experiment.usage_summary(calls(0))
+        tracemalloc.start()
+        try:
+            actual = experiment.usage_summary(calls(256 * 1024))
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(actual, expected)
+        self.assertLess(peak, 3 * 1024 * 1024, 'accounting retained complete model requests')
+
+    def test_report_ledger_keeps_parsed_records_without_raw_copies(self):
+        path = self.root / 'results.jsonl'
+        with path.open('wb') as f:
+            for i in range(64):
+                f.write(engine._canonical_json_bytes({'id': i, 'padding': 'x' * (256 * 1024)}))
+        files = experiment.ReportFiles()
+        tracemalloc.start()
+        try:
+            entry = files.ledger(path)
+            retained, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(len(entry['records']), 64)
+        self.assertIs(files.ledger(path), entry)
+        self.assertLess(peak - retained, 2 * 1024 * 1024, 'ledger was copied before parsing')
+        self.assertLess(retained, 20 * 1024 * 1024, 'ledger retained both raw and parsed receipts')
+
+    def test_reconciled_costs_keep_receipt_identity_without_model_request_bodies(self):
+        def record(i):
+            return {'provider': 'openrouter', 'model_result': {
+                'request': {'padding': 'x' * (256 * 1024)},
+                'response_metadata': {'id': f'gen-{i}'}}}
+        key = engine._sha256_bytes(engine._canonical_json_bytes(record(0)))
+        (self.root/'cost-receipts.jsonl').write_bytes(engine._canonical_json_bytes({
+            'record_sha256': key, 'source': 'openrouter/generation',
+            'generation': {'id': 'gen-0', 'total_cost': .25}}))
+        tracemalloc.start()
+        try:
+            costs = engine.load_reconciled_costs(self.root, (record(i) for i in range(64)))
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertEqual(costs, {key: .25})
+        self.assertLess(peak, 3 * 1024 * 1024, 'cost reconciliation kept complete request bodies')
+
     def test_large_source_is_evicted_before_loading_its_replacement(self):
         paths = [self.root / f'large-{i}.json' for i in range(2)]
         for path in paths:

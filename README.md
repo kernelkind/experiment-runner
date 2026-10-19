@@ -84,6 +84,12 @@ Loading a frozen batch also shares exactly equal rendered-prompt strings between
 its checked plan, config and manifest. Each file retains its own validation and
 hash; the in-memory texts no longer need three separate copies.
 
+Receipt reports parse JSONL as a stream. Generation accounting retains billing
+fields and original file/line/hash references, and streams source ledgers through
+the normal provenance and receipt-hash checks. Reused generations, their earlier
+attempts and inherited prefix warmups retain their existing classification and
+deduplication; missing usage and cost remain unknown.
+
 Intentional repeats, including prefix warmups, skip history discovery because
 they always send a fresh request. They still preserve request locks and original
 receipt references. Warmup preparation reuses the frozen prefix eligibility and

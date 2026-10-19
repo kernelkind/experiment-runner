@@ -12,6 +12,7 @@ from collections import Counter
 from contextvars import copy_context
 from contextlib import contextmanager
 from dataclasses import replace
+from itertools import chain
 from datetime import datetime, timezone
 import fcntl
 import json
@@ -50,11 +51,13 @@ class ReportFiles(engine.ReceiptFiles):
             stamp = self._stamp(path)
             entry = self._ledgers.get(path)
             if entry is None or entry['stamp'] != stamp:
-                raw = path.read_bytes()
+                self._ledgers.pop(path, None)
+                entry = None
+                with path.open('rb') as stream:
+                    records = [json.loads(line) for line in stream]
                 if self._stamp(path) != stamp:
                     raise engine.RunnerError(f'source changed while reading: {path}')
-                lines = raw.splitlines(keepends=True)
-                entry = dict(stamp=stamp, lines=lines, records=[json.loads(line) for line in lines])
+                entry = dict(stamp=stamp, records=records)
                 self._ledgers[path] = entry
             return entry
 
@@ -676,8 +679,8 @@ def usage_summary(calls, *, strict=True, warmup_calls=()):
                  attempts_without_cost_estimate=0, provider_reported_cost_usd=0,
                  attempts_without_provider_cost=0)
     observations = []
-    for record, charge, warmup in [*((r, c, False) for r, c in calls),
-                                  *((r, c, True) for r, c in warmup_calls)]:
+    for record, charge, warmup in chain(((r, c, False) for r, c in calls),
+                                       ((r, c, True) for r, c in warmup_calls)):
         if type(charge) in (int, float) and math.isfinite(charge) and charge >= 0:
             usage["provider_reported_cost_usd"] += charge
         else:
@@ -700,7 +703,7 @@ def usage_summary(calls, *, strict=True, warmup_calls=()):
                                  and _nonnegative_number(raw.get('output_tokens', raw.get('completion_tokens'))))):
                     known = False
         if not known:
-            observations.append((record, None, None, warmup))
+            observations.append((_usage_record(record), None, None, warmup))
             usage["attempts_without_usage"] += 1
             usage["attempts_without_cost_estimate"] += 1
             continue
@@ -710,7 +713,7 @@ def usage_summary(calls, *, strict=True, warmup_calls=()):
             usage[field] += value
         cost = saved.get("cost") or {}
         estimate = cost.get("total") if isinstance(cost, dict) else None
-        observations.append((record, values, estimate if _nonnegative_number(estimate) else None, warmup))
+        observations.append((_usage_record(record), values, estimate if _nonnegative_number(estimate) else None, warmup))
         if estimate is None or (strict and not (
                 type(estimate) in (int, float) and math.isfinite(estimate) and estimate >= 0)):
             usage["attempts_without_cost_estimate"] += 1
@@ -727,12 +730,71 @@ def usage_summary(calls, *, strict=True, warmup_calls=()):
     return usage
 
 
+def _usage_record(record):
+    """Keep billing evidence, without retaining rendered requests or answers."""
+    model = record.get('model_result') or {}
+    selected = {k: model[k] for k in ('uncached_catalog_cost_estimate_usd', 'usage_note') if k in model}
+    raw = (model.get('response_metadata') or {}).get('usage') or {}
+    selected['response_metadata'] = {'usage': {
+        k: raw[k] for k in ('input_tokens', 'prompt_tokens', 'output_tokens', 'completion_tokens') if k in raw}}
+    return dict(status=record.get('status'), usage=record.get('usage'), model_result=selected)
+
+
+def _usage_manifest(value):
+    return {k: value[k] for k in ('wrapper_sha256', 'cache_warmup') if k in value}
+
+
+def receipt_usage(references):
+    """Sum source-bound originals in reference order, streaming each ledger once."""
+    wanted, by_path = {}, {}
+    for reference in references:
+        path, number = Path(reference['results_path']).resolve(), reference['result_line']
+        if type(number) is not int or number < 1:
+            raise engine.RunnerError('invalid generation source line')
+        key = path, number
+        saved = dict(reference, results_path=str(path))
+        prior = wanted.get(key)
+        if prior is not None:
+            if any(prior[k] != saved[k] for k in ('result_sha256', 'job_key', 'status')):
+                raise engine.RunnerError('generation source changed while reporting')
+            saved['added_from_reuse'] = prior.get('added_from_reuse', False) and saved.get('added_from_reuse', False)
+        wanted[key] = saved
+        by_path.setdefault(path, set()).add(number)
+    files, observed = engine.ReceiptFiles(), {}
+    for path, numbers in by_path.items():
+        manifest_path = path.parent/'manifest.json'
+        header = files.json(manifest_path, project=_usage_manifest)
+        manifest_hash = files.sha256(manifest_path)
+        provenance = files.provenance(path.parent, manifest_sha256=manifest_hash,
+                                      initial_wrapper_sha256=header['wrapper_sha256'])
+        costs = engine.load_reconciled_costs(path.parent,
+            (record for _, _, record in engine._iter_results(path, manifest_hash, provenance)))
+        for number, line, record in engine._iter_results(path, manifest_hash, provenance):
+            if number not in numbers:
+                continue
+            reference = wanted[path, number]
+            if (engine._sha256_bytes(line) != reference['result_sha256']
+                    or record.get('job_key') != reference['job_key']
+                    or record.get('status') != reference['status']):
+                raise engine.RunnerError('generation source changed while reporting')
+            observed[path, number] = (_usage_record(record),
+                engine.provider_cost(record, costs), bool(header.get('cache_warmup')))
+    if observed.keys() != wanted.keys():
+        raise engine.RunnerError('generation source receipt is missing')
+    sources = list(wanted.values())
+    usage = usage_summary(
+        ((r, c) for key in wanted for r, c, warm in [observed[key]] if not warm),
+        warmup_calls=((r, c) for key in wanted for r, c, warm in [observed[key]] if warm))
+    return {**usage, 'original_calls': len(sources),
+            'source_calls_added': sum(s.get('added_from_reuse', False) for s in sources),
+            'failed_calls': sum(s['status'] == 'failed' for s in sources), 'sources': sources}
+
+
 def generation_usage(config, manifest, selected, records, latest, files, reconciled_costs,
                      warmup_calls=(), warmup_sources=()):
     """Account for original calls once by verified file/line, not request text."""
     ledger = (config.run_directory / "results.jsonl").resolve()
     jobs = {"prompt:" + c.get("job_id", c["id"]): c for c in selected}
-    source_ledgers = {ledger: records}
     source_attempts = {}
     originals = {}
     for number, record in enumerate(records, 1):
@@ -743,8 +805,12 @@ def generation_usage(config, manifest, selected, records, latest, files, reconci
             job = engine.PromptJob(case.get("job_id", case["id"]), case["prompt"])
             engine.validate_prompt_receipt(replace(config, prompts=(job,)), manifest,
                                            record, files=files)
-        originals[(ledger, number)] = (record, False)
-    local_count = len(originals)
+        line = files.line(ledger, number)
+        if json.loads(line) != record:
+            raise engine.RunnerError('generation source changed while reporting')
+        originals[ledger, number] = dict(results_path=str(ledger), result_line=number,
+            result_sha256=engine._sha256_bytes(line), job_key=record['job_key'],
+            status=record['status'], added_from_reuse=False)
     for case in selected:
         record = latest.get("prompt:" + case.get("job_id", case["id"]))
         if not record or record.get("execution") != "cross_run_reuse":
@@ -756,51 +822,38 @@ def generation_usage(config, manifest, selected, records, latest, files, reconci
         source = engine._read_request_source(reference,
             engine._prompt_request_key(manifest, case["prompt"]), files=files)
         path = Path(reference["results_path"]).resolve()
-        if path not in source_ledgers:
-            source_manifest = files.json(path.parent / "manifest.json")
+        if path not in source_attempts:
+            source_manifest = _usage_manifest(files.json(path.parent / "manifest.json"))
             source_provenance = files.provenance(path.parent,
                 manifest_sha256=reference["manifest_sha256"],
                 initial_wrapper_sha256=source_manifest["wrapper_sha256"])
-            engine._load_latest_results(path, reference["manifest_sha256"], source_provenance)
-            source_ledgers[path] = [json.loads(line) for line in files.lines(path)]
-        if path not in source_attempts:
             by_job = {}
-            for number, prior in enumerate(source_ledgers[path], 1):
+            for number, line, prior in engine._iter_results(
+                    path, reference['manifest_sha256'], source_provenance):
                 if prior.get("execution") != "cross_run_reuse":
-                    by_job.setdefault(prior.get("job_key"), []).append((number, prior))
+                    by_job.setdefault(prior['job_key'], []).append(dict(
+                        results_path=str(path), result_line=number,
+                        result_sha256=engine._sha256_bytes(line), job_key=prior['job_key'],
+                        status=prior['status'], added_from_reuse=True))
             source_attempts[path] = by_job
-        for number, prior in source_attempts[path].get(source["job_key"], []):
+        for prior in source_attempts[path].get(source["job_key"], []):
+            number = prior['result_line']
             if number > reference["result_line"]:
                 break
-            if prior.get("status") == "succeeded":
+            if prior['status'] == "succeeded":
                 engine._read_request_source({**reference, "result_line": number,
-                    "result_sha256": engine._sha256_bytes(files.line(path, number))},
+                    "result_sha256": prior['result_sha256']},
                     engine._prompt_request_key(manifest, case["prompt"]), files=files)
             key = (path, number)
-            if key in originals and originals[key][0] != prior:
+            if key in originals and originals[key]['result_sha256'] != prior['result_sha256']:
                 raise engine.RunnerError("generation source changed while reporting")
-            originals.setdefault(key, (prior, True))
-    reconciled = {config.run_directory.resolve(): reconciled_costs}
-    calls, sources = [], []
-    for (path, number), (record, added) in originals.items():
-        line = files.line(path, number)
-        if json.loads(line) != record:
-            raise engine.RunnerError("generation source changed while reporting")
-        if path.parent not in reconciled:
-            reconciled[path.parent] = engine.load_reconciled_costs(
-                path.parent, source_ledgers[path])
-        calls.append((record, engine.provider_cost(record, reconciled[path.parent])))
-        sources.append(dict(results_path=str(path), result_line=number,
-                            result_sha256=engine._sha256_bytes(line),
-                            job_key=record.get("job_key"), status=record.get("status"),
-                            added_from_reuse=added))
-    all_warmups = list(warmup_calls)
+            originals.setdefault(key, prior)
+    sources = list(originals.values())
     sources.extend(warmup_sources)
     seen_warmups = {(s['results_path'], s['result_line']) for s in warmup_sources}
-    inherited_warmups = 0
     # Tracing a reused generation must include the warmup paid by its original
     # batch, once even when several selected cases share that batch.
-    for source_ledger in source_ledgers:
+    for source_ledger in source_attempts:
         source_directory = source_ledger.parent.parent
         if source_ledger == ledger or not (source_directory / 'cache-warmups.jsonl').exists():
             continue
@@ -809,19 +862,9 @@ def generation_usage(config, manifest, selected, records, latest, files, reconci
         for call, source in zip(prior_calls, prior_sources):
             key = (source['results_path'], source['result_line'])
             if key not in seen_warmups:
-                all_warmups.append(call)
                 sources.append({**source, 'added_from_reuse': True})
                 seen_warmups.add(key)
-                inherited_warmups += 1
-    # Instructions-only experiments contain warmup attempts, not comparisons.
-    if manifest.get('cache_warmup'):
-        all_warmups.extend(calls)
-        calls = []
-    return {**usage_summary(calls, strict=True, warmup_calls=all_warmups),
-            "original_calls": len(calls) + len(all_warmups),
-            "source_calls_added": len(originals) - local_count + inherited_warmups,
-            "failed_calls": sum(r.get("status") == "failed" for r, _ in [*calls, *all_warmups]),
-            "sources": sources}
+    return receipt_usage(sources)
 
 
 def cache_warmup_records(directory, plan, config):
@@ -893,7 +936,7 @@ def _report(directory, only=None, note_ids=None, *, generation_costs=False, incl
     ledger = config.run_directory / "results.jsonl"
     evidence = files.ledger(ledger) if ledger.exists() else None
     latest = engine._load_latest_results(ledger, manifest_hash, provenance,
-        evidence=None if evidence is None else zip(evidence['lines'], evidence['records']))
+        evidence=None if evidence is None else ((None, r) for r in evidence['records']))
     records = evidence['records'] if evidence is not None else []
     reconciled_costs = engine.load_reconciled_costs(config.run_directory, records)
     reviews_path = directory / "reviews.jsonl"

@@ -179,31 +179,36 @@ def provider_cost(record, reconciled_costs=None):
     cost = native.get('cost') if isinstance(native, dict) else None
     if type(cost) in (int, float) and math.isfinite(cost) and cost >= 0:
         return cost
-    return (reconciled_costs or {}).get(_sha256_bytes(_canonical_json_bytes(record)))
+    return reconciled_costs.get(_sha256_json(record)) if reconciled_costs else None
 
 
 def load_reconciled_costs(run_directory, records):
     path = run_directory / 'cost-receipts.jsonl'
     if not path.exists():
         return {}
-    by_hash = {_sha256_bytes(_canonical_json_bytes(r)): r for r in records}
+    by_hash = {}
+    for record in records:
+        metadata = (record.get('model_result') or {}).get('response_metadata') or {}
+        by_hash[_sha256_json(record)] = dict(provider=record.get('provider'),
+            execution=record.get('execution'), generation_id=metadata.get('id'),
+            native_cost=provider_cost(record))
     costs = {}
-    for line in path.read_bytes().splitlines():
-        receipt = json.loads(line)
-        key = receipt.get('record_sha256')
-        record = by_hash.get(key)
-        generation = receipt.get('generation') or {}
-        expected_id = ((record or {}).get('model_result') or {}).get('response_metadata', {}).get('id')
-        cost = generation.get('total_cost')
-        if (record is None or record.get('provider') != 'openrouter' or
-            record.get('execution') == 'cross_run_reuse' or not expected_id or
-            generation.get('id') != expected_id or receipt.get('source') != 'openrouter/generation' or
-            type(cost) not in (int, float) or not math.isfinite(cost) or cost < 0 or key in costs):
-            raise RunnerError('invalid or mismatched cost receipt')
-        native = provider_cost(record)
-        if native is not None and native != cost:
-            raise RunnerError('cost receipt conflicts with original billing')
-        costs[key] = cost
+    with path.open('rb') as stream:
+        for line in stream:
+            receipt = json.loads(line)
+            key = receipt.get('record_sha256')
+            record = by_hash.get(key)
+            generation = receipt.get('generation') or {}
+            expected_id = (record or {}).get('generation_id')
+            cost = generation.get('total_cost')
+            if (record is None or record.get('provider') != 'openrouter' or
+                record.get('execution') == 'cross_run_reuse' or not expected_id or
+                generation.get('id') != expected_id or receipt.get('source') != 'openrouter/generation' or
+                type(cost) not in (int, float) or not math.isfinite(cost) or cost < 0 or key in costs):
+                raise RunnerError('invalid or mismatched cost receipt')
+            if record['native_cost'] is not None and record['native_cost'] != cost:
+                raise RunnerError('cost receipt conflicts with original billing')
+            costs[key] = cost
     return costs
 
 
@@ -1468,16 +1473,16 @@ def _prepare_subject_run_directory(
     return prepared
 
 
-def _load_latest_results(
+def _iter_results(
     path: Path,
     manifest_sha256: str,
     provenance: RunnerProvenance,
-    references: dict[str, SourceResultReference] | None = None,
     *, evidence=None,
-) -> dict[str, dict[str, Any]]:
+):
+    """Validate the complete ledger while retaining only prior attempt numbers."""
     if not path.exists():
-        return {}
-    latest: dict[str, dict[str, Any]] = {}
+        return
+    attempts = {}
     def stream_rows():
         try:
             with path.open('rb') as stream:
@@ -1529,17 +1534,34 @@ def _load_latest_results(
         attempt = record.get("attempt")
         if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
             raise RunnerError(f"results ledger line {line_number} has invalid attempt")
-        previous = latest.get(job_key)
-        if previous is not None and attempt != previous["attempt"] + 1:
+        previous = attempts.get(job_key)
+        if previous is not None and attempt != previous + 1:
             raise RunnerError(
                 f"results ledger has a nonconsecutive attempt for `{job_key}`"
             )
+        attempts[job_key] = attempt
+        yield line_number, line, record
+
+
+def _load_latest_results(
+    path: Path,
+    manifest_sha256: str,
+    provenance: RunnerProvenance,
+    references: dict[str, SourceResultReference] | None = None,
+    *, evidence=None,
+) -> dict[str, dict[str, Any]]:
+    latest = {}
+    for line_number, line, record in _iter_results(
+            path, manifest_sha256, provenance, evidence=evidence):
+        job_key = record['job_key']
         latest[job_key] = record
         if references is not None:
+            if line is None:
+                raise RunnerError('raw receipt bytes required for result references')
             references[job_key] = SourceResultReference(
                 line=line_number,
                 sha256=_sha256_bytes(line),
-                attempt=attempt,
+                attempt=record['attempt'],
             )
     return latest
 
