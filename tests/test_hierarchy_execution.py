@@ -46,6 +46,24 @@ class HierarchyExecutionTests(unittest.TestCase):
             'prepare', str(self.root / name), '--spec', str(self.root / 'spec.json')])
         return experiment.prepare(args, include_request_preview=False)
 
+    def test_loading_frozen_batch_does_not_retain_three_copies_of_prompt_text(self):
+        (self.root / 'prompt.txt').write_text('x' * (128 * 1024) + '🌿\n{TASK}')
+        (self.root / 'cases.json').write_text(json.dumps({'cases': [
+            {'id': f'case-{i}', 'inputs': {'TASK': str(i)}} for i in range(16)]}))
+        self.prepare()
+        tracemalloc.start()
+        try:
+            with experiment.report_scope():
+                plan, config, manifest = experiment.load(self.root / 'E1')
+                self.assertEqual([p.text for p in config.prompts],
+                                 [c['prompt'] for c in plan['cases']])
+                self.assertEqual([p.text for p in config.prompts],
+                                 [p['text'] for p in manifest['prompts']])
+                retained, _ = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertLess(retained, 12 * 1024 * 1024, 'frozen prompt copies remained resident')
+
     def test_explicit_provider_attempt_limit_survives_resume(self):
         self.prepare()
         with patch.dict(os.environ, {'FAKE_RUNNER_FAILURES': json.dumps({

@@ -60,7 +60,8 @@ History discovery keeps request keys and original receipt references, then
 releases each historical manifest and receipt body. Source verification lazily
 loads matching evidence through a cache holding up to 16 MiB of smaller source
 files, the executing batch's manifest, and one larger source file. A different
-large source evicts the previous one; small reads do not. This avoids reparsing
+large source evicts the previous one before reading and decoding its replacement;
+small reads do not. This avoids reparsing
 one large historical manifest for every reused answer without retaining every
 historical manifest. Evicted JSON is read and parsed again when needed.
 Adapters may use `read(path, project=selector)` to retain a pure selected JSON
@@ -75,6 +76,13 @@ limit. Changed files are hashed in 1 MiB chunks and checked for changes during
 that read. Verified JSON reads populate the same digest metadata. This is a
 cache bound, not a resident-memory guarantee; keep the
 workload cgroup limit in place.
+
+Canonical JSON digests stream the same sorted UTF-8 bytes, including the final
+newline, rather than allocating a second complete JSON document. Existing
+request, plan and receipt identities remain byte-for-byte identical.
+Loading a frozen batch also shares exactly equal rendered-prompt strings between
+its checked plan, config and manifest. Each file retains its own validation and
+hash; the in-memory texts no longer need three separate copies.
 
 Intentional repeats, including prefix warmups, skip history discovery because
 they always send a fresh request. They still preserve request locks and original

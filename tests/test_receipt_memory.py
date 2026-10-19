@@ -9,6 +9,7 @@ import unittest
 from unittest.mock import patch
 
 from experiment_runner import experiment
+from experiment_runner import inputs
 from experiment_runner import compatibility
 from experiment_runner import extraction_pipeline as engine
 
@@ -18,6 +19,31 @@ class ReceiptMemoryTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
+
+    def test_digest_streams_the_existing_unicode_json_byte_contract(self):
+        value = {'rows': ['x' * (256 * 1024) + '🌿' for _ in range(32)]}
+        expected = engine._sha256_bytes(engine._canonical_json_bytes(value))
+        tracemalloc.start()
+        try:
+            self.assertEqual(inputs.digest(value), expected)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertLess(peak, 4 * 1024 * 1024, 'digest copied the whole Unicode document')
+
+    def test_large_source_is_evicted_before_loading_its_replacement(self):
+        paths = [self.root / f'large-{i}.json' for i in range(2)]
+        for path in paths:
+            path.write_text(json.dumps({'value': 'x' * (17 * 1024 * 1024)}))
+        files = engine.ReceiptFiles()
+        tracemalloc.start()
+        try:
+            for path in paths:
+                self.assertEqual(files.json(path)['value'][-1:], 'x')
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertLess(peak, 55 * 1024 * 1024, 'old large source survived replacement parsing')
 
     def test_projected_large_sources_retain_only_selected_fields_and_exact_digests(self):
         paths = [self.root / f'source-{i}.json' for i in range(3)]

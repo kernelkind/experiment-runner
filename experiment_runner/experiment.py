@@ -138,9 +138,20 @@ def load(directory):
         if (files.sha256(path) if files else engine._sha256_file(path)) != expected:
             raise ValueError(f"prepared {name} changed; prepare a new experiment")
     config = engine.PromptRunnerConfig.load(observe(directory / "runner-config.json"), files=files)
+    # These frozen files repeat the same rendered prompts. Share equal strings
+    # after each source is checked instead of retaining three full text copies.
+    prompts = {p.prompt_id: p.text for p in config.prompts}
+    for case in plan['cases']:
+        text = prompts.get(case.get('job_id', case['id']))
+        if case['prompt'] == text:
+            case['prompt'] = text
     manifest = read(observe(Path(plan["run_directory"]) / "manifest.json"))
     if inputs.digest(manifest) != plan["manifest_sha256"]:
         raise ValueError("prepared run manifest changed")
+    for prompt in manifest['prompts']:
+        text = prompts.get(prompt['prompt_id'])
+        if prompt['text'] == text:
+            prompt['text'] = text
     value = plan, config, manifest
     if files is not None and stamps == {path: files._stamp(path) for path in stamps}:
         files.loads[directory] = dict(stamps=stamps, value=value)

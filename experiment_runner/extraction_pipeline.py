@@ -498,6 +498,16 @@ def _sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
 
 
+def _sha256_json(value: object) -> str:
+    """Hash the canonical JSON bytes without copying the complete document."""
+    digest = hashlib.sha256()
+    encoder = json.JSONEncoder(ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    for chunk in encoder.iterencode(value):
+        digest.update(chunk.encode('utf-8'))
+    digest.update(b'\n')
+    return digest.hexdigest()
+
+
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as source:
@@ -2426,17 +2436,20 @@ class ReceiptFiles:
                 and entry['stamp'][2] <= 16 * 1024 * 1024):
             self._json_bytes -= entry['stamp'][2]
         if entry is None or entry['stamp'] != stamp:
+            # Release the preceding large source before allocating its replacement.
+            # Keeping both through JSON decoding defeats the one-large-source bound.
+            entry = None
+            if path != self._manifest_path and stamp[2] > 16 * 1024 * 1024:
+                for key in list(self._json):
+                    if key != self._manifest_path and self._json[key]['stamp'][2] > 16 * 1024 * 1024:
+                        del self._json[key]
             raw = path.read_bytes()
             if self._stamp(path) != stamp:
                 raise RunnerError(f'source changed while reading: {path}')
             entry = dict(stamp=stamp, value=json.loads(raw), sha256=_sha256_bytes(raw))
         self._hashes[path] = (entry['stamp'], entry['sha256'])
         if path != self._manifest_path:
-            if stamp[2] > 16 * 1024 * 1024:
-                for key in list(self._json):
-                    if key != self._manifest_path and self._json[key]['stamp'][2] > 16 * 1024 * 1024:
-                        del self._json[key]
-            else:
+            if stamp[2] <= 16 * 1024 * 1024:
                 while self._json_bytes + stamp[2] > 16 * 1024 * 1024:
                     oldest = next(key for key in self._json if key != self._manifest_path
                                   and self._json[key]['stamp'][2] <= 16 * 1024 * 1024)
