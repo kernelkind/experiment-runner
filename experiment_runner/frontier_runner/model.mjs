@@ -20,6 +20,7 @@ import { stream as codexStream } from '@earendil-works/pi-ai/api/openai-codex-re
 import { stream as openrouterStream } from '@earendil-works/pi-ai/api/openai-completions';
 import { websocketRequest, websocketResponse } from './websocket.mjs';
 import { experimentAdmission, experimentScopes } from './backoff.mjs';
+import { authenticationMode, directConnection, loginDirect } from './direct-auth.mjs';
 
 export const VERSION = 'oracle-model-runner/1';
 const PI_AI_VERSION = '0.85.1';
@@ -149,7 +150,7 @@ const mimoFlash = {
 async function identity() {
   const hash = createHash('sha256');
   const requestHash = createHash('sha256');
-  for (const path of ['model.mjs', 'websocket.mjs', 'backoff.mjs', '../provider_backoff.py',
+  for (const path of ['model.mjs', 'websocket.mjs', 'backoff.mjs', 'direct-auth.mjs', '../provider_backoff.py',
     '../extraction_pipeline.py', '../scheduling.py', '../compatibility.py',
     '../experiment.py', '../cli.py', '../inputs.py', '../project.py', '../__init__.py',
     'request-compatibility.json', 'package-lock.json', '../run-model.sh']) {
@@ -692,10 +693,10 @@ async function executeModel(request, { apiKey, fetch = globalThis.fetch, signal,
 }
 
 export async function execute(request, options = {}) {
-  const { apiKey, fetch = globalThis.fetch, signal, offline = false, experimentConcurrency } = options;
+  const { apiKey, fetch = globalThis.fetch, signal, offline = false, experimentConcurrency, directScopes } = options;
   if (!nonempty(apiKey)) throw new Error('Explicit credentials are required for execution');
   const admission = experimentConcurrency !== undefined && !offline
-    ? await experimentAdmission(request, { apiKey, fetch, signal, concurrency: experimentConcurrency }) : null;
+    ? await experimentAdmission(request, { apiKey, fetch, signal, concurrency: experimentConcurrency, directScopes }) : null;
   let result;
   try { result = await executeModel(request, options); }
   catch (error) {
@@ -790,6 +791,7 @@ export async function localPiConnection(providerName = 'openai-codex') {
 }
 
 const help = `Usage: run-model.sh preview|run [CONFIG.json] [--send]
+       EXPERIMENT_RUNNER_AUTH=direct run-model.sh login openai-codex|openrouter
 Reads one JSON config from file or stdin; writes one JSON result to stdout.
 Required: provider, model, reasoning, prompt (sent exactly as supplied).
 Optional: schema, timeout_seconds (default 300), transport (sse default; websocket for subscription only).
@@ -807,12 +809,15 @@ schema is validated locally without coercion; omitted schema accepts plain text.
 JSON Schema draft-07 (default), 2019-09, and 2020-12 are supported without remote refs.
 Provider schema support may be narrower; unsupported parameters remain request failures.
 preview cannot send and reads no credentials. run requires --send.
-Subscription auth: the selected account's credential service, launched automatically.
-No upstream credential export, auth files, or paid OpenAI API fallback.
-OpenRouter auth: the same local credential service, with one shared provider key.
-Never reads OPENROUTER_API_KEY or OPENAI_API_KEY; no direct upstream fallback.
+Authentication defaults to service: the selected Anvil account's credential service.
+Service mode never reads provider API keys or falls back to direct access.
+EXPERIMENT_RUNNER_AUTH=direct explicitly selects pi-ai authentication without Anvil.
+Direct credentials use $XDG_CONFIG_HOME/experiment-runner/auth.json (or ~/.config),
+overridden by EXPERIMENT_RUNNER_AUTH_FILE; the file must be outside Git and mode 0600.
+Direct OpenRouter also accepts OPENROUTER_API_KEY when no credential is stored.
+Subscription login never falls back to paid OpenAI API billing. Preview reads no credentials.
 --version prints versions; --identity prints versions and source/dependency SHA-256.
-Internal scopes command reads the selected local account's hashed account/transport
+Internal scopes command returns the selected account's hashed account/transport
 scopes without inference. --identity advertises experiment_scopes for queued admission.
 Before paid execution, obtain approved maximum spend and record the commitment in
 budget-ledger.json. Provider-enforced spending caps are not required.
@@ -829,21 +834,30 @@ export async function main() {
   if (values.identity) { process.stdout.write(JSON.stringify(await identity()) + '\n'); return; }
   if (values['auth-file']) throw new Error('--auth-file is no longer supported; subscription credentials are service-owned. Remove the option or set batch auth_file to null.');
   const [command, path] = positionals;
+  if (command === 'login') {
+    if (authenticationMode() !== 'direct' || values.send || values['pi-config'] || positionals.length !== 2) {
+      throw new Error('Use EXPERIMENT_RUNNER_AUTH=direct run-model.sh login openai-codex|openrouter');
+    }
+    await loginDirect(path);
+    return;
+  }
   if (!['preview', 'run', 'scopes'].includes(command) || positionals.length > 2) throw new Error(help);
   if (command === 'run' && !values.send) throw new Error('Sending requires the explicit --send flag');
   if (command === 'preview' && values.send) throw new Error('preview does not accept --send');
   const input = path ? await readFile(path, 'utf8') : await new Response(process.stdin).text();
   const request = await prepare(JSON.parse(input));
   if (command === 'preview') { process.stdout.write(JSON.stringify(await preview(request), null, 2) + '\n'); return; }
-  if (!values['pi-config']) return launchWithSelectedPi(input, command);
-  const connection = await localPiConnection(request.model.provider);
+  const direct = authenticationMode() === 'direct';
+  if (direct && values['pi-config']) throw new Error('Direct authentication cannot use --pi-config');
+  if (!direct && !values['pi-config']) return launchWithSelectedPi(input, command);
+  const connection = direct ? await directConnection(request.model.provider) : await localPiConnection(request.model.provider);
   request.model = { ...request.model, baseUrl: connection.baseUrl };
   if (command === 'scopes') {
-    const { scopes } = await experimentScopes(request, { apiKey: connection.apiKey });
+    const { scopes } = await experimentScopes(request, { apiKey: connection.apiKey, directScopes: connection.scopes });
     process.stdout.write(JSON.stringify(scopes) + '\n');
     return;
   }
-  const result = await execute(request, { apiKey: connection.apiKey,
+  const result = await execute(request, { apiKey: connection.apiKey, directScopes: connection.scopes,
     ...(process.env.ORACLE_EXPERIMENT_CONCURRENCY === undefined ? {} : {
       experimentConcurrency: Number(process.env.ORACLE_EXPERIMENT_CONCURRENCY) }) });
   process.stdout.write(JSON.stringify(result, null, 2) + '\n');

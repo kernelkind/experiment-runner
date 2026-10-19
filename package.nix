@@ -5,7 +5,7 @@ let
     pname = "experiment-runner-node-dependencies";
     version = "1.0.0";
     src = ./experiment_runner/frontier_runner;
-    npmDepsHash = "sha256-IDc3g7+TDGLD0gmJFvtrJR+qZTDs/BICL4C40dvDuNI=";
+    npmDepsHash = "sha256-iXEBDnUHCPRqFAqpMV+/U6ntXpFUVDX5/NuHTcxzZlQ=";
     nodejs = nodejs_24;
     dontNpmBuild = true;
     installPhase = ''

@@ -148,7 +148,8 @@ function policyFacts(result) {
     response_metadata: facts };
 }
 
-export async function experimentScopes(request, { apiKey, fetch = globalThis.fetch, signal }) {
+export async function experimentScopes(request, { apiKey, fetch = globalThis.fetch, signal, directScopes }) {
+  if (directScopes) return { scopes: directScopes, route: null };
   const route = serviceRoute(request);
   const url = new URL('/request-status/scopes', route.origin);
   url.searchParams.set('account', route.account);
@@ -165,11 +166,11 @@ export async function experimentScopes(request, { apiKey, fetch = globalThis.fet
   return { scopes, route };
 }
 
-export async function experimentAdmission(request, { apiKey, fetch, signal, concurrency }) {
+export async function experimentAdmission(request, { apiKey, fetch, signal, concurrency, directScopes }) {
   if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 1024) {
     throw new Error('Invalid experiment concurrency');
   }
-  const { scopes, route } = await experimentScopes(request, { apiKey, fetch, signal });
+  const { scopes, route } = await experimentScopes(request, { apiKey, fetch, signal, directScopes });
   const marker = process.env.ORACLE_EXPERIMENT_ADMISSION_MARKER;
   if (marker) process.stderr.write(`${marker}:waiting\n`);
   const started = performance.now();
@@ -194,7 +195,7 @@ export async function experimentAdmission(request, { apiKey, fetch, signal, conc
     async finish(result) {
       const metadata = result.response_metadata;
       const reference = metadata.proxy_request_id;
-      if (!metadata.abort_reason && metadata.terminal_event !== 'response.completed'
+      if (route && !metadata.abort_reason && metadata.terminal_event !== 'response.completed'
           && metadata.http_status !== 101
           && result.stop_reason === 'error' && typeof reference === 'string'
           && /^[A-Za-z0-9_-]{8,128}$/.test(reference)) {

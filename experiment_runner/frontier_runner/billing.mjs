@@ -1,7 +1,8 @@
-// Read-only OpenRouter generation metadata through the existing credential service.
+// Read-only OpenRouter generation metadata through the selected authentication route.
 // Kept separate from inference transport so saved model-runner identities stay valid.
 import {spawn} from 'node:child_process';
 import {localPiConnection} from './model.mjs';
+import {authenticationMode, directConnection} from './direct-auth.mjs';
 
 async function main() {
   const args=process.argv.slice(2);
@@ -10,7 +11,9 @@ async function main() {
   const ids=JSON.parse(input);
   if (!Array.isArray(ids) || new Set(ids).size!==ids.length ||
       ids.some(id=>typeof id!=='string' || !/^gen-[A-Za-z0-9-]+$/.test(id))) throw new Error();
-  if (!args.length) {
+  const direct=authenticationMode()==='direct';
+  if (direct && args.length) throw new Error();
+  if (!direct && !args.length) {
     const child=spawn('agent-account',['exec','pi','--',process.execPath,
       process.argv[1],'--pi-config'],{stdio:['pipe','inherit','inherit']});
     const interrupt=()=>child.kill('SIGINT');
@@ -27,7 +30,7 @@ async function main() {
     }
     return;
   }
-  const connection=await localPiConnection('openrouter');
+  const connection=direct ? await directConnection('openrouter') : await localPiConnection('openrouter');
   const rows=[];
   for (const id of ids) {
     try {

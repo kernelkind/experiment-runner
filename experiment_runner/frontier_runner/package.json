@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node --test model.test.mjs auth.test.mjs systemone.test.mjs websocket.test.mjs backoff.test.mjs billing.test.mjs cache-cli.test.mjs"
+    "test": "node --test model.test.mjs auth.test.mjs direct-auth.test.mjs systemone.test.mjs websocket.test.mjs backoff.test.mjs billing.test.mjs cache-cli.test.mjs updates.test.mjs"
   },
   "engines": {
     "node": ">=24"
@@ -12,6 +12,7 @@
     "@earendil-works/pi-ai": "0.85.1",
     "ajv": "8.17.1",
     "ajv-formats": "3.0.1",
+    "proper-lockfile": "4.1.2",
     "undici": "7.24.4"
   }
 }

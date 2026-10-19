@@ -2,7 +2,7 @@
 set -euo pipefail
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 RUNNER="$HERE/frontier_runner"
-if [[ ! -d "$RUNNER/node_modules/@earendil-works/pi-ai" || ! -d "$RUNNER/node_modules/ajv" || ! -d "$RUNNER/node_modules/undici" ]]; then
+if [[ ! -d "$RUNNER/node_modules/@earendil-works/pi-ai" || ! -d "$RUNNER/node_modules/ajv" || ! -d "$RUNNER/node_modules/undici" || ! -d "$RUNNER/node_modules/proper-lockfile" ]]; then
   echo 'Install pinned dependencies in experiment_runner/frontier_runner with npm ci --ignore-scripts first.' >&2
   exit 1
 fi

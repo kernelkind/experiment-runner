@@ -105,18 +105,24 @@ queue without an outer batch concurrency cap.
 
 ## Use
 
-Use the shared launcher at
-`~/src/notedeck_worktrees/algos/experiment-runner/bin/experiment-runner`.
-It loads code directly from the shared `main` checkout.
-With the pinned Node dependencies installed in
-`experiment_runner/frontier_runner`, its CLI is immediately usable:
+Use `bin/experiment-runner` from the source checkout selected for your project.
+It loads that checkout's code. Install Python 3.11+ and Node 24+, then install
+the declared Python packages and pinned Node dependencies:
 
 ```bash
-~/src/notedeck_worktrees/algos/experiment-runner/bin/experiment-runner --help
+cd experiment-runner
+export EXPERIMENT_RUNNER_ROOT="$PWD"
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e .
+npm --prefix experiment_runner/frontier_runner ci \
+  --ignore-scripts --no-audit --no-fund
+bin/experiment-runner --help
 ```
 
-Use this launcher for experiment execution. Do not substitute an immutable Nix
-package or require a system installation for this workflow.
+Oracle's hierarchy coordinator expects this source layout. Keep the selected
+checkout and dependencies stable while a saved experiment is running. On Anvil,
+the existing shared launcher and account-service setup remain supported.
 
 `experiment-runner --help` lists commands and points to the cache workflow.
 `experiment-runner prepare --help` includes the caching option, an automatic
@@ -153,6 +159,45 @@ executor or rewriting historical prompts.
 `inputs` and `input_sha256`, without reading answer reports or invoking request
 previews. `--case` selects one object; `--only` selects a cases list. Evidence,
 cost and prompt-only filters cannot be combined with this input-only view.
+
+## Authentication
+
+`EXPERIMENT_RUNNER_AUTH` selects the model launcher's authentication route.
+Unset, or `service`, retains the Anvil route: `agent-account exec pi`, local
+Pi configuration and the credential service. It does not read provider API
+keys or switch to direct access if the service fails.
+
+Outside Anvil, select `direct` and use pi-ai's provider login. In the same shell
+as setup, from the runner checkout:
+
+```bash
+cd "$EXPERIMENT_RUNNER_ROOT"
+export EXPERIMENT_RUNNER_AUTH=direct
+./experiment_runner/run-model.sh login openai-codex
+```
+
+The command offers browser or device-code login for a subscription. It stores
+credentials in `$XDG_CONFIG_HOME/experiment-runner/auth.json`, defaulting to
+`~/.config/experiment-runner/auth.json`. `EXPERIMENT_RUNNER_AUTH_FILE` can select
+another path outside Git repositories. Files must have mode `0600`; new files
+are created with that mode. Pi-ai refreshes expired tokens through a locked,
+atomic store, so concurrent request processes do not rotate the same token
+twice. It uses the existing pinned pi-ai release without modifying it.
+
+Direct OpenRouter requests accept `OPENROUTER_API_KEY` when no OpenRouter
+credential is stored. `run-model.sh login openrouter` is another way to obtain
+and save an OpenRouter key through its browser flow. A broken stored credential
+does not fall back to the environment. Select `provider: openrouter` and a
+supported OpenRouter model in the experiment spec; omit subscription-only
+`prompt_cache` settings. A subscription request never switches to paid OpenAI
+API access. Keep credentials out of specs and experiment output directories.
+
+The selected mode applies to `scopes`, `run` and `reconcile-costs`. Direct mode
+derives private queue identifiers from the provider and authenticated account;
+it does not query Anvil. Both modes retain the shared request queue, retry
+policy, request validation, usage accounting and credential redaction.
+`preview`, `--help` and `--identity` read no credentials. Choosing authentication
+does not authorize model calls or spending.
 
 ## Internal request queue
 
@@ -247,9 +292,10 @@ not per agent or token budget.
 
 Waiting cases stay in the runner process; model workers start only after
 admission. Native workers advertise `experiment_scopes: true` in `--identity`
-and implement `scopes`: read the selected account's local configuration, query
-the local credential service and return only hashed account/transport scopes,
-without inference. The runner discovers scopes once per batch and the worker
+and implement `scopes`: service mode queries the local credential service;
+direct mode resolves pi-ai credentials and computes the account/transport hashes
+locally. Both return only hashes, without inference. The runner discovers scopes
+once per batch and the worker
 checks its admission against the selected scopes again before sending. Scope
 failure stops dispatch; changed scopes refuse the request. Custom workers
 without this capability still share the 30 slots. They do not gain native
@@ -838,10 +884,11 @@ reuse itself adds no new execution cost.
 ## Verification
 
 ```bash
+cd "$EXPERIMENT_RUNNER_ROOT"
+source .venv/bin/activate
 python3 -m unittest discover -s tests
 cd experiment_runner/frontier_runner
-node --test model.test.mjs auth.test.mjs systemone.test.mjs \
-  websocket.test.mjs backoff.test.mjs billing.test.mjs
+npm test
 ```
 
 Oracle adapter and compatibility regressions remain in Oracle. The native
@@ -849,3 +896,6 @@ cross-process test exercises two experiment processes and the persistent
 attempt cap. The credential-service joint fixture verifies a real local
 HTTP/2 GOAWAY through the proxy, native SDK, shared admission gate and production
 retry policy. No test needs a provider account or teacher request.
+Direct-authentication fixtures exercise pi-ai device login, cross-process token
+refresh, provider failures and a native prepare/run/resume cycle using local
+servers. These are offline integration checks, not live-provider validation.
