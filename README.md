@@ -3,6 +3,10 @@
 Run prompt experiments, compare prompt versions, and keep a record of the inputs,
 model settings, answers and costs behind each result.
 
+The generic prompt workflow works without Oracle MVP. Oracle uses the runner
+with its own prompts, input adapters and hierarchy-generation code; see
+[use with another project](#use-with-another-project) for that boundary.
+
 An experiment applies one versioned prompt to a set of **cases**. Each case has
 an ID and input text to substitute into the prompt. The runner saves the prepared
 requests before execution, records responses and attempts, and can reuse saved
@@ -255,11 +259,19 @@ missing OpenRouter charges without generating answers.
 
 ## Use with another project
 
-The generic adapter above works on its own. Projects can supply additional input
-adapters, validation, review interfaces and commands through an
-`experiment-runner.json` file. Oracle uses this mechanism for its subject/mask
-experiments and hierarchy generation; those prompts and algorithms belong to
-Oracle, while this repository provides execution and saved evidence.
+The built-in `generic` adapter accepts your own prompt template, cases and model
+settings. Preparing, running, comparing and reviewing these experiments requires
+no Oracle checkout or extension.
+
+| This repository provides | Oracle MVP provides |
+| --- | --- |
+| Preparation, execution, retries and saved-answer reuse | Research prompts, experiment specs and subject/mask input preparation |
+| Response receipts, usage/cost accounting and baseline comparisons | Hierarchy-generation algorithms and project-specific validation |
+| Generic case inspection, attributed reviews and compact exports | Specialized review interfaces and project commands |
+
+Projects declare their input adapters and commands in `experiment-runner.json`.
+Other projects can supply their own extension when the generic adapter is
+insufficient.
 
 When following a project's guide, run the CLI from that project's checkout so
 its configuration is discovered. You can also select it with the global
@@ -267,6 +279,16 @@ its configuration is discovered. You can also select it with the global
 requirements come from that project's documentation. Oracle's hierarchy
 coordinator expects the runner's source-checkout layout used in the installation
 instructions above.
+
+Some Oracle-specific handling remains in the shared code. When `run` or `show`
+receives a directory containing `bounded-build.json`, it loads the configured
+project's `bounded_hierarchy_build` module; opening or resuming Oracle's builds
+therefore requires Oracle's extension. Some report fields also have
+Oracle-specific handling. Generic prompt experiments use the built-in workflow.
+
+Authentication defaults to Anvil's account service. For direct provider access
+outside Anvil, select `EXPERIMENT_RUNNER_AUTH=direct` and follow the
+[authentication instructions](#authentication).
 
 ## Reference
 
