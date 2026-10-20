@@ -1,6 +1,6 @@
 { lib, stdenvNoCC, buildNpmPackage, makeWrapper, python3, nodejs_24 }:
 let
-  runtime = python3.withPackages (ps: [ ps.tiktoken ps.numpy ]);
+  runtime = python3.withPackages (ps: [ ps.tiktoken ps.numpy ps.ijson ]);
   nodeDependencies = buildNpmPackage {
     pname = "experiment-runner-node-dependencies";
     version = "1.0.0";
