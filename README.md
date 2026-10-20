@@ -1,113 +1,31 @@
 # Experiment runner
 
-This repository owns experiment preparation, execution, receipt verification,
-request reuse, budgets, provider retries and transport. Project Git worktrees
-share this implementation. Project prompts, specs, adapters and generated
-experiments remain in their project repositories.
+Run prompt experiments, compare prompt versions, and keep a record of the inputs,
+model settings, answers and costs behind each result.
 
-Only `run` sends model requests, and it requires the caller's existing inference
-and spending authorization. Moving or installing this tool does not authorize
-inference. Tests use local fixtures.
+An experiment applies one versioned prompt to a set of **cases**. Each case has
+an ID and input text to substitute into the prompt. The runner saves the prepared
+requests before execution, records responses and attempts, and can reuse saved
+answers when a later experiment makes an identical request. A revised prompt can
+be compared against the previous answers without rerunning the baseline.
 
-Prepared prompt experiments also support `provider: local` with `transport:
-http`, an explicitly selected model worker, and an optional positive
-`max_output_tokens`. Local requests reject `auth_file`; HTTP transport is
-reserved for this provider. The project supplies the worker and model server.
-The shared runner retains the same input, schema, worker-identity, receipt,
-reuse and retry checks. Saved case reports expose the worker's
-`response_metadata`, `usage` and `stop_reason` without inventing missing values.
+The basic workflow is **prepare → inspect → run → review**. Preparation and
+inspection make no model calls. `run` sends requests; interrupted runs can resume
+from their saved directory. Validation checks the response format and any rules
+supplied by a project adapter; judging answer quality remains a separate step.
 
-## Contain a large workload's memory
+- [Install](#install)
+- [Run a small experiment](#run-a-small-experiment)
+- [Compare prompt versions](#compare-prompt-versions)
+- [Saved files](#saved-files)
+- [Command guide](#command-guide)
+- [Use with another project](#use-with-another-project)
+- [Reference](#reference)
 
-On a host with a systemd user manager and delegated memory controller, launch
-the whole coordinating command as one transient user service. Its Python and
-Node children inherit the same cgroup limit. The following example bounds the
-full distillation grading workload to 32 GiB with no swap, while every ready
-native batch remains free to enter the existing 30-request queue:
+## Install
 
-```bash
-systemd-run --user --wait --pipe --collect \
-  --unit=distillation-full-1800 \
-  --working-directory=/home/dev/src/notedeck_worktrees/algos/oracle-mvp-grading \
-  --property=MemoryMax=32G --property=MemorySwapMax=0 \
-  --property=OOMPolicy=kill --property=KillMode=control-group \
-  --property=Restart=no --expand-environment=no --setenv=PATH \
-  /etc/profiles/per-user/dev/bin/uv run --no-project --with tiktoken==0.14.0 \
-  /home/dev/src/notedeck_worktrees/algos/experiment-runner/bin/experiment-runner \
-  run-distillation-automatic-grading \
-  target/distillation-review-v1/grading/full-1800/automatic \
-  >> target/distillation-review-v1/grading/full-1800/run-automatic.log 2>&1
-```
-
-Run this from that task worktree so the output path also resolves there. Select
-an explicit workload memory allowance for the host; 32 GiB is the approved
-allowance for this grading run on Anvil. Use the installed absolute `uv` path
-on another host. The service inherits the user manager's environment; pass any
-required task-specific environment explicitly with `--setenv`. This changes no
-host-wide memory settings and adds no concurrency limit.
-
-If the cgroup exhausts its memory allowance, `OOMPolicy=kill` stops the whole
-workload, including its children. `systemd-run --wait` returns failure and
-reports `oom-kill`; `Restart=no` prevents an automatic OOM restart loop. Treat
-that as a failed run. Inspect and fix the cause, then explicitly resume the
-same saved automatic directory with this command. Existing model receipts and
-attempt budgets stay in that directory. Supply `--runner-upgrade-reason` only
-when the native source-change check requires the reviewed upgrade reason.
-Stopping the group releases only its own processes; unrelated workloads remain
-outside it.
-
-History discovery keeps request keys and original receipt references, then
-releases each historical manifest and receipt body. Source verification lazily
-loads matching evidence through a cache holding up to 16 MiB of smaller source
-files, the executing batch's manifest, and one larger source file. A different
-large source evicts the previous one before reading and decoding its replacement;
-small reads do not. This avoids reparsing
-one large historical manifest for every reused answer without retaining every
-historical manifest. Evicted JSON is read and parsed again when needed.
-Adapters may use `read(path, project=selector)` to retain a pure selected JSON
-view under a separate 16 MiB bound. Ordinary source reads cannot evict those
-views. Projection identity and the complete file stamp identify each entry;
-full reads and different projections stay separate. The reader parses the full
-source and retains its original SHA-256 before selecting fields. Oversized
-views are returned without retention. No validation verdict is cached.
-Digest checks keep only file identity, size, timestamps and SHA-256;
-unchanged files need no repeated parsing or hashing, even above the JSON cache
-limit. Changed files are hashed in 1 MiB chunks and checked for changes during
-that read. Verified JSON reads populate the same digest metadata. This is a
-cache bound, not a resident-memory guarantee; keep the
-workload cgroup limit in place.
-
-Canonical JSON digests stream the same sorted UTF-8 bytes, including the final
-newline, rather than allocating a second complete JSON document. Existing
-request, plan and receipt identities remain byte-for-byte identical.
-Loading a frozen batch also shares exactly equal rendered-prompt strings between
-its checked plan, config and manifest. Each file retains its own validation and
-hash; the in-memory texts no longer need three separate copies.
-
-Receipt reports parse JSONL as a stream. Generation accounting retains billing
-fields and original file/line/hash references, and streams source ledgers through
-the normal provenance and receipt-hash checks. Reused generations, their earlier
-attempts and inherited prefix warmups retain their existing classification and
-deduplication; missing usage and cost remain unknown.
-
-Intentional repeats, including prefix warmups, skip history discovery because
-they always send a fresh request. They still preserve request locks and original
-receipt references. Warmup preparation reuses the frozen prefix eligibility and
-loads the parent settings without building a parent report that it cannot use.
-
-The October 13 model-free full-grading check loaded all 128 prepared batches
-and their shared history concurrently under that 32 GiB limit. It completed in
-14.84 seconds, peaked at 21.94 GiB of cgroup memory and held 14.16 GiB after all
-loads, with zero OOM events and zero swap. This verifies input/history startup
-at full batch fanout; model workers and subsequent collection still require
-runtime measurement. All ready batches continue to use the shared request
-queue without an outer batch concurrency cap.
-
-## Use
-
-Use `bin/experiment-runner` from the source checkout selected for your project.
-It loads that checkout's code. Install Python 3.11+ and Node 24+, then install
-the declared Python packages and pinned Node dependencies:
+Requirements: **Python 3.11+**, **Node.js 24+** and **npm**. From a checkout of this
+repository:
 
 ```bash
 cd experiment-runner
@@ -120,75 +38,244 @@ npm --prefix experiment_runner/frontier_runner ci \
 bin/experiment-runner --help
 ```
 
-Oracle's hierarchy coordinator expects this source layout. Keep the selected
-checkout and dependencies stable while a saved experiment is running. On Anvil,
-the existing shared launcher and account-service setup remain supported.
+The examples below use the same shell and `bin/experiment-runner`, which loads
+this checkout's code. Installation also provides an `experiment-runner` command
+in the virtual environment. Keep the checkout and dependencies stable during a
+run; see [versions and saved experiments](#versions-and-saved-experiments) before
+upgrading an existing experiment.
 
-`experiment-runner --help` lists commands and points to the cache workflow.
-`experiment-runner prepare --help` includes the caching option, an automatic
-warming example, and worker migration. `experiment-runner run --help`
-explains shared attempt bounds and cache-cost accounting.
+## Run a small experiment
 
-`prepare`, `show`, `revise`, attributed `review` and `reconcile-costs` retain their
-existing workflow. Generic cases need no project extension. For Oracle-specific
-adapters and commands, use `--project-root` or run inside a checkout containing
-`experiment-runner.json`:
+This example assigns a topic label to each of two short texts. It uses the
+built-in `generic` input adapter, so no other project is required. The example
+selects `openai-codex` with `gpt-6.1-sol`; running it requires an account with
+access to that model. Authentication happens after preparation. OpenRouter and
+project-supplied local workers are covered in the
+[authentication reference](#authentication).
+
+### 1. Define the prompt, cases and settings
+
+Create three files in `result-example/`. The **Topic-v1** prompt contains a
+`{TEXT}` placeholder. Each case supplies its own `TEXT` value. The spec selects
+the prompt, cases and model settings; file paths inside it are relative to the
+spec file.
 
 ```bash
-cd ~/src/notedeck_worktrees/algos/oracle-mvp
-../experiment-runner/bin/experiment-runner prepare target/example-v1 \
-  --spec sse_multivector/experiment_specs/example-v1.json
+cd "$EXPERIMENT_RUNNER_ROOT"
+mkdir -p result-example
+cat > result-example/prompt-v1.txt <<'PROMPT'
+Identify the main topic of this text. Return only a short topic label.
+
+{TEXT}
+PROMPT
+cat > result-example/cases.json <<'JSON'
+{
+  "cases": [
+    {
+      "id": "gardening",
+      "inputs": {"TEXT": "I planted tomatoes and watered the seedlings."}
+    },
+    {
+      "id": "software",
+      "inputs": {"TEXT": "The update fixes a crash when opening saved files."}
+    }
+  ]
+}
+JSON
+cat > result-example/spec.json <<'JSON'
+{
+  "schema_version": 1,
+  "prompt": {"id": "Topic-v1", "path": "prompt-v1.txt"},
+  "dataset": {"adapter": "generic", "path": "cases.json"},
+  "runner": {
+    "provider": "openai-codex",
+    "model": "gpt-6.1-sol",
+    "reasoning_effort": "medium",
+    "transport": "sse"
+  }
+}
+JSON
 ```
 
-The command is illustrative: supply an existing, authorized spec. Input and
-prompt paths resolve relative to the spec. Review and hierarchy extensions are
-loaded from the selected project, never copied into this package.
+Case IDs must be unique. Input names must be `UPPER_CASE` and their values must
+be strings. Every supplied variable must appear in the template, and every
+placeholder must have a value. Literal JSON braces are allowed in prompt text.
 
-### Compact publication results
+### 2. Prepare and inspect without inference
 
-New standalone prompt experiments save a managed `publication/` directory during
-preparation, execution and review. It contains a small `experiment.json` with
-settings, version/source bindings and payload checksums; deduplicated template
-variables in `inputs.jsonl`; and final case answers, outcomes, reuse references
-and attributed reviews in `results.jsonl`. Rendered prompts, recursive baseline
-reports, transport details and arbitrary evidence wrappers are excluded.
+```bash
+cd "$EXPERIMENT_RUNNER_ROOT"
+bin/experiment-runner prepare result-example/run-v1 \
+  --spec result-example/spec.json
+bin/experiment-runner show result-example/run-v1 \
+  --case gardening --prompt-only
+```
 
-`export-results` exports the same format from an explicitly selected saved
-experiment without inference. It streams the saved report and binds its input
-selection and hash; it does not reconstruct a missing report, merge newer review
-sidecars or perform receipt verification. Metadata states these limitations.
+`prepare` creates a new experiment directory, freezes the rendered prompts and
+settings, and records source and code hashes. The two cases have not been sent
+to a model. `show --prompt-only` prints the exact prompt for the selected case.
+The destination must not already exist.
 
-`prepare --publication-role standalone|internal` freezes whether a job owns a
-public result. Normal preparation defaults to standalone; project coordinators
-mark construction jobs internal, and cache warmups are always internal.
-`prepare --from` inherits the role. Unmarked historical plans stay unmarked unless
-the caller explicitly selects a role for the new preparation. Automatic export
-requires standalone; known internal jobs cannot be exported separately.
+Keep the source files after preparing: later checks use their recorded hashes.
+To change a prompt, create a new version rather than editing the frozen source.
 
-The shared standard-library `publication_files` writer stages streamed JSONL
-payloads, rejects unrelated/different-owner destinations, binds payload hashes
-and replaces metadata last. Unchanged exports keep bytes and modification times.
-Project evaluation and numerical adapters can use it without a transport or model
-dependency. Choosing public datasets, reviewing sensitive content and uploading
-the files remain separate work.
+### 3. Authenticate and run
 
-### Project extensions
+For direct access through your own provider account, select `direct`. Log in
+if you have not already authenticated this runner:
 
-A project extension may implement `prompt_sources(prompt)`. Preparation calls
-it for a spec's prompt and for an explicit `--prompt` replacement, before
-publishing the experiment. The callback receives `id`, `text` and `source_path`;
-it validates project-owned composition and returns absolute source paths mapped
-to SHA-256 hashes. The runner verifies those hashes and freezes them alongside
-the prompt and input sources. A rejection makes no model calls and creates no
-experiment. Existing projects without the hook retain their behavior. An
-unchanged `prepare --from` keeps the original frozen prompt and dependencies.
-This supports shared prompt components without putting project rules in the
-executor or rewriting historical prompts.
+```bash
+cd "$EXPERIMENT_RUNNER_ROOT"
+export EXPERIMENT_RUNNER_AUTH=direct
+./experiment_runner/run-model.sh login openai-codex
+```
 
-`show <experiment> --inputs-only` prints only each saved case's `id`, exact
-`inputs` and `input_sha256`, without reading answer reports or invoking request
-previews. `--case` selects one object; `--only` selects a cases list. Evidence,
-cost and prompt-only filters cannot be combined with this input-only view.
+This uses pi-ai's browser or device-code login and stores credentials outside
+the repository, normally in `~/.config/experiment-runner/auth.json`. Existing
+Anvil users can keep their account-service setup. OpenRouter and other
+authentication settings are described in the [authentication reference](#authentication).
+
+The following command **sends model requests using the selected account**:
+
+```bash
+cd "$EXPERIMENT_RUNNER_ROOT"
+bin/experiment-runner run result-example/run-v1
+```
+
+`run` prints progress and waits for completion. It saves answers and attempt
+records as it goes. To resume after an interruption, run the same command
+against the same directory; completed successful answers are retained. Temporary
+provider failures retry automatically. For paid or larger experiments, set the
+attempt and spending limits appropriate to your work; see `run --help` and the
+[retry reference](#internal-request-queue).
+
+### 4. Inspect answers and record a review
+
+```bash
+cd "$EXPERIMENT_RUNNER_ROOT"
+bin/experiment-runner show result-example/run-v1
+bin/experiment-runner show result-example/run-v1 --case gardening
+```
+
+The summary shows case outcomes and recorded usage/cost information. The case
+view shows the prompt, answer and supporting evidence. Use `--json` for
+machine-readable output. Missing usage or cost remains unknown. For subscription
+runs, the displayed API-equivalent costs are estimates, not account charges.
+
+After inspecting an answer, you can record an attributed review. For example:
+
+```bash
+cd "$EXPERIMENT_RUNNER_ROOT"
+bin/experiment-runner review result-example/run-v1 \
+  --case gardening --role user --verdict uncertain \
+  --comment "Check whether the label is specific enough."
+```
+
+A review records your judgement separately from validation. In this plain-text
+example, a `valid` result does not mean the topic label is correct. Project
+adapters can add their own validation and review views.
+
+## Compare prompt versions
+
+Write a new **Topic-v2** prompt and prepare it from the saved experiment:
+
+```bash
+cd "$EXPERIMENT_RUNNER_ROOT"
+cat > result-example/prompt-v2.txt <<'PROMPT'
+Identify the main topic of this text. Return only a specific topic label
+of at most three words.
+
+{TEXT}
+PROMPT
+bin/experiment-runner prepare result-example/run-v2 \
+  --from result-example/run-v1 \
+  --prompt result-example/prompt-v2.txt --prompt-id Topic-v2
+bin/experiment-runner show result-example/run-v2 \
+  --case gardening --prompt-only
+```
+
+This inherits the cases and model settings and saves the previous answers as
+the comparison baseline. It makes no model calls. Once you have checked the new
+prompt, run and inspect the candidate:
+
+```bash
+cd "$EXPERIMENT_RUNNER_ROOT"
+bin/experiment-runner run result-example/run-v2
+bin/experiment-runner show result-example/run-v2 --case gardening
+```
+
+The case view includes the candidate and baseline. The baseline is not rerun.
+Keep related experiments under the same parent directory so the default history
+search can find their saved requests. Identical requests reuse verified answers;
+reuse is not another independent sample. For an intentional fresh trial, prepare
+a new directory with `--repeat`.
+
+## Saved files
+
+Each experiment directory contains:
+
+| Path | Contents |
+| --- | --- |
+| `experiment.json` | Frozen prompt, cases, settings, source/code hashes and any baseline. |
+| `runner-config.json` | The prepared model-worker configuration. |
+| `report.json` | Latest saved case outcomes, usage and comparisons. |
+| `run/` | Request manifest, response receipts, attempts and execution records. |
+| `publication/` | Compact inputs, final answers, settings and reviews for standalone experiments. |
+
+Keep reusable prompts, source cases and specs separate from generated experiment
+directories. Preparation adds a `.gitignore` inside each generated directory.
+Code hashes identify the implementation; they do not preserve a copy of its
+source, so retain the corresponding Git revision too.
+
+`publication/` is a local export, not an upload. It contains actual case inputs
+and answers. Choosing what to share remains a separate decision. The
+[publication reference](#compact-publication-results) explains this format and
+how it differs from the full execution record.
+
+## Command guide
+
+| Task | Command |
+| --- | --- |
+| Create an experiment from a spec | `prepare DEST --spec SPEC` |
+| Compare a new prompt with saved answers | `prepare DEST --from OLD --prompt FILE --prompt-id VERSION` |
+| Execute or resume | `run EXPERIMENT` |
+| Inspect one case | `show EXPERIMENT --case ID` |
+| Print its exact rendered prompt | `show EXPERIMENT --case ID --prompt-only` |
+| Print saved inputs and their hashes | `show EXPERIMENT --inputs-only` |
+| Record a judgement | `review EXPERIMENT --case ID --role user --verdict accept --comment TEXT` |
+| Stop new requests and let active ones finish | `pause EXPERIMENT` |
+| Apply exact text edits to a new prompt file and print the diff | `revise BASE DEST --edits FILE` |
+| Export saved prompt results locally | `export-results EXPERIMENT` |
+| Check saved prompt evidence without inference | `verify EXPERIMENT` |
+
+Commands in the table follow `bin/experiment-runner` or the installed
+`experiment-runner` command. Use `COMMAND --help` for options. For the core
+prompt workflow, `run` performs inference; `reconcile-costs` separately looks up
+missing OpenRouter charges without generating answers.
+
+## Use with another project
+
+The generic adapter above works on its own. Projects can supply additional input
+adapters, validation, review interfaces and commands through an
+`experiment-runner.json` file. Oracle uses this mechanism for its subject/mask
+experiments and hierarchy generation; those prompts and algorithms belong to
+Oracle, while this repository provides execution and saved evidence.
+
+When following a project's guide, run the CLI from that project's checkout so
+its configuration is discovered. You can also select it with the global
+`--project-root PATH` option before the command. Project-specific commands and
+requirements come from that project's documentation. Oracle's hierarchy
+coordinator expects the runner's source-checkout layout used in the installation
+instructions above.
+
+## Reference
+
+The sections below cover authentication choices, larger workloads, saved
+experiment compatibility, publication and extension development. Expand the
+part relevant to your task.
+
+<details>
+<summary>Authentication: direct accounts, OpenRouter and Anvil</summary>
 
 ## Authentication
 
@@ -229,6 +316,23 @@ policy, request validation, usage accounting and credential redaction.
 `preview`, `--help` and `--identity` read no credentials. Choosing authentication
 does not authorize model calls or spending.
 
+### Local model workers
+
+Prepared experiments also support `provider: local` with `transport: http`, an
+explicitly selected model worker, and an optional positive `max_output_tokens`.
+The project supplies the worker and model server; this repository does not
+install or host a model. Local requests reject `auth_file`; HTTP transport is
+reserved for this provider.
+
+Local experiments retain input, schema, worker-identity, receipt, reuse and retry
+checks. Saved case reports expose the worker's `response_metadata`, `usage` and
+`stop_reason` without inventing missing values.
+
+</details>
+
+<details>
+<summary>Scheduling, parallel batches and provider retries</summary>
+
 ## Internal request queue
 
 **Launch all ready, authorized model batches immediately. Start their `run`
@@ -248,15 +352,16 @@ independent C should start alongside A. Start newly ready batches without
 waiting for unrelated batches. Keep any separate CPU/GPU limit for local
 encoding from withholding ready provider batches.
 
-From a project task worktree, with two already-prepared, authorized independent
-experiments, start both before waiting:
+For two already-prepared, authorized independent experiments in this checkout,
+start both before waiting. Replace the example directories with your own:
 
 ```bash
-../experiment-runner/bin/experiment-runner run target/a-v1 \
-  > target/a-v1/run.log 2>&1 &
+cd "$EXPERIMENT_RUNNER_ROOT"
+bin/experiment-runner run result-example/a-v1 \
+  > result-example/a-v1/run.log 2>&1 &
 batch_a_pid=$!
-../experiment-runner/bin/experiment-runner run target/b-v1 \
-  > target/b-v1/run.log 2>&1 &
+bin/experiment-runner run result-example/b-v1 \
+  > result-example/b-v1/run.log 2>&1 &
 batch_b_pid=$!
 batch_a_status=0
 wait "$batch_a_pid" || batch_a_status=$?
@@ -288,6 +393,7 @@ is retained when the waiter arrives.
 Set membership once during preparation:
 
 ```bash
+cd "$EXPERIMENT_RUNNER_ROOT"
 bin/experiment-runner prepare target/batch-a --spec comparisons.json \
   --scheduling-group distillation
 ```
@@ -303,6 +409,7 @@ Independent workflows belonging to the same effort must share the same ID.
 An older ungrouped prepared batch can join a group on its next run:
 
 ```bash
+cd "$EXPERIMENT_RUNNER_ROOT"
 bin/experiment-runner run target/older-batch --scheduling-group distillation
 ```
 
@@ -429,6 +536,7 @@ Scheduling adds no prompt, schema, cache-key or request-body changes.
 `run` prints live progress on stderr. For machine-readable status, use:
 
 ```bash
+cd "$EXPERIMENT_RUNNER_ROOT"
 experiment-runner show target/example-v1 --json
 ```
 
@@ -495,6 +603,96 @@ is operational evidence, separate from immutable model receipts. The limit
 covers this user's cooperating runner executions on this host; it is not the
 provider's concurrency contract or a reservation guaranteeing chat capacity.
 
+</details>
+
+<details>
+<summary>Memory limits and large workloads</summary>
+
+## Contain a large workload's memory
+
+On a host with a systemd user manager and delegated memory controller, launch
+an experiment as one transient user service. Its Python and Node children
+inherit the same cgroup limit. For example, the command below limits the
+prepared example experiment to 32 GiB and disables swap for that workload:
+
+```bash
+cd "$EXPERIMENT_RUNNER_ROOT"
+systemd-run --user --wait --pipe --collect \
+  --unit=experiment-example-v1 --working-directory="$PWD" \
+  --property=MemoryMax=32G --property=MemorySwapMax=0 \
+  --property=OOMPolicy=kill --property=KillMode=control-group \
+  --property=Restart=no --expand-environment=no \
+  --setenv=PATH --setenv=EXPERIMENT_RUNNER_AUTH \
+  "$PWD/.venv/bin/python" "$PWD/bin/experiment-runner" run result-example/run-v1
+```
+
+Choose a memory allowance appropriate to the workload and host; 32 GiB is an
+example, not a requirement for a small experiment. The service inherits the
+user manager's environment; this command copies the current shell's `PATH` and
+authentication route. Pass any other task-specific settings explicitly with
+`--setenv`. This changes no host-wide memory settings and adds no concurrency
+limit.
+
+If the cgroup exhausts its allowance, `OOMPolicy=kill` stops the workload,
+including its children. `systemd-run --wait` returns failure and reports
+`oom-kill`; `Restart=no` prevents an automatic restart loop. Inspect and fix the
+cause before explicitly resuming the saved experiment. Existing receipts and
+attempt budgets remain in its directory. Supply `--runner-upgrade-reason` only
+when the native source-change check requires a reviewed reason. Other workloads
+remain outside the group.
+
+History discovery keeps request keys and original receipt references, then
+releases each historical manifest and receipt body. Source verification lazily
+loads matching evidence through a cache holding up to 16 MiB of smaller source
+files, the executing batch's manifest, and one larger source file. A different
+large source evicts the previous one before reading and decoding its replacement;
+small reads do not. This avoids reparsing
+one large historical manifest for every reused answer without retaining every
+historical manifest. Evicted JSON is read and parsed again when needed.
+Adapters may use `read(path, project=selector)` to retain a pure selected JSON
+view under a separate 16 MiB bound. Ordinary source reads cannot evict those
+views. Projection identity and the complete file stamp identify each entry;
+full reads and different projections stay separate. The reader parses the full
+source and retains its original SHA-256 before selecting fields. Oversized
+views are returned without retention. No validation verdict is cached.
+Digest checks keep only file identity, size, timestamps and SHA-256;
+unchanged files need no repeated parsing or hashing, even above the JSON cache
+limit. Changed files are hashed in 1 MiB chunks and checked for changes during
+that read. Verified JSON reads populate the same digest metadata. This is a
+cache bound, not a resident-memory guarantee; keep the
+workload cgroup limit in place.
+
+Canonical JSON digests stream the same sorted UTF-8 bytes, including the final
+newline, rather than allocating a second complete JSON document. Existing
+request, plan and receipt identities remain byte-for-byte identical.
+Loading a frozen batch also shares exactly equal rendered-prompt strings between
+its checked plan, config and manifest. Each file retains its own validation and
+hash; the in-memory texts no longer need three separate copies.
+
+Receipt reports parse JSONL as a stream. Generation accounting retains billing
+fields and original file/line/hash references, and streams source ledgers through
+the normal provenance and receipt-hash checks. Reused generations, their earlier
+attempts and inherited prefix warmups retain their existing classification and
+deduplication; missing usage and cost remain unknown.
+
+Intentional repeats, including prefix warmups, skip history discovery because
+they always send a fresh request. They still preserve request locks and original
+receipt references. Warmup preparation reuses the frozen prefix eligibility and
+loads the parent settings without building a parent report that it cannot use.
+
+The October 13 model-free full-grading check loaded all 128 prepared batches
+and their shared history concurrently under that 32 GiB limit. It completed in
+14.84 seconds, peaked at 21.94 GiB of cgroup memory and held 14.16 GiB after all
+loads, with zero OOM events and zero swap. This verifies input/history startup
+at full batch fanout; model workers and subsequent collection still require
+runtime measurement. All ready batches continue to use the shared request
+queue without an outer batch concurrency cap.
+
+</details>
+
+<details>
+<summary>Runner versions, upgrades and saved experiments</summary>
+
 ## Versions and saved experiments
 
 Preparation freezes inputs, model settings and request identity, and records
@@ -524,6 +722,7 @@ For a controlled handover, pause one experiment, wait until its status is
 `paused`, then resume it with the same budget and execution limits:
 
 ```bash
+cd "$EXPERIMENT_RUNNER_ROOT"
 bin/experiment-runner pause target/trial-v1
 bin/experiment-runner show target/trial-v1 --json
 bin/experiment-runner run target/trial-v1 --attempt-budget target/attempt-budget.json
@@ -547,21 +746,19 @@ installing this release cannot upgrade already-loaded Python code. Other
 coordinators can retain their loaded scheduling code while compatible workers
 update; pause and restart each coordinator separately to adopt new workflow
 code. No global idle period is required for subsequent compatible updates.
-Preparation records hashes without preserving a separate copy of runner code. Failed token usage
-remains unknown.
+Preparation records hashes without preserving a separate copy of runner code.
+Failed token usage remains unknown.
 
 `prepare --from` retains the old worker by default, including custom workers.
 To move an older experiment's frozen inputs to the shared source worker, prepare
-a new directory with `--runner-binary
-~/src/notedeck_worktrees/algos/experiment-runner/experiment_runner/run-model.sh`.
+a new directory with `--runner-binary "$EXPERIMENT_RUNNER_ROOT/experiment_runner/run-model.sh"`.
 This selects the worker only for the new experiment; it does not resume or
 rewrite the previous experiment.
 
 Oracle's old Python/shell/Node entry points delegate to this package.
 `EXPERIMENT_RUNNER_ROOT` can select another checkout for the source launcher and
-compatibility callers; an invalid explicit root fails without fallback. The
-shared `main` checkout is the standard. A project worktree itself does not select
-a runner revision.
+compatibility callers; an invalid explicit root fails without fallback. A project
+worktree itself does not select a runner revision.
 
 Related offline evidence checks can use `experiment.report_scope()` to share
 parsed files, frozen plan validation and receipt indexes. File identity, size,
@@ -592,88 +789,6 @@ of the entire document; file flush, fsync and atomic replacement still precede
 publication. Parsed inputs and report evidence still require memory, so these
 changes do not replace a workload memory limit.
 
-## Verify saved experiments after moving files
-
-Extract the evidence package with its directory structure intact, then pass the
-experiment directory to `verify`:
-
-```bash
-cd "$EXPERIMENT_RUNNER_ROOT"
-bin/experiment-runner verify release/evidence/project/trial
-```
-
-The command finds the nearest `experiment-locations.json` in the experiment's
-parent directories. Published packages supply this file; readers do not create
-or edit it. Its destinations must stay inside the extraction root. Missing or
-invalid bundled entries fail without falling back to the original machine.
-For an experiment still at its original location, no metadata is needed.
-
-`verify` checks the frozen plan, prepared-file and source hashes, manifest,
-ledger sequence and provenance, and every successful response receipt. Reused
-responses are checked against their original producer receipts. It retains the
-original path strings and hashes, makes no model calls or evidence changes, and
-requires neither credentials nor an installed model worker.
-
-Add `--json` for the plan hash, checked-source and receipt counts, and latest
-case statuses. Exit status zero means the integrity checks passed, even if some
-cases failed or never ran. Failed attempts receive ledger provenance/sequence
-checks, not successful-response checks. Mechanical decisions and answer quality
-are not reevaluated.
-
-Check archive checksums first: internal hashes do not establish a collection's
-completeness or authenticity. Verification does not reconstruct aggregates,
-verify all transitive adapter evidence, recover historical code, or evaluate
-review notes, reconciled costs or whole hierarchy/training outputs. It streams
-source hashes and receipt ledgers, but loads the selected plan, configuration
-and manifests as JSON. Verify individual child experiments for a large build.
-Bundled locations apply only to `verify`; `run`, `show`, `collect` and
-`prepare --from` keep their existing path behavior.
-
-### Prepare locations for publication
-
-Publishers stage the selected experiments and dependencies before making an
-archive. Include bound historical sources and the original receipts, manifests
-and upgrade ledgers needed by reused answers. Preserve the frozen bytes.
-
-Keep the original-to-staged locations used during copying in a private file
-outside the archive. For example, `locations-private.json` beside `release/`:
-
-```json
-{
-  "schema_version": 1,
-  "roots": {"/old/project": "release/evidence/project"},
-  "files": {"/old/project/posts.json": "release/datasets/posts.json"}
-}
-```
-
-Destinations in this private file are relative to the file, or absolute. Exact
-file entries override roots; the longest matching root wins. This allows a
-corpus to occupy a shared dataset location. Use the actual paths from staging.
-Credentials and the old runner executable are not verification dependencies.
-
-```bash
-cd "$EXPERIMENT_RUNNER_ROOT"
-bin/experiment-runner prepare-release release \
-  --locations locations-private.json \
-  --experiment evidence/project/trial
-```
-
-Repeat `--experiment` for all selected experiments sharing the extraction root.
-The command verifies the staged evidence, sharing source hashes across those
-experiments, then writes `release/experiment-locations.json`. It includes only
-used bindings, with relative destinations inside that root. External
-dependencies and changed or missing evidence fail before metadata is written.
-Existing metadata is never overwritten. A successful check can still include
-failed and unrun cases; it does not make them successful experiments.
-
-Include the generated file in the archive and its checksums; keep the private
-staging file outside it. Split archives sharing an extraction root must supply
-the same complete metadata, rather than overwriting it with partial mappings.
-Test after extraction elsewhere, without `--locations` or original storage.
-This command prepares metadata; archive selection, copying and compression
-remain publisher steps. Explicit `verify --locations FILE` remains available
-for publisher checks and overrides automatic lookup.
-
 ## Update the shared binary after code merges
 
 After **every code change merged into local `main`**, verify that the shared
@@ -684,7 +799,7 @@ dependencies changed, update them with `npm ci --ignore-scripts` in
 other non-code changes do not require a binary update.
 
 ```bash
-cd ~/src/notedeck_worktrees/algos/experiment-runner
+cd "$EXPERIMENT_RUNNER_ROOT"
 bin/experiment-runner --version
 bin/experiment-runner --help
 bin/experiment-runner prepare --help
@@ -699,6 +814,11 @@ resume existing directories automatically; incompatible request changes use
 `--from` and `--runner-binary`, as described above. Account for older active
 processes before changing their bound source. Newer processes support a
 per-experiment pause and resume; never edit an actively bound task checkout.
+
+</details>
+
+<details>
+<summary>SSE prefix caching and cost accounting</summary>
 
 ## SSE prefix caching
 
@@ -757,18 +877,15 @@ key across cases and batches; changing whitespace changes it. The backend still
 receives and checks the actual input text; a key does not substitute for it.
 
 ```bash
-cd ~/src/notedeck_worktrees/algos/oracle-mvp
-../experiment-runner/bin/experiment-runner prepare target/compare-cached-v1 \
-  --from target/comparisons-v1 \
-  --runner-binary ../experiment-runner/experiment_runner/run-model.sh \
-  --provider openai-codex --model gpt-6.1-sol --reasoning-effort medium \
-  --transport sse \
-  --prompt-cache
-../experiment-runner/bin/experiment-runner run target/compare-cached-v1 \
-  --max-new-attempts 129
+cd "$EXPERIMENT_RUNNER_ROOT"
+bin/experiment-runner prepare result-cached/run-v1 \
+  --spec comparisons.json --prompt-cache
+bin/experiment-runner run result-cached/run-v1 --max-new-attempts 129
 ```
 
-Replace the example's experiment paths with your own. Preparation
+This assumes `comparisons.json` selects the provider/model/transport above and
+a qualifying shared prefix. Replace it and the destination with your own paths.
+The 129-attempt example includes warmup; use your authorized allowance. Preparation
 makes no model calls. The single `run` command first checks exact-answer reuse.
 Immediately before the first comparison requiring a new attempt, it sends one
 prefix warmup and waits for completion, then runs the comparisons.
@@ -916,6 +1033,126 @@ percentage saved. A zero uncached denominator also has no defined savings
 percentage. Filters retain the experiment's shared warmup overhead as described
 above, without allocating it between cases.
 
+</details>
+
+<details>
+<summary>Compact publication results and full evidence verification</summary>
+
+## Compact publication results
+
+New standalone prompt experiments save a managed `publication/` directory during
+preparation, execution and review. It contains a small `experiment.json` with
+settings, version/source bindings and payload checksums; deduplicated template
+variables in `inputs.jsonl`; and final case answers, outcomes, reuse references
+and attributed reviews in `results.jsonl`. Rendered prompts, recursive baseline
+reports, transport details and arbitrary evidence wrappers are excluded.
+
+`export-results` exports the same format from an explicitly selected saved
+experiment without inference. It streams the saved report and binds its input
+selection and hash; it does not reconstruct a missing report, merge newer review
+sidecars or perform receipt verification. Metadata states these limitations.
+
+`prepare --publication-role standalone|internal` freezes whether a job owns a
+public result. Normal preparation defaults to standalone; project coordinators
+mark construction jobs internal, and cache warmups are always internal.
+`prepare --from` inherits the role. Unmarked historical plans stay unmarked unless
+the caller explicitly selects a role for the new preparation. Automatic export
+requires standalone; known internal jobs cannot be exported separately.
+
+The shared standard-library `publication_files` writer stages streamed JSONL
+payloads, rejects unrelated/different-owner destinations, binds payload hashes
+and replaces metadata last. Unchanged exports keep bytes and modification times.
+Project evaluation and numerical adapters can use it without a transport or model
+dependency. Choosing public datasets, reviewing sensitive content and uploading
+the files remain separate work.
+
+## Verify saved experiments after moving files
+
+Extract the evidence package with its directory structure intact, then pass the
+experiment directory to `verify`:
+
+```bash
+cd "$EXPERIMENT_RUNNER_ROOT"
+bin/experiment-runner verify release/evidence/project/trial
+```
+
+The command finds the nearest `experiment-locations.json` in the experiment's
+parent directories. Published packages supply this file; readers do not create
+or edit it. Its destinations must stay inside the extraction root. Missing or
+invalid bundled entries fail without falling back to the original machine.
+For an experiment still at its original location, no metadata is needed.
+
+`verify` checks the frozen plan, prepared-file and source hashes, manifest,
+ledger sequence and provenance, and every successful response receipt. Reused
+responses are checked against their original producer receipts. It retains the
+original path strings and hashes, makes no model calls or evidence changes, and
+requires neither credentials nor an installed model worker.
+
+Add `--json` for the plan hash, checked-source and receipt counts, and latest
+case statuses. Exit status zero means the integrity checks passed, even if some
+cases failed or never ran. Failed attempts receive ledger provenance/sequence
+checks, not successful-response checks. Mechanical decisions and answer quality
+are not reevaluated.
+
+Check archive checksums first: internal hashes do not establish a collection's
+completeness or authenticity. Verification does not reconstruct aggregates,
+verify all transitive adapter evidence, recover historical code, or evaluate
+review notes, reconciled costs or whole hierarchy/training outputs. It streams
+source hashes and receipt ledgers, but loads the selected plan, configuration
+and manifests as JSON. Verify individual child experiments for a large build.
+Bundled locations apply only to `verify`; `run`, `show`, `collect` and
+`prepare --from` keep their existing path behavior.
+
+### Prepare locations for publication
+
+Publishers stage the selected experiments and dependencies before making an
+archive. Include bound historical sources and the original receipts, manifests
+and upgrade ledgers needed by reused answers. Preserve the frozen bytes.
+
+Keep the original-to-staged locations used during copying in a private file
+outside the archive. For example, `locations-private.json` beside `release/`:
+
+```json
+{
+  "schema_version": 1,
+  "roots": {"/old/project": "release/evidence/project"},
+  "files": {"/old/project/posts.json": "release/datasets/posts.json"}
+}
+```
+
+Destinations in this private file are relative to the file, or absolute. Exact
+file entries override roots; the longest matching root wins. This allows a
+corpus to occupy a shared dataset location. Use the actual paths from staging.
+Credentials and the old runner executable are not verification dependencies.
+
+```bash
+cd "$EXPERIMENT_RUNNER_ROOT"
+bin/experiment-runner prepare-release release \
+  --locations locations-private.json \
+  --experiment evidence/project/trial
+```
+
+Repeat `--experiment` for all selected experiments sharing the extraction root.
+The command verifies the staged evidence, sharing source hashes across those
+experiments, then writes `release/experiment-locations.json`. It includes only
+used bindings, with relative destinations inside that root. External
+dependencies and changed or missing evidence fail before metadata is written.
+Existing metadata is never overwritten. A successful check can still include
+failed and unrun cases; it does not make them successful experiments.
+
+Include the generated file in the archive and its checksums; keep the private
+staging file outside it. Split archives sharing an extraction root must supply
+the same complete metadata, rather than overwriting it with partial mappings.
+Test after extraction elsewhere, without `--locations` or original storage.
+This command prepares metadata; archive selection, copying and compression
+remain publisher steps. Explicit `verify --locations FILE` remains available
+for publisher checks and overrides automatic lookup.
+
+</details>
+
+<details>
+<summary>Project extension API and constructor integration</summary>
+
 ## Project extensions
 
 An `experiment-runner.json` file declares `schema_version: 1`, an `inputs`
@@ -962,6 +1199,24 @@ checks still apply. Explicit `prepare --repeat` disables mechanical routing and
 executes the normal prompts as fresh model trials. Cases without this metadata
 retain the existing request, receipt, import and `--from` behavior.
 
+### Prompt sources and input inspection
+
+A project extension may implement `prompt_sources(prompt)`. Preparation calls
+it for a spec's prompt and for an explicit `--prompt` replacement, before
+publishing the experiment. The callback receives `id`, `text` and `source_path`;
+it validates project-owned composition and returns absolute source paths mapped
+to SHA-256 hashes. The runner verifies those hashes and freezes them alongside
+the prompt and input sources. A rejection makes no model calls and creates no
+experiment. Existing projects without the hook retain their behavior. An
+unchanged `prepare --from` keeps the original frozen prompt and dependencies.
+This supports shared prompt components without putting project rules in the
+executor or rewriting historical prompts.
+
+`show <experiment> --inputs-only` prints only each saved case's `id`, exact
+`inputs` and `input_sha256`, without reading answer reports or invoking request
+previews. `--case` selects one object; `--only` selects a cases list. Evidence,
+cost and prompt-only filters cannot be combined with this input-only view.
+
 ## Hierarchy clients and shared attempt bounds
 
 Project constructors can call `prepare`, `report` and `run` with
@@ -993,7 +1248,9 @@ placeholders, remains unknown and makes the complete catalog-cost total null.
 Verified reused generations are counted once by their original receipt, while
 reuse itself adds no new execution cost.
 
-## Verification
+</details>
+
+## Development checks
 
 ```bash
 cd "$EXPERIMENT_RUNNER_ROOT"
