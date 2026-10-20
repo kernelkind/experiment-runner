@@ -144,6 +144,36 @@ The command is illustrative: supply an existing, authorized spec. Input and
 prompt paths resolve relative to the spec. Review and hierarchy extensions are
 loaded from the selected project, never copied into this package.
 
+### Compact publication results
+
+New standalone prompt experiments save a managed `publication/` directory during
+preparation, execution and review. It contains a small `experiment.json` with
+settings, version/source bindings and payload checksums; deduplicated template
+variables in `inputs.jsonl`; and final case answers, outcomes, reuse references
+and attributed reviews in `results.jsonl`. Rendered prompts, recursive baseline
+reports, transport details and arbitrary evidence wrappers are excluded.
+
+`export-results` exports the same format from an explicitly selected saved
+experiment without inference. It streams the saved report and binds its input
+selection and hash; it does not reconstruct a missing report, merge newer review
+sidecars or perform receipt verification. Metadata states these limitations.
+
+`prepare --publication-role standalone|internal` freezes whether a job owns a
+public result. Normal preparation defaults to standalone; project coordinators
+mark construction jobs internal, and cache warmups are always internal.
+`prepare --from` inherits the role. Unmarked historical plans stay unmarked unless
+the caller explicitly selects a role for the new preparation. Automatic export
+requires standalone; known internal jobs cannot be exported separately.
+
+The shared standard-library `publication_files` writer stages streamed JSONL
+payloads, rejects unrelated/different-owner destinations, binds payload hashes
+and replaces metadata last. Unchanged exports keep bytes and modification times.
+Project evaluation and numerical adapters can use it without a transport or model
+dependency. Choosing public datasets, reviewing sensitive content and uploading
+the files remain separate work.
+
+### Project extensions
+
 A project extension may implement `prompt_sources(prompt)`. Preparation calls
 it for a spec's prompt and for an explicit `--prompt` replacement, before
 publishing the experiment. The callback receives `id`, `text` and `source_path`;

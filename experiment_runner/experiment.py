@@ -105,6 +105,16 @@ def write(path, value):
     engine._atomic_write_json(Path(path), value)
 
 
+def save_report(directory, result, *, plan=None):
+    """Save the native report and refresh explicitly standalone public results."""
+    directory = Path(directory).resolve()
+    write(directory / 'report.json', result)
+    if plan is None or plan.get('publication_role') == 'standalone':
+        from .prompt_publication import export_results
+        export_results(directory, result=result, plan=plan, automatic=True)
+    return result
+
+
 def resolve(path, base):
     path = Path(path).expanduser()
     return (base / path).resolve() if not path.is_absolute() else path.resolve()
@@ -305,8 +315,11 @@ def prepare(args, *, preparation_context=None, include_request_preview=True):
         raise ValueError("experiment destination already exists")
     warmup = getattr(args, "cache_warmup", False)
     inherited_history = None
+    publication_role = getattr(args, 'publication_role', None)
     if args.from_experiment:
         old, _, old_manifest = load(args.from_experiment)
+        if publication_role is None:
+            publication_role = old.get('publication_role')
         inherited_history = old_manifest.get("request_reuse", {}).get("history_root")
         setup = {k: old[k] for k in ("prompt", "dataset", "cases", "runner", "sources")}
         group = old.get('scheduling_group') or scheduling.bound_group(Path(old['run_directory']))
@@ -318,6 +331,8 @@ def prepare(args, *, preparation_context=None, include_request_preview=True):
         baseline = (None if warmup else report(Path(args.from_experiment).resolve(),
                                                include_request_preview=include_request_preview))
     else:
+        if publication_role is None:
+            publication_role = 'standalone'
         setup = spec_setup(args.spec, preparation_context=preparation_context,
                            include_request_preview=include_request_preview)
         baseline = report(args.baseline.resolve(), include_request_preview=include_request_preview) if args.baseline else None
@@ -429,6 +444,7 @@ def prepare(args, *, preparation_context=None, include_request_preview=True):
             setup['runner']['prompt_cache_key'] = 'prefix-' + engine._sha256_bytes(prefix.encode())[:56]
             setup['cache_warmup'] = policy or prefix_policy(prefix)
     if warmup:
+        publication_role = 'internal'
         prefix = setup["runner"].get("prompt_cache_prefix")
         if (not args.from_experiment or not prefix or args.only or args.prompt
                 or args.prompt_id or args.baseline or args.import_config
@@ -473,6 +489,10 @@ def prepare(args, *, preparation_context=None, include_request_preview=True):
             "baseline": snapshot,
             "baseline_prompt_id": baseline["prompt_id"] if baseline else None,
         }
+        if publication_role is not None:
+            if publication_role not in ('standalone', 'internal'):
+                raise ValueError('invalid publication role')
+            plan['publication_role'] = publication_role
         config_value = {
             "schema_version": 1,
             **setup["runner"],
@@ -520,6 +540,11 @@ def prepare(args, *, preparation_context=None, include_request_preview=True):
             )
         plan["run_directory"] = str(config.run_directory)
         plan["manifest_sha256"] = inputs.digest(manifest)
+        plan['request_reuse'] = {
+            'intentional_repeat': manifest.get('request_reuse', {}).get('intentional_repeat')}
+        plan['model_runner'] = {key: manifest[key] for key in (
+            'provider', 'model', 'reasoning_effort', 'runner_version', 'runner_sha256',
+            'request_code_sha256', 'wrapper_sha256', 'response_schema_sha256') if key in manifest}
         plan["files"] = {
             "runner-config.json": engine._sha256_file(staged / "runner-config.json")
         }
@@ -538,7 +563,7 @@ def prepare(args, *, preparation_context=None, include_request_preview=True):
         for child in staged.iterdir():
             child.rename(destination / child.name)
     result = report(destination, include_request_preview=include_request_preview)
-    write(destination / "report.json", result)
+    save_report(destination, result, plan=plan)
     return result
 
 
@@ -982,6 +1007,14 @@ def _report(directory, only=None, note_ids=None, *, generation_costs=False, incl
                 "record_sha256": inputs.digest(record),
             }
             row["reused"] = record.get("execution") == "cross_run_reuse"
+            row['attempt'] = record.get('attempt')
+            for field in ('request_sha256', 'prompt_sha256'):
+                if field in record:
+                    row[field] = record[field]
+            if isinstance(record.get('reused_from'), dict):
+                row['reused_from'] = {key: record['reused_from'][key]
+                    for key in ('result_line', 'result_sha256', 'manifest_sha256')
+                    if key in record['reused_from']}
             if record["status"] == "failed":
                 row.update(
                     status="failed",
@@ -1244,7 +1277,7 @@ def run(directory, max_new_attempts=None, runner_upgrade_reason=None, *,
         if not jobs:
             execution_upgrade(directory, plan, runner_upgrade_reason)
             result = report(directory, include_request_preview=include_request_preview)
-            write(directory / "report.json", result)
+            save_report(directory, result, plan=plan)
             return result
         identity = engine._runner_identity(config)
         if not engine.compatibility.compatible(manifest, identity):
@@ -1315,7 +1348,7 @@ def run(directory, max_new_attempts=None, runner_upgrade_reason=None, *,
                             validate_output=lambda job, raw: inputs.validate(
                                 {'adapter': 'generic'}, warm_plan['cases'][0], raw, config.output_schema))
                     finally:
-                        write(child / 'report.json', report(child, include_request_preview=False))
+                        save_report(child, report(child, include_request_preview=False), plan=warm_plan)
                 try:
                     queue = scheduling.active_queue()
                     queue.warming(True)
@@ -1345,11 +1378,19 @@ def run(directory, max_new_attempts=None, runner_upgrade_reason=None, *,
                 before_new_attempt=(warm_before_dispatch if warm_cache and plan.get('cache_warmup', {}).get('eligible') else None),
                 scheduling_group=group,
             )
-        except engine.RunnerError as caught:
+        except BaseException as caught:
             error = caught
+            if not isinstance(caught, engine.RunnerError):
+                raise
         finally:
-            result = report(directory, include_request_preview=include_request_preview)
-            write(directory / "report.json", result)
+            try:
+                result = report(directory, include_request_preview=include_request_preview)
+                save_report(directory, result, plan=plan)
+            except Exception as report_error:
+                if error is None:
+                    raise
+                error.add_note('Saving the final report/publication failed: '
+                               + type(report_error).__name__)
         if error:
             raise engine.RunnerError(
                 f"{error}; partial results: {directory / 'report.json'}"
@@ -1374,7 +1415,7 @@ def review(args):
             'case_id': args.case, 'role': args.role, 'verdict': args.verdict,
             'comment': args.comment, 'time': datetime.now(timezone.utc).isoformat(),
             'input_sha256': case['input_sha256'], 'output_sha256': inputs.digest(case['output'])})
-        write(args.experiment / 'report.json', report(args.experiment))
+        save_report(args.experiment, report(args.experiment))
         print(f'Recorded {args.role} review for {args.case}. Model calls made: 0')
 
 
@@ -1683,6 +1724,8 @@ Example from your project checkout (replace the spec and destination):
     p.add_argument("--prompt", type=Path)
     p.add_argument("--prompt-id")
     p.add_argument("--repeat", action="store_true")
+    p.add_argument('--publication-role', choices=('standalone', 'internal'),
+                   help='standalone results export automatically; internal jobs belong to their parent; --from inherits')
     p.add_argument("--history-root", type=Path)
     p.add_argument('--scheduling-group', metavar='ID',
                    help='share one scheduling allocation across all batches of this overall experiment; inherited by --from')
@@ -1759,6 +1802,9 @@ Example from your project checkout (replace the spec and destination):
     p.add_argument("--max-request-cost-usd", type=float,
                    help="caller-verified maximum cost reserved for each in-flight call; required with --max-cost-usd")
     p.add_argument("--runner-upgrade-reason", help="approve project adapter/evaluator upgrades; compatible runner updates are automatic, incompatible requests remain refused")
+    p = commands.add_parser('export-results', help='export compact saved prompt answers, inputs and settings; no inference')
+    p.add_argument('experiment', type=Path)
+    p.add_argument('--output', type=Path, help='default EXPERIMENT/publication; refreshes this experiment only')
     p = commands.add_parser('verify', help='check saved prompt evidence; no inference or writes')
     p.add_argument('experiment', type=Path)
     p.add_argument('--locations', type=Path, help='JSON mapping original paths to extracted files')
@@ -1862,6 +1908,11 @@ def main(argv=None):
                 return 0
             return int(any(case['status'] in ('malformed', 'invalid_receipt', 'failed', 'unrun')
                            for case in result['cases'] if args.only is None or case['id'] in args.only))
+        elif args.command == 'export-results':
+            from .prompt_publication import export_results, saved_snapshot
+            with saved_snapshot(args.experiment):
+                result = export_results(args.experiment, args.output)
+            print(json.dumps(result, indent=2))
         elif args.command == 'verify':
             from .verification import verify, summary
             result = verify(args.experiment, args.locations)
