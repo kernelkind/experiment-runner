@@ -2289,36 +2289,40 @@ def _invoke_prompt_worker(config, argv, request, directory, *, worker_identity):
     unavailable_line = marker + ':unavailable\n'
     deadline = time.monotonic() + config.timeout_seconds + 30
     admitted = False
-    data = _ordered_json_bytes(request).decode('utf-8')
-    with subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                          text=True, cwd=directory, env=environment) as child:
-        try:
-            if slot:
-                slot['queue'].worker_started(slot['identifier'], child.pid)
-            while True:
-                try:
-                    stdout, stderr = child.communicate(input=data, timeout=0.25)
-                    break
-                except subprocess.TimeoutExpired as partial:
-                    data = None
-                    observed = partial.stderr or b''
-                    if admitted_line in observed and not admitted:
-                        admitted = True
-                        deadline = time.monotonic() + config.timeout_seconds + 30
-                    elif waiting_line in observed and not admitted:
-                        deadline = None
-                    if deadline is not None and time.monotonic() >= deadline:
-                        raise subprocess.TimeoutExpired(argv, config.timeout_seconds + 30)
-        finally:
-            if child.poll() is None:
-                # The native launcher forwards termination to its selected Pi
-                # child; keep the existing process-group interrupt behavior.
-                child.terminate()
-                try:
-                    child.communicate(timeout=5)
-                except subprocess.TimeoutExpired:
-                    child.kill()
-                    child.communicate()
+    # A timed-out communicate(input=...) cannot reliably resume a partial
+    # stdin write on older supported Python versions. Supply complete stdin
+    # independently of output/admission polling, without another writer thread.
+    with tempfile.TemporaryFile() as request_input:
+        request_input.write(_ordered_json_bytes(request))
+        request_input.seek(0)
+        with subprocess.Popen(argv, stdin=request_input, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              text=True, cwd=directory, env=environment) as child:
+            try:
+                if slot:
+                    slot['queue'].worker_started(slot['identifier'], child.pid)
+                while True:
+                    try:
+                        stdout, stderr = child.communicate(timeout=0.25)
+                        break
+                    except subprocess.TimeoutExpired as partial:
+                        observed = partial.stderr or b''
+                        if admitted_line in observed and not admitted:
+                            admitted = True
+                            deadline = time.monotonic() + config.timeout_seconds + 30
+                        elif waiting_line in observed and not admitted:
+                            deadline = None
+                        if deadline is not None and time.monotonic() >= deadline:
+                            raise subprocess.TimeoutExpired(argv, config.timeout_seconds + 30)
+            finally:
+                if child.poll() is None:
+                    # The native launcher forwards termination to its selected Pi
+                    # child; keep the existing process-group interrupt behavior.
+                    child.terminate()
+                    try:
+                        child.communicate(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        child.kill()
+                        child.communicate()
     if unavailable_line in stderr.splitlines(keepends=True):
         raise ExperimentAdmissionUnavailable(
             'Experiment admission unavailable; restore the local scope/status service and admission state before running')
