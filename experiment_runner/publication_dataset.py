@@ -538,14 +538,15 @@ def verify_dataset(dataset):
 
 
 def restore_dataset(dataset, output, publication=None):
-    """Restore all files, or one study with only its files and shared shards present."""
+    """Restore all files, or a selected directory and its required shared shards."""
     dataset = _no_symlink(dataset)
     manifest = _manifest(dataset, complete=publication is None)
     if publication is not None:
         publication = _path(publication)
-        _require(publication + '/experiment.json' in manifest['files'], 'publication is not included')
     prefix = publication + '/' if publication is not None else ''
     names = [name for name in manifest['files'] if name.startswith(prefix)]
+    if publication is not None:
+        _require(bool(names), 'publication directory is not included')
     before = _inventory(dataset) if publication is None else None
     manifest_stamp = _stamp(dataset/'dataset.json')
     with _staging(dataset, Path(output)) as (_, output, workspace, staged), _index(workspace) as index:

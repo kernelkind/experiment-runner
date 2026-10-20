@@ -117,6 +117,24 @@ class PublicationDatasetTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'extra or missing'):
             verify_dataset(self.output)
 
+    def test_restore_directory_with_nested_metadata_and_untransformed_input_files(self):
+        self.publication('inputs/training/metadata')
+        prepared = self.source/'inputs/training/train.jsonl'
+        prepared.write_bytes(canonical(dict(note_id='one', text='Exact post'))+b'\n')
+        self.publication('unrelated')
+        self.prepare()
+        from experiment_runner.publication_dataset import restore_dataset
+        restored = self.root/'training'
+        result = restore_dataset(self.output, restored, publication='inputs/training')
+        expected = {p.relative_to(self.source/'inputs/training').as_posix():p.read_bytes()
+                    for p in (self.source/'inputs/training').rglob('*') if p.is_file()}
+        self.assertEqual(result['files'], len(expected))
+        self.assertEqual(expected, {p.relative_to(restored).as_posix():p.read_bytes()
+                                   for p in restored.rglob('*') if p.is_file()})
+        with self.assertRaisesRegex(ValueError, 'not included'):
+            restore_dataset(self.output, self.root/'missing', publication='inputs/train')
+        self.assertFalse((self.root/'missing').exists())
+
     def change_manifest(self, update):
         path=self.output/'dataset.json'
         value=json.loads(path.read_text());update(value)
