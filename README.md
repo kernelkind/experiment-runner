@@ -45,9 +45,9 @@ The tutorial uses `openai-codex` with `gpt-6.1-sol`.
 [Provider and authentication instructions](docs/running-experiments.md#providers-and-authentication)
 cover the other routes and the existing Anvil account-service integration.
 
-Source publication is planned for
+Source code is available at
 [kernelkind/experiment-runner](https://github.com/kernelkind/experiment-runner).
-After publication, run the following from the directory where you want the
+Run the following from the directory where you want the
 checkout. If you already have `experiment-runner/`, skip the clone line:
 
 ```bash
@@ -271,3 +271,8 @@ extraction and compatibility code. The
 paths require it. No Oracle checkout is needed for the tutorial above.
 
 For development, start with the [test instructions](docs/development.md#tests).
+
+## License
+
+Unless otherwise noted, this project is licensed under the **GNU General Public
+License, version 3 or later** (`GPL-3.0-or-later`). See [LICENSE](LICENSE).
