@@ -34,11 +34,24 @@ _CASE = {'id', 'inputs', 'input_sha256', 'status', 'output', 'reused', 'origin',
          'request_sha256', 'prompt_sha256', 'reused_from', 'mechanical_sha256'}
 _REVIEW = {'role', 'verdict', 'comment', 'time', 'input_sha256', 'output_sha256', 'current'}
 _STATUSES = {'valid', 'empty', 'malformed', 'invalid_receipt', 'failed', 'unrun'}
+_REVIEW_SESSION = re.compile(
+    r'\A(?P<attribution>[ \t]*(?:independent[ \t]+)?agent[ \t]+review[ \t]+by[ \t]+[^():\r\n]+?)'
+    r'[ \t]+\(session(?:[ _-]+(?:id|uuid))?(?:[ \t]+|[ \t]*[:=][ \t]*)'
+    r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}[ \t]*\)(?=[ \t]*:)', re.IGNORECASE)
 
 
 def _scalars(value, fields):
     return {key: value[key] for key in sorted(fields) if key in value
             and (value[key] is None or type(value[key]) in (str, int, float, bool))}
+
+
+def _review(value):
+    result = _scalars(value, _REVIEW)
+    if result.get('role') == 'agent' and isinstance(result.get('comment'), str):
+        # Only the leading agent attribution identifies an executor session;
+        # scientific identifiers and quoted text elsewhere remain unchanged.
+        result['comment'] = _REVIEW_SESSION.sub(r'\g<attribution>', result['comment'], count=1)
+    return result
 
 
 def _value(events, first, keep):
@@ -268,7 +281,7 @@ def _row(case):
     reviews = case.get('reviews', [])
     if not isinstance(reviews, list) or any(not isinstance(review, dict) for review in reviews):
         raise ValueError('saved case reviews must be a list of objects')
-    row['reviews'] = [_scalars(review, _REVIEW) for review in reviews]
+    row['reviews'] = [_review(review) for review in reviews]
     return row, variables
 
 

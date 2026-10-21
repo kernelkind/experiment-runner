@@ -104,6 +104,94 @@ class PromptPublicationTests(unittest.TestCase):
         self.assertEqual(before,
             {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in (directory/'publication').iterdir()})
 
+    def test_private_agent_session_attribution_is_omitted_without_changing_assessment(self):
+        directory, plan, report = self.saved()
+        session = '11111111-2222-4333-8444-555555555555'
+        review = report['cases'][0]['reviews'][0]
+        review['time'] = '2026-01-01T12:00:00+00:00'
+        assessment = 'Reject. The child drops its parent restriction.\nKeep this qualification.'
+        review['comment'] = f'Independent agent review by reviewer-A (session {session}): {assessment}'
+        expected = {key: value for key, value in review.items() if key != 'imported_from'}
+        expected['comment'] = f'Independent agent review by reviewer-A: {assessment}'
+        self.save('saved/report.json', report)
+        sources = {name: (directory/name).read_bytes() for name in ('experiment.json', 'report.json')}
+
+        export_results(directory)
+
+        metadata, _, rows = self.published(directory)
+        self.assertEqual(rows[0]['reviews'][0]['comment'], expected['comment'])
+        self.assertEqual(rows[0]['reviews'][0], expected)
+        self.assertEqual(metadata['source_id'], engine._sha256_json(plan))
+        self.assertEqual(metadata['snapshot']['report_sha256'], hashlib.sha256(sources['report.json']).hexdigest())
+        self.assertEqual(rows[0]['output_sha256'], engine._sha256_json(report['cases'][0]['output']))
+        self.assertEqual(sources, {name: (directory/name).read_bytes() for name in sources})
+
+    def test_automatic_export_omits_session_attribution_variants(self):
+        session = 'aaaa1111-bb22-4cc3-8dd4-eeee55555555'
+        for attribution, label in (
+                (f'agent review by reviewer-B (session_id={session})', 'agent review by reviewer-B'),
+                (f'Independent Agent Review By reviewer-C (session UUID: {session.upper()})',
+                 'Independent Agent Review By reviewer-C'),
+                (f' Independent\tagent review by reviewer-D \t(session id {session})',
+                 ' Independent\tagent review by reviewer-D')):
+            with self.subTest(attribution=attribution):
+                directory, plan, report = self.saved()
+                report['cases'][0]['reviews'][0]['comment'] = attribution+': Scientific assessment.'
+                self.save('saved/report.json', report)
+
+                export_results(directory, result=report, plan=plan, automatic=True)
+
+                _, _, rows = self.published(directory)
+                self.assertEqual(rows[0]['reviews'][0]['comment'], label+': Scientific assessment.')
+                self.assertEqual(report['cases'][0]['reviews'][0]['comment'],
+                                 attribution+': Scientific assessment.')
+
+    def test_session_projection_preserves_scientific_identifiers_and_user_comments(self):
+        directory, _, report = self.saved()
+        identifier = '11111111-2222-4333-8444-555555555555'
+        attribution = f'Independent agent review by reviewer-A (session {identifier})'
+        scientific = f'Node {identifier}; trial {identifier}; https://media.example/{identifier}.'
+        comments = [
+            ('agent', attribution+': '+scientific,
+             'Independent agent review by reviewer-A: '+scientific),
+            ('user', attribution+': User-supplied text.', attribution+': User-supplied text.'),
+            ('agent', f'Quoted attribution: "{attribution}: result".',
+             f'Quoted attribution: "{attribution}: result".'),
+            ('agent', f'Independent agent review by reviewer-A (trial {identifier}): Result.',
+             f'Independent agent review by reviewer-A (trial {identifier}): Result.'),
+            ('agent', 'Independent agent review by reviewer-A (session 17): Result.',
+             'Independent agent review by reviewer-A (session 17): Result.'),
+            ('agent', f'Independent review by reviewer-A (session {identifier}): Result.',
+             f'Independent review by reviewer-A (session {identifier}): Result.'),
+            ('agent', attribution+' without an attribution delimiter.',
+             attribution+' without an attribution delimiter.'),
+        ]
+        report['cases'][0]['reviews'] = [dict(role=role, verdict='comment', comment=comment,
+                                             current=True) for role, comment, _ in comments]
+        report['cases'][0]['output'] = scientific
+        self.save('saved/report.json', report)
+
+        export_results(directory)
+
+        _, _, rows = self.published(directory)
+        self.assertEqual([review['comment'] for review in rows[0]['reviews']],
+                         [expected for _, _, expected in comments])
+        self.assertEqual(rows[0]['output'], scientific)
+        self.assertEqual(rows[0]['output_sha256'], engine._sha256_json(scientific))
+
+    def test_agent_attribution_does_not_consume_session_literal_from_assessment(self):
+        directory, _, report = self.saved()
+        identifier = '11111111-2222-4333-8444-555555555555'
+        comment = ('Independent agent review by reviewer-A: '
+                   f'The source defines a literal (session {identifier}): meaning.')
+        report['cases'][0]['reviews'][0]['comment'] = comment
+        self.save('saved/report.json', report)
+
+        export_results(directory)
+
+        _, _, rows = self.published(directory)
+        self.assertEqual(rows[0]['reviews'][0]['comment'], comment)
+
     def test_output_schema_preserves_its_request_significant_property_order(self):
         directory, plan, report = self.saved()
         schema = {'type': 'object', 'properties': {'z': {'type': 'string'}, 'a': {'type': 'number'}},

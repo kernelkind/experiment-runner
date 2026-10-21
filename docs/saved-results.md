@@ -103,6 +103,11 @@ variables in `inputs.jsonl`; and final case answers, outcomes, reuse references
 and attributed reviews in `results.jsonl`. Rendered prompts, recursive baseline
 reports, transport details and arbitrary evidence wrappers are excluded.
 
+In an agent review, exports omit the parenthetical session UUID from a leading
+`Agent review by REVIEWER (session UUID):` attribution. The reviewer label and
+scientific assessment remain, along with the recorded review fields and
+source-report hash. User comments and scientific identifiers are preserved.
+
 `export-results` exports the same format from an explicitly selected saved
 experiment without inference. It streams the saved report and binds its input
 selection and hash; it does not reconstruct a missing report, merge newer review
