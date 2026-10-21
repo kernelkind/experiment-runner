@@ -30,7 +30,7 @@ rerunning the baseline.
 
 ## Requirements and installation
 
-Use **Linux**, **Python 3.11+**, **Node.js 24+** and **npm**. The request queue uses
+Use **Linux**, **Git**, **Python 3.11+**, **Node.js 24+** and **npm**. The request queue uses
 Linux process information from `/proc`.
 
 Choose how to run model requests:
@@ -45,9 +45,13 @@ The tutorial uses `openai-codex` with `gpt-6.1-sol`.
 [Provider and authentication instructions](docs/running-experiments.md#providers-and-authentication)
 cover the other routes and the existing Anvil account-service integration.
 
-From the parent directory of your checkout:
+Source publication is planned for
+[kernelkind/experiment-runner](https://github.com/kernelkind/experiment-runner).
+After publication, run the following from the directory where you want the
+checkout. If you already have `experiment-runner/`, skip the clone line:
 
 ```bash
+git clone https://github.com/kernelkind/experiment-runner.git
 cd experiment-runner
 export EXPERIMENT_RUNNER_ROOT="$PWD"
 python3 -m venv .venv
